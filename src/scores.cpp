@@ -21,6 +21,7 @@
 #include "magic/magic.hpp"
 #include "net.hpp"
 #include "player.hpp"
+#include "sam_classes.hpp"   // SAM_CLASS_ID_BASE — custom class ids in save DLC validation
 #include "sys/stat.h"
 #include "paths.hpp"
 #include "collision.hpp"
@@ -7091,7 +7092,15 @@ int SaveGameInfo::Player::isCharacterValidFromDLC()
 	{
 		return VALID_OK_CHARACTER; // aesthetic only option.
 	}
-	if ( this->char_class <= CLASS_MONK )
+	// S.A.M: a custom class (id >= SAM_CLASS_ID_BASE) is not a vanilla DLC class, so the
+	// per-class/race achievement switch below has no case for it and would fall through to
+	// `return INVALID_CHARACTER` — which is why a non-human custom character failed to load
+	// its save with "could not verify required DLC" (a tester's char_class 1000 loaded only
+	// after they hand-edited it to a vanilla class id). The race's own DLC pack was already
+	// required above, and a custom class carries no extra vanilla unlock, so treat it like a
+	// base class here. Range check only (no getClass): the mod may not be mounted yet at the
+	// continue screen, but the id range is always reserved for S.A.M.
+	if ( this->char_class <= CLASS_MONK || this->char_class >= SAM_CLASS_ID_BASE )
 	{
 		return VALID_OK_CHARACTER;
 	}
