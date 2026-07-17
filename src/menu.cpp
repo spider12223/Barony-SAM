@@ -55,6 +55,9 @@
 #include "ui/Font.hpp"
 #include "ui/MainMenu.hpp"
 #include "ui/Image.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp"
+#include "sam_classes.hpp"
 
 #ifdef STEAMWORKS
 //Helper func. //TODO: Bugger.
@@ -278,6 +281,41 @@ bool enabledDLCPack1 = false;
 bool enabledDLCPack2 = false;
 bool enabledDLCPack3 = false;
 
+// S.A.M: robust DLC ownership check.
+//
+// The stock build gates non-human races and DLC classes on SteamApps()->BIsDlcInstalled().
+// That reports whether the DLC is *installed* (its files present / its checkbox ticked in
+// Steam's DLC properties), which is NOT the same as *owned*: Barony's DLC is a license and
+// its content ships inside the base game, so on some clients BIsDlcInstalled returns false
+// for DLC the player genuinely owns — and then their skeleton/vampire/etc. save refuses to
+// load with "Could not verify required DLC installed". BIsSubscribedApp() checks OWNERSHIP
+// directly, which is the right question here. Either signal being true means the player is
+// entitled to the pack. This is not a bypass: it is still wholly gated on a Steam-confirmed
+// entitlement — it just stops a client-side "installed" quirk from locking people out of
+// their own characters. Logged once per pack so a tester's log shows what Steam reported.
+bool samDlcOwned(uint32_t dlcAppId)
+{
+#ifdef STEAMWORKS
+	if ( !SteamApps() ) { return false; }
+	const bool installed = SteamApps()->BIsDlcInstalled(dlcAppId);
+	const bool subscribed = SteamApps()->BIsSubscribedApp(dlcAppId);
+	const bool owned = installed || subscribed;
+	// Log once per pack (not every tick) so a tester's log shows exactly what Steam reported.
+	const int idx = dlcAppId == 1010820 ? 0 : dlcAppId == 1010821 ? 1 : dlcAppId == 1010822 ? 2 : 3;
+	static bool logged[4] = { false, false, false, false };
+	if ( idx < 4 && !logged[idx] )
+	{
+		logged[idx] = true;
+		printlog("[S.A.M][DLC]: app %u -> installed=%d subscribed=%d (owned=%d)",
+			(unsigned)dlcAppId, (int)installed, (int)subscribed, (int)owned);
+	}
+	return owned;
+#else
+	(void)dlcAppId;
+	return false;
+#endif
+}
+
 // new text crawls...
 int DLCendmoviealpha[8][30] = { 0 };
 int DLCendmovieStageAndTime[8][2] = { 0 };
@@ -491,6 +529,13 @@ int isCharacterValidFromDLC(int player, int characterClass, int race, int appear
 
 int isCharacterValidFromDLC(Stat& myStats, int characterClass)
 {
+	// S.A.M: a registered custom class (id >= SAM_CLASS_ID_BASE) is always valid — it
+	// isn't gated behind any DLC. Without this, the class-restore + carousel validation
+	// paths treat it as INVALID and reset a non-human custom character to Barbarian.
+	if ( characterClass >= SAM_CLASS_ID_BASE && SAMClasses::getClass(characterClass) != nullptr )
+	{
+		return VALID_OK_CHARACTER;
+	}
 	bool challengeClass = false;
 	bool challengeRace = false;
 	if ( gameModeManager.currentSession.challengeRun.isActive() )
@@ -745,13 +790,19 @@ static void handleMainMenu(bool mode)
 	Sint32 omousey = inputs.getMouse(clientnum, Inputs::MouseInputs::OY);
 
 #ifdef STEAMWORKS
-	if ( SteamApps()->BIsDlcInstalled(1010820) )
+	// S.A.M: owned OR installed — see samDlcOwned. Also fill pack3, which the stock code
+	// here omitted (only the per-tick loop set it), so this menu path agrees with it.
+	if ( samDlcOwned(1010820) )
 	{
 		enabledDLCPack1 = true;
 	}
-	if ( SteamApps()->BIsDlcInstalled(1010821) )
+	if ( samDlcOwned(1010821) )
 	{
 		enabledDLCPack2 = true;
+	}
+	if ( samDlcOwned(1010822) )
+	{
+		enabledDLCPack3 = true;
 	}
 #else
 #endif // STEAMWORKS
@@ -9485,7 +9536,12 @@ void doNewGame(bool makeHighscore) {
 	}
 
 	// spice of life achievement
-	usedClass[client_classes[clientnum]] = true;
+	// S.A.M: guard against custom class ids (>= 1000) — usedClass is sized
+	// [NUMCLASSES], so indexing it with a custom id would be out of bounds.
+	if ( client_classes[clientnum] >= 0 && client_classes[clientnum] < NUMCLASSES )
+	{
+		usedClass[client_classes[clientnum]] = true;
+	}
 	bool usedAllClasses = true;
 	for ( int c = 0; c <= CLASS_MONK; c++ )
 	{
@@ -9614,6 +9670,44 @@ void doNewGame(bool makeHighscore) {
 	pauseGame(1, 0);
 	loading = false;
 	intro = false;
+
+	// S.A.M Framework: move speed resets on EVERY machine, outside the host gate below.
+	// A client applies its own multiplier locally (movement is computed where the player
+	// lives), and the host only transmits on change — so a client that skipped this would
+	// carry the last game's speed into the next one until some script happened to set it.
+	SAMLua::resetMoveSpeed();
+
+	// Reset per-run state and fire game.on_game_start (host-authoritative).
+	if ( multiplayer != CLIENT )
+	{
+		SAMLua::resetKills();
+		SAMLua::resetTimers();
+		SAMJs::resetTimers();
+
+		for ( int c = 0; c < MAXPLAYERS; ++c )
+		{
+			if ( !client_disconnected[c] && stats[c] )
+			{
+				SAMLua::Event ev;
+				ev.setName("game.on_game_start");
+				ev.i("player", (long long)c);
+				ev.i("class_id", (long long)client_classes[c]);
+				ev.s("class_name", std::string(playerClassLangEntry(client_classes[c], c)));
+				ev.i("race", (long long)stats[c]->playerRace);
+				ev.s("race_name", std::string(Language::get(3161 + stats[c]->playerRace)));
+				SAMLua::dispatchEvent(ev);
+
+				SAMJs::Event jsev;
+				jsev.setName("game.on_game_start");
+				jsev.i("player", (long long)c);
+				jsev.i("class_id", (long long)client_classes[c]);
+				jsev.s("class_name", std::string(playerClassLangEntry(client_classes[c], c)));
+				jsev.i("race", (long long)stats[c]->playerRace);
+				jsev.s("race_name", std::string(Language::get(3161 + stats[c]->playerRace)));
+				SAMJs::dispatchEvent(jsev);
+			}
+		}
+	}
 
 	if ( !wasLoadingSaveGame )
 	{
@@ -11802,7 +11896,18 @@ bool replayLastCharacter(const int index, int multiplayer)
 		stats[index]->sex = static_cast<sex_t>(std::min(lastSex, (int)sex_t::FEMALE));
 		stats[index]->playerRace = std::min(std::max(static_cast<int>(RACE_HUMAN), lastRace), static_cast<int>(RACE_ENUM_END - 1));
 		stats[index]->stat_appearance = lastAppearance;
-		client_classes[index] = std::min(std::max(0, lastClass), static_cast<int>(NUMCLASSES - 1));
+		// S.A.M: a registered custom class (id >= SAM_CLASS_ID_BASE) must survive the
+		// restore. The vanilla clamp to NUMCLASSES-1 would turn it into CLASS_PALADIN,
+		// so the game "forgets" the last-selected custom class. Gate on getClass() so a
+		// stale id from an uninstalled mod still falls back safely to the vanilla clamp.
+		if ( lastClass >= SAM_CLASS_ID_BASE && SAMClasses::getClass(lastClass) != nullptr )
+		{
+			client_classes[index] = lastClass;
+		}
+		else
+		{
+			client_classes[index] = std::min(std::max(0, lastClass), static_cast<int>(NUMCLASSES - 1));
+		}
 
 		switch ( isCharacterValidFromDLC(*stats[index], lastClass) )
 		{

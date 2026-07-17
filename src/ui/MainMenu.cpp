@@ -1,4 +1,5 @@
 #include "../main.hpp"
+#include <algorithm>
 #include "MainMenu.hpp"
 #include "Frame.hpp"
 #include "Image.hpp"
@@ -15,6 +16,8 @@
 #include "../menu.hpp"
 #include "../scores.hpp"
 #include "../mod_tools.hpp"
+#include "sam_classes.hpp" // S.A.M Framework custom classes
+#include "sam_sync.hpp" // S.A.M Framework multiplayer mod-fingerprint sync
 #include "../interface/interface.hpp"
 #include "../draw.hpp"
 #include "../engine/audio/sound.hpp"
@@ -11800,7 +11803,10 @@ bind_failed:
 	        client_classes[player] = (int)SDLNet_Read32(&net_packet->data[37]);
 	        stats[player]->sex = static_cast<sex_t>((int)SDLNet_Read32(&net_packet->data[41]));
 	        Uint32 raceAndAppearance = SDLNet_Read32(&net_packet->data[45]);
-	        stats[player]->stat_appearance = (raceAndAppearance & 0xFF00) >> 8;
+	        // S.A.M: clamp — this is a raw network byte and nothing validated it. An
+	        // out-of-range value walks playerHeadSprite's arithmetic off the end of the
+	        // appearance blocks and renders an arbitrary unrelated model as someone's head.
+	        stats[player]->stat_appearance = std::min<Uint32>((Uint32)((raceAndAppearance & 0xFF00) >> 8), (Uint32)(NUMAPPEARANCES - 1));
 	        stats[player]->playerRace = (raceAndAppearance & 0xFF);
 
 			if (!loadingsavegame) {
@@ -11906,6 +11912,16 @@ bind_failed:
 		// client requesting game scenario
 		{ 'CSCN', []() {
 			sendCustomScenarioOverNet(net_packet->data[4]);
+		} },
+
+		// S.A.M Framework: client requesting our mod fingerprint.
+		// Guard the packet length before reading data[4]; sendFingerprint() then
+		// bounds-checks the slot itself. The slot is client-supplied, but the payload
+		// is the host's own (identical-for-all-clients) fingerprint, so a mis-targeted
+		// request only sends a benign, receiver-deduped packet — no OOB, no info leak.
+		{ 'SAMF', []() {
+			if ( net_packet->len < 5 ) { return; }
+			SAMSync::sendFingerprint(net_packet->data[4]);
 		} },
 
 		// client requesting new svFlags
@@ -12104,11 +12120,13 @@ bind_failed:
 					}
 					sendSvFlagsOverNet();
 					sendCustomScenarioOverNet(playerNum);
+					SAMSync::sendFingerprint(playerNum); // S.A.M: mod fingerprint for sync check
 				}
 				else if ( result == NetworkingLobbyJoinRequestResult::NET_LOBBY_JOIN_DIRECTIP_SUCCESS )
 				{
 					sendSvFlagsOverNet();
 					sendCustomScenarioOverNet(playerNum);
+					SAMSync::sendFingerprint(playerNum); // S.A.M: mod fingerprint for sync check
 				}
 
 			    // assume success after this point
@@ -12168,9 +12186,16 @@ bind_failed:
 	    {'JOIN', [](){
 	        const int player = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
 		    client_disconnected[player] = false;
-		    client_classes[player] = net_packet->data[5];
+		    // S.A.M: prefer the 32-bit class in the appended tail. data[5] is a single byte,
+		    // so it truncates every custom class id (>= 1000) down to garbage. A host on an
+		    // older build sends the short packet and we fall back to the byte — broken the
+		    // same way it always was, rather than reading past the end.
+		    client_classes[player] = ( net_packet->len >= 45 )
+		        ? (int)SDLNet_Read32(&net_packet->data[41])
+		        : (int)net_packet->data[5];
 		    stats[player]->sex = static_cast<sex_t>(net_packet->data[6]);
-		    stats[player]->stat_appearance = net_packet->data[7];
+		    // S.A.M: clamp — raw network byte, never validated (see the JOIN note above).
+		    stats[player]->stat_appearance = std::min<Uint32>((Uint32)net_packet->data[7], (Uint32)(NUMAPPEARANCES - 1));
 		    stats[player]->playerRace = net_packet->data[8];
 		    stringCopy(stats[player]->name, (char*)(&net_packet->data[9]), sizeof(Stat::name), 32);
 
@@ -12210,7 +12235,8 @@ bind_failed:
                 client_classes[player] = (int)SDLNet_Read32(&net_packet->data[37]);
                 stats[player]->sex = static_cast<sex_t>((int)SDLNet_Read32(&net_packet->data[41]));
                 Uint32 raceAndAppearance = SDLNet_Read32(&net_packet->data[45]);
-                stats[player]->stat_appearance = (raceAndAppearance & 0xFF00) >> 8;
+                // S.A.M: clamp — raw network byte, never validated.
+                stats[player]->stat_appearance = std::min<Uint32>((Uint32)((raceAndAppearance & 0xFF00) >> 8), (Uint32)(NUMAPPEARANCES - 1));
                 stats[player]->playerRace = (raceAndAppearance & 0xFF);
 				if (!loadingsavegame) {
 					initClass(player);
@@ -12290,6 +12316,49 @@ bind_failed:
 		// update mod achievement status
 		{ 'MODS', []() {
 			Mods::lobbyDisableSteamAchievements = net_packet->data[4] == 0 ? false : true;
+		} },
+
+		// S.A.M Framework: the host's mod fingerprint ("namespace@version;..."),
+		// chunked like CSCN. Compare against our own mod list and WARN on
+		// mismatch — never block; the player decides whether to stay.
+		{ 'SAMF', []() {
+			if ( !SAMSync::receiveFingerprint((const char*)&net_packet->data[4], (int)net_packet->len - 4) )
+			{
+				return; // more chunks pending
+			}
+			if ( !SAMSync::hasMismatch() )
+			{
+				return; // fingerprints match — logged, nothing to show
+			}
+			// cap the prompt at a few issues; the full list is in sam_log.txt
+			std::string text = "S.A.M mod mismatch with host!\n\n";
+			const std::string details = SAMSync::getMismatchDetails();
+			int shown = 0;
+			int total = 0;
+			size_t start = 0;
+			while ( start < details.size() )
+			{
+				size_t end = details.find('\n', start);
+				if ( end == std::string::npos )
+				{
+					end = details.size();
+				}
+				++total;
+				if ( shown < 3 )
+				{
+					text += details.substr(start, end - start) + "\n";
+					++shown;
+				}
+				start = end + 1;
+			}
+			if ( total > shown )
+			{
+				text += "(+" + std::to_string(total - shown) + " more - see sam_log.txt)\n";
+			}
+			text += "\nYou may still play, but modded content\nwill not match the host.";
+			soundError();
+			monoPromptGeneric(text.c_str(), "Okay",
+				[](Button&){ soundCancel(); closeMono(); }, false);
 		} },
 
 		// update custom scenario string
@@ -12562,9 +12631,19 @@ bind_failed:
 						stats[c]->clearStats();
 						client_disconnected[c] = net_packet->data[8 + c * chunk_size + 0]; // connectedness
 						playerSlotsLocked[c] = net_packet->data[8 + c * chunk_size + 1]; // locked state
-						client_classes[c] = net_packet->data[8 + c * chunk_size + 2]; // class
+						// S.A.M: prefer the appended 32-bit class tail. The in-chunk byte
+						// truncates every custom class id (>= 1000), so a modded player showed
+						// up as a garbage class. A host on an older build sends no tail and we
+						// fall back to the byte rather than reading past the packet.
+						{
+							const int samTail = 8 + MAXPLAYERS * chunk_size;
+							client_classes[c] = ( (int)net_packet->len >= samTail + MAXPLAYERS * 4 )
+								? (int)SDLNet_Read32(&net_packet->data[samTail + c * 4])
+								: (int)net_packet->data[8 + c * chunk_size + 2];
+						}
 						stats[c]->sex = static_cast<sex_t>(net_packet->data[8 + c * chunk_size + 3]); // sex
-						stats[c]->stat_appearance = net_packet->data[8 + c * chunk_size + 4]; // appearance
+						// S.A.M: clamp — raw network byte, never validated.
+						stats[c]->stat_appearance = std::min<Uint32>((Uint32)net_packet->data[8 + c * chunk_size + 4], (Uint32)(NUMAPPEARANCES - 1)); // appearance
 						stats[c]->playerRace = net_packet->data[8 + c * chunk_size + 5]; // player race
 						stringCopy(stats[c]->name, (char*)(net_packet->data + 8 + c * chunk_size + 6), sizeof(Stat::name), 32); // name
 
@@ -12878,6 +12957,7 @@ bind_failed:
 		PingNetworkStatus_t::reset();
 		Mods::lobbyDisableSteamAchievements = false;
 		lobbyCustomScenarioClient.clear();
+		SAMSync::clear(); // S.A.M: never let fingerprint state survive into a new connection
 
 	    // open wait prompt
         cancellablePrompt("connect_prompt", "", "Cancel", [](Widget& widget){
@@ -16691,6 +16771,21 @@ failed:
 
         if (details) {
   		    static auto class_desc_fn = [](Field& field, int index){
+			    // S.A.M custom classes (ids >= 1000): show the registered description.
+			    if ( client_classes[index] >= SAM_CLASS_ID_BASE )
+			    {
+			        const SAMClassDef* samdef = SAMClasses::getClass(client_classes[index]);
+			        field.setText(samdef ? samdef->description.c_str() : "");
+			        // Use a UNIFORM text color, NOT addColorToLine(): a custom
+			        // description is free-form text that the Field reflows to fit,
+			        // so the vanilla per-word-highlight map (keyed to the pre-reflow
+			        // structure) desyncs from the reflowed lines and Text::render()
+			        // indexes a null color array -> crash. setColor is reflow-safe
+			        // and works for any description (empty, short, or wrapping).
+			        field.setColor(color_dlc0);
+			        field.clearIndividualLinePadding();
+			        return;
+			    }
 			    const int i = std::min(std::max(0, client_classes[index]), (Sint32)(ClassDescriptions::data.size() - 1));
 				field.setText(ClassDescriptions::data[i].text.c_str());
 			    if (i < CLASS_CONJURER) {
@@ -16733,9 +16828,31 @@ failed:
 
 		    for (int c = 0; c < num_class_stats; ++c) {
 		        static auto class_stat_fn = [](Field& field, int index){
-			        const int i = std::min(std::max(0, client_classes[index]), (Sint32)(ClassDescriptions::data.size() - 1));
 			        const int s = (int)strtol(field.getName(), nullptr, 10);
-			        field.setColor(ClassDescriptions::data[i].statRatings[s]);
+			        // S.A.M FIX: ClassDescriptions::data is a std::map keyed by class enum.
+			        // Custom/S.A.M classes (ids >= SAM_CLASS_ID_BASE) and any id without a
+			        // vanilla description have NO key here. The old code clamped to
+			        // data.size()-1 and used operator[], which INSERTS an empty entry for the
+			        // absent key; statRatings[s] then dereferenced the empty vector's null
+			        // data() and crashed ("Show Class Info" on a custom class). Use find()
+			        // (never inserts) and fall back to a neutral rating for custom classes.
+			        auto descIt = ClassDescriptions::data.find(client_classes[index]);
+			        if ( descIt == ClassDescriptions::data.end()
+			            || s < 0 || s >= (int)descIt->second.statRatings.size() )
+			        {
+			            field.setColor(makeColorRGB(191, 191, 191)); // neutral grey
+			            if ( auto parent = static_cast<Frame*>(field.getParent()) )
+			            {
+			                char buf[32];
+			                snprintf(buf, sizeof(buf), "stat img bottom %d", s);
+			                if ( auto img = parent->findImage(buf) ) { img->disabled = true; }
+			            }
+			            return;
+			        }
+			        const auto& desc = descIt->second;
+			        const std::string rating = (s < (int)desc.statRatingsStrings.size())
+			            ? desc.statRatingsStrings[s] : std::string();
+			        field.setColor(desc.statRatings[s]);
 
 					if ( auto parent = static_cast<Frame*>(field.getParent()) )
 					{
@@ -16745,11 +16862,11 @@ failed:
 
 						snprintf(buf, sizeof(buf), "stat img bottom %d", s);
 						auto class_stat_img_bottom = parent->findImage(buf);
-						if ( /*!class_stat_img_top ||*/ !class_stat_img_bottom ) 
+						if ( /*!class_stat_img_top ||*/ !class_stat_img_bottom )
 						{
 							return;
 						}
-						if ( ClassDescriptions::data[i].statRatingsStrings[s] == "bad" )
+						if ( rating == "bad" )
 						{
 							//class_stat_img_top->disabled = true;
 							class_stat_img_bottom->disabled = false;
@@ -16757,7 +16874,7 @@ failed:
 							class_stat_img_bottom->path = 
 								"*#images/ui/Main Menus/Play/PlayerCreation/ClassSelection/statgrowth_lo2.png";
 						}
-						else if ( ClassDescriptions::data[i].statRatingsStrings[s] == "poor" )
+						else if ( rating == "poor" )
 						{
 							//class_stat_img_top->disabled = true;
 							class_stat_img_bottom->disabled = false;
@@ -16765,7 +16882,7 @@ failed:
 							class_stat_img_bottom->path =
 								"*#images/ui/Main Menus/Play/PlayerCreation/ClassSelection/statgrowth_lo1.png";
 						}
-						else if ( ClassDescriptions::data[i].statRatingsStrings[s] == "decent" )
+						else if ( rating == "decent" )
 						{
 							//class_stat_img_top->disabled = false;
 							class_stat_img_bottom->disabled = false;
@@ -16773,7 +16890,7 @@ failed:
 							class_stat_img_bottom->path =
 								"*#images/ui/Main Menus/Play/PlayerCreation/ClassSelection/statgrowth_hi1.png";
 						}
-						else if ( ClassDescriptions::data[i].statRatingsStrings[s] == "good" )
+						else if ( rating == "good" )
 						{
 							//class_stat_img_top->disabled = false;
 							class_stat_img_bottom->disabled = false;
@@ -16837,11 +16954,20 @@ failed:
 
 				static constexpr int hpmp_buf_size = 32;
 				static auto hpmp_fn = [](Field& field, int index) {
-					const int i = std::min(std::max(0, client_classes[index]), (Sint32)(ClassDescriptions::data.size() - 1));
+					// S.A.M FIX (see class_stat_fn): find() avoids inserting an empty map
+					// entry every frame for custom/S.A.M classes; show a neutral 20/20.
+					auto descIt = ClassDescriptions::data.find(client_classes[index]);
 					char buf[hpmp_buf_size];
-					snprintf(buf, sizeof(buf), "%d\n%d",
-						ClassDescriptions::data[i].hp,
-						ClassDescriptions::data[i].mp);
+					if ( descIt != ClassDescriptions::data.end() )
+					{
+						snprintf(buf, sizeof(buf), "%d\n%d",
+							descIt->second.hp,
+							descIt->second.mp);
+					}
+					else
+					{
+						snprintf(buf, sizeof(buf), "%d\n%d", 20, 20);
+					}
 					field.setText(buf);
 				};
 
@@ -16876,14 +17002,25 @@ failed:
 		    // difficulty stars
 		    static constexpr int star_buf_size = 32;
 	        static auto stars_fn = [](Field& field, int index){
-		        const int i = std::min(std::max(0, client_classes[index]), (Sint32)(ClassDescriptions::data.size() - 1));
+		        // S.A.M FIX (see class_stat_fn): find() never inserts; custom/S.A.M classes
+		        // have no survivalComplexity entry, so show a neutral difficulty instead of
+		        // dereferencing an empty vector.
+		        auto descIt = ClassDescriptions::data.find(client_classes[index]);
+		        if ( descIt == ClassDescriptions::data.end()
+		            || descIt->second.survivalComplexity.size() < 2 )
+		        {
+		            field.setColor(makeColorRGB(191, 191, 191));
+		            field.setText("***\n***"); // neutral difficulty for custom classes
+		            return;
+		        }
+		        const auto& sc = descIt->second.survivalComplexity;
 		        for (int c = 0; c < 2; ++c) {
-					field.addColorToLine(c, std::get<2>(ClassDescriptions::data[i].survivalComplexity[c]));
+					field.addColorToLine(c, std::get<2>(sc[c]));
 		        }
 		        char buf[star_buf_size];
-		        snprintf(buf, sizeof(buf), "%s\n%s", 
-					std::get<1>(ClassDescriptions::data[i].survivalComplexity[0]).c_str(), 
-					std::get<1>(ClassDescriptions::data[i].survivalComplexity[1]).c_str());
+		        snprintf(buf, sizeof(buf), "%s\n%s",
+					std::get<1>(sc[0]).c_str(),
+					std::get<1>(sc[1]).c_str());
 		        field.setText(buf);
 	        };
 
@@ -16897,6 +17034,14 @@ failed:
 	        (*difficulty_stars->getTickCallback())(*difficulty_stars);
         } else {
 		    static auto class_name_fn = [](Field& field, int index){
+			    // S.A.M custom classes (ids >= 1000): show the registered name.
+			    if ( client_classes[index] >= SAM_CLASS_ID_BASE )
+			    {
+			        const SAMClassDef* samdef = SAMClasses::getClass(client_classes[index]);
+			        field.setText(samdef ? samdef->name.c_str() : "");
+			        field.setColor(color_dlc0);
+			        return;
+			    }
 			    const int i = std::min(std::max(0, client_classes[index]), num_classes - 1);
 			    field.setText(Language::get(playerClassLangEntryCapitalized(i)));
 			    if (i < CLASS_CONJURER) {
@@ -16921,7 +17066,12 @@ failed:
 		    (*class_name->getTickCallback())(*class_name);
 		}
 
-		const int height = std::max(254, 6 + 54 * (int)(num_classes / 4 + ((num_classes % 4) ? 1 : 0)));
+		// S.A.M: custom classes are appended as extra icon buttons after the vanilla
+		// grid (see the SAMClasses loop below), so the scroll area must be tall enough
+		// to reach them. Include SAMClasses::count() in the row math — otherwise custom
+		// classes on any row past the vanilla grid get clipped out of the scroll region.
+		const int sam_total_classes = num_classes + (int)SAMClasses::count();
+		const int height = std::max(254, 6 + 54 * (int)(sam_total_classes / 4 + ((sam_total_classes % 4) ? 1 : 0)));
 
 		auto subframe = card->addFrame("subframe");
 		subframe->setScrollBarsEnabled(false);
@@ -17069,6 +17219,9 @@ failed:
 
 		const int current_class = std::min(std::max(0, client_classes[index]), num_classes - 1);
 		auto current_class_name = classes_in_order[current_class];
+		// S.A.M: when a custom class (id >= 1000) is selected, no vanilla button
+		// should highlight — its name matches none of classes_in_order.
+		if ( client_classes[index] >= SAM_CLASS_ID_BASE ) { current_class_name = ""; }
 
         bool selected_button = false;
 		static const std::string prefix = "*images/ui/Main Menus/Play/PlayerCreation/ClassSelection/";
@@ -17347,6 +17500,71 @@ failed:
 			    });
 		}
 
+// S.A.M custom classes: append selectable icon buttons after the vanilla grid.
+		// Each button is named by the class id string; its callback stores the real
+		// runtime id (>= 1000) into client_classes, so grid position and class id
+		// stay decoupled. The vanilla button_fn ignores these (their names aren't in
+		// classes_in_order), leaving the built-in class flow untouched.
+		for ( int samIdx = 0; samIdx < SAMClasses::count(); ++samIdx )
+		{
+			const int samClassId = SAMClasses::classIdAtIndex(samIdx);
+			const SAMClassDef* samdef = SAMClasses::getClass(samClassId);
+			if ( !samdef ) { continue; }
+			const int pos = num_classes + samIdx;
+			auto sambutton = subframe->addButton(samdef->id.c_str());
+			sambutton->setBackground((prefix + "ClassSelect_IconBGBase_00.png").c_str());
+			sambutton->setBackgroundHighlighted((prefix + "ClassSelect_IconBGBaseHigh_00.png").c_str());
+			sambutton->setBackgroundActivated((prefix + "ClassSelect_IconBGBasePress_00.png").c_str());
+			// Custom portrait if the mod shipped one (resolved + existence-checked
+			// at load time in sam_classes.cpp); otherwise the placeholder icon.
+			// The leading '*' selects nearest-neighbour filtering to match the
+			// vanilla pixel-art icons. portraitPath is absolute, so Image::get's
+			// PhysFS lookup misses and it falls through to a direct IMG_Load — and
+			// if that load fails the button just draws no icon (never crashes).
+			if ( !samdef->portraitPath.empty() )
+			{
+				sambutton->setIcon(("*" + samdef->portraitPath).c_str());
+			}
+			else
+			{
+				sambutton->setIcon((prefix + "ClassSelect_Icon_Barbarian_00.png").c_str());
+			}
+			sambutton->setColor(makeColor(255, 255, 255, 255));
+			sambutton->setHighlightColor(makeColor(255, 255, 255, 255));
+			sambutton->setSize(SDL_Rect{ 8 + (pos % 4) * 54, 6 + (pos / 4) * 54, 54, 54 });
+			if ( client_classes[index] == samClassId )
+			{
+				sambutton->select();
+				sambutton->scrollParent();
+				selected_button = true;
+			}
+			sambutton->setWidgetSearchParent(((std::string("card") + std::to_string(index)).c_str()));
+			sambutton->addWidgetAction("MenuStart", "confirm");
+			sambutton->setCallback([](Button& button){
+				const int index = button.getOwner();
+				const int samId = SAMClasses::classIdForIdString(button.getName());
+				if ( samId < 0 ) { return; }
+				soundActivate();
+				button.setColor(makeColor(255, 255, 255, 255));
+				client_classes[index] = samId;
+				stats[index]->clearStats();
+				initClass(index);
+				sendPlayerOverNet();
+				saveLastCharacter(index, multiplayer);
+				if ( inputs.hasController(index) )
+				{
+					createCharacterCard(index);
+					if ( auto lobby = main_menu_frame->findFrame("lobby") )
+					{
+						if ( auto card = lobby->findFrame((std::string("card") + std::to_string(index)).c_str()) )
+						{
+							if ( auto classbtn = card->findButton("class") ) { classbtn->select(); }
+						}
+					}
+				}
+			});
+		}
+
         if (!selected_button) {
 		    auto first_button = subframe->findButton(reduced_class_list[0]);
 		    assert(first_button);
@@ -17377,6 +17595,7 @@ failed:
 		if (multiplayer == CLIENT) {
 			sendSvFlagsOverNet();
 			sendCustomScenarioOverNet(index);
+			SAMSync::requestFingerprint(); // S.A.M: self-heal if the join-time send was swallowed
 		}
 
 		auto countdown = lobby->findFrame("countdown");
@@ -17968,6 +18187,13 @@ failed:
 		auto class_text = card->addField("class_text", 64);
 		class_text->setSize(SDL_Rect{96, 236, 138, 32});
 		static auto class_text_fn = [](Field& field, int index){
+			// S.A.M custom classes (ids >= 1000): show the registered name.
+			if ( client_classes[index] >= SAM_CLASS_ID_BASE )
+			{
+				const SAMClassDef* samdef = SAMClasses::getClass(client_classes[index]);
+				field.setText(samdef ? samdef->name.c_str() : "");
+				return;
+			}
 			int i = std::min(std::max(0, client_classes[index]), num_classes - 1);
             field.setText(Language::get(playerClassLangEntryCapitalized(i)));
 		};
@@ -26395,17 +26621,19 @@ failed:
 		enabledDLCPack3 = nxCheckDLC(2);
 #endif
 #ifdef STEAMWORKS
+		// S.A.M: accept owned-but-not-"installed" DLC too (samDlcOwned), so a client-side
+		// installed-flag quirk no longer locks non-human saves out of loading.
 		if ( !enabledDLCPack1 )
 		{
-			enabledDLCPack1 = SteamApps()->BIsDlcInstalled(1010820);
+			enabledDLCPack1 = samDlcOwned(1010820);
 		}
 		if ( !enabledDLCPack2 )
 		{
-			enabledDLCPack2 = SteamApps()->BIsDlcInstalled(1010821);
+			enabledDLCPack2 = samDlcOwned(1010821);
 		}
 		if ( !enabledDLCPack3 )
 		{
-			enabledDLCPack3 = SteamApps()->BIsDlcInstalled(1010822);
+			enabledDLCPack3 = samDlcOwned(1010822);
 		}
 #endif
 

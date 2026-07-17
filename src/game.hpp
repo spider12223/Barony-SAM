@@ -401,6 +401,9 @@ extern std::vector<std::string> randomNPCNamesFemale;
 extern bool enabledDLCPack1;
 extern bool enabledDLCPack2;
 extern bool enabledDLCPack3;
+// S.A.M: DLC ownership check that accepts either "installed" or "subscribed" (owned).
+// See the definition in menu.cpp for why BIsDlcInstalled alone locks owners out.
+bool samDlcOwned(uint32_t dlcAppId);
 extern std::vector<std::string> physFSFilesInDirectory;
 void loadRandomNames();
 int mapLevel(int player, int radius, int _x, int _y, bool usingSpell);
