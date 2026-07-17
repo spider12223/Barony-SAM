@@ -26,6 +26,12 @@ See LICENSE for details.
 #endif
 #include "init.hpp"
 #include "ui/LoadingScreen.hpp"
+#include "sam_loader.hpp" // S.A.M Framework core loader
+#ifndef EDITOR
+#include "sam_spells.hpp" // S.A.M custom-spell icon lookup (getSpellIconPath hook)
+#include "sam_items.hpp"  // S.A.M custom .vox model registration (registerModModels)
+#include "sam_classes.hpp" // S.A.M per-class appearance (resolveAppearance)
+#endif
 #include <thread>
 #include <future>
 #include <fstream>
@@ -982,7 +988,13 @@ void ItemTooltips_t::readItemsFromFile()
 	Uint32 hash = 0;
 	for ( int i = 0; i < NUMITEMS && i < itemsRead; ++i )
 	{
-		assert(i == tmpItems[i].itemId);
+		// S.A.M: was assert(i == tmpItems[i].itemId). Softened to a warning so a
+		// modified items.json (or the reserved custom id range >= 5000) can't hard-
+		// abort a debug build; this loop only writes the built-in range [0, NUMITEMS).
+		if ( i != tmpItems[i].itemId )
+		{
+			printlog("[JSON]: warning: items/items.json entry %d has item_id %d (expected %d)", i, tmpItems[i].itemId, i);
+		}
 		items[i].level = tmpItems[i].itemLevel;
 		items[i].gold_value = tmpItems[i].gold;
 		items[i].weight = tmpItems[i].weight;
@@ -2482,6 +2494,10 @@ std::string& ItemTooltips_t::getIconLabel(Item& item)
 {
 #ifndef EDITOR
 	if ( item.type == SPELL_ITEM && !item.spellNotifyIcon ) { return defaultString; }
+	// S.A.M custom item (type >= NUMITEMS): tmpItems is only sized to the vanilla item
+	// count, so tmpItems[5000] is a wild OOB read whose garbage std::string copy throws
+	// bad_alloc when the inventory renders the icon label. Guard it (no icon label).
+	if ( (size_t)item.type >= tmpItems.size() ) { return defaultString; }
 	return tmpItems[item.type].iconLabelPath;
 #endif
 }
@@ -3140,22 +3156,22 @@ std::string ItemTooltips_t::getSpellIconPath(const int player, Item& item, int s
 	}
 	else if ( item.type == SPELL_ITEM )
 	{
-		if ( spellID > SPELL_NONE )
-		{
-			spellImageNode = getSpellNodeFromSpellID(spellID);
-		}
-		else
+		// Resolve the real spell id (either passed in or from the item's appearance).
+		int resolvedSpellID = spellID;
+		if ( resolvedSpellID <= SPELL_NONE )
 		{
 			spell_t* spell = getSpellFromItem(player, &item, false);
-			if ( spell )
-			{
-				spellImageNode = getSpellNodeFromSpellID(spell->ID);
-			}
-			else
-			{
-				spellImageNode = getSpellNodeFromSpellID(SPELL_NONE);
-			}
+			resolvedSpellID = spell ? spell->ID : SPELL_NONE;
 		}
+		// S.A.M custom spell (id >= 2000): use the mod-supplied PNG (loaded by path like a
+		// class portrait), else fall back to a generic magic orb (forcebolt's icon).
+		if ( resolvedSpellID >= SAM_SPELL_ID_BASE )
+		{
+			std::string samIcon = SAMSpells::getIconPath(resolvedSpellID);
+			if ( !samIcon.empty() ) { return samIcon; }
+			resolvedSpellID = SPELL_FORCEBOLT; // generic fallback icon
+		}
+		spellImageNode = getSpellNodeFromSpellID(resolvedSpellID > SPELL_NONE ? resolvedSpellID : SPELL_NONE);
 	}
 	if ( spellImageNode )
 	{
@@ -9665,7 +9681,12 @@ void ClassHotbarConfig_t::writeToFile(HotbarConfigType fileWriteType, HotbarConf
 
 	if ( fileWriteType == HOTBAR_LAYOUT_CUSTOM_CONFIG )
 	{
-		std::string classname = playerClassInternalNames[client_classes[clientnum]];
+		// S.A.M: playerClassInternalNames is sized to the vanilla classes; use a
+		// distinct fallback key for custom class ids (>= 1000) to avoid OOB access.
+		const int samcc = client_classes[clientnum];
+		std::string classname = ( samcc >= 0 && samcc < (int)playerClassInternalNames.size() )
+			? playerClassInternalNames[samcc]
+			: ( std::string("sam_custom_") + std::to_string(samcc) );
 		if ( writeNewFile )
 		{
 			CustomHelpers::addMemberToRoot(exportDocument, "version", rapidjson::Value(VERSION));
@@ -10023,6 +10044,10 @@ void ClassHotbarConfig_t::init()
 void ClassHotbarConfig_t::assignHotbarSlots(const int player)
 {
 	int classnum = client_classes[player];
+	// S.A.M: ClassHotbars[]/ClassHotbarsDefault[] are sized [NUMCLASSES]; a custom
+	// class id (>= 1000) would index out of bounds and crash. Fall back to the
+	// Barbarian layout as a safe base (SAM's own starting hotbar slots still apply).
+	if ( classnum < 0 || classnum >= NUMCLASSES ) { classnum = CLASS_BARBARIAN; }
 	auto& layoutDefault = players[player]->hotbar.useHotbarFaceMenu ? ClassHotbarsDefault[classnum].layoutModern : ClassHotbarsDefault[classnum].layoutClassic;
 	auto& layoutCustom = players[player]->hotbar.useHotbarFaceMenu ? ClassHotbars[classnum].layoutModern : ClassHotbars[classnum].layoutClassic;
 
@@ -10135,6 +10160,10 @@ void ClassHotbarConfig_t::assignHotbarSlots(const int player)
 			}
 		}
 	}
+
+	// S.A.M: this pass just zeroed and rebuilt the bar from the class layout, wiping any
+	// hotbar slots a custom class pinned in applyLoadout. Put them back so they win.
+	SAMClasses::reapplyHotbarPins(player);
 }
 
 LocalAchievements_t LocalAchievements;
@@ -11625,6 +11654,10 @@ void Mods::unloadMods(bool force)
 	clearAllMountedPaths();
 	mountedFilepaths.clear();
 	Mods::disableSteamAchievements = false;
+
+	// S.A.M Framework — tear the mod registry back down to vanilla on unload.
+	SAMLoader::unload();
+
     if (force) {
         modelsListModifiedIndexes.clear();
         for (int c = 0; c < nummodels; ++c) {
@@ -11823,6 +11856,12 @@ void Mods::loadMods()
 
 	Mods::customContentLoadedFirstTime = true;
 
+	// S.A.M Framework — mod folders are now mounted; scan them for mod.json and
+	// (re)load. Mods::mountedFilepaths holds the resolved path for every
+	// subscribed Workshop item and local mod. This runs every time the player
+	// starts a modded game, so SAMLoader fully rebuilds its registry each call.
+	SAMLoader::load(Mods::mountedFilepaths, VERSION);
+
 	updateLoadingScreen(10);
 	doLoadingScreen();
 
@@ -11861,6 +11900,18 @@ void Mods::loadMods()
 		useModelCache = oldModelCache;
 		Mods::modelsListRequiresReloadUnmodded = true;
 	}
+
+	// S.A.M: mods can ship their own .vox models. Deliberately AFTER the block above:
+	// that pass computes its range from `nummodels` as it stands, so appending here
+	// keeps our models invisible to it and its replacements invisible to us. Growing
+	// the model tables reallocs them, and this is the one point in the frame where the
+	// engine already tears down and rebuilds polymodels wholesale — so nothing is
+	// holding a stale pointer across it. Don't move this call.
+	SAMItems::registerModModels();
+
+	// Classes can name a custom head, so their appearance can only be resolved once the
+	// models above actually exist and have indices.
+	SAMClasses::resolveAppearance();
 
 	updateLoadingScreen(20);
 	doLoadingScreen();
