@@ -22,6 +22,8 @@
 #include "magic/magic.hpp"
 #include "prng.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp" // S.A.M scripting hooks
 
 /*-------------------------------------------------------------------------------
 
@@ -346,6 +348,24 @@ void actSink(Entity* my)
 						}
 						default:
 							break;
+					}
+
+					// S.A.M scripting hook: a player used a sink (host-authoritative; actSink
+					// returns early for CLIENT). skill[3] is the rolled outcome, read here
+					// BEFORE the second-usage block below reassigns it.
+					{
+						const long long samOutcome = (long long)my->skill[3];
+						const char* samOutcomeName = samOutcome == 0 ? "ring"
+							: samOutcome == 1 ? "slime" : samOutcome == 2 ? "nutrition" : "damage";
+						SAMLua::Event ev;
+						ev.setName("world.on_sink_used").i("player", i)
+							.i("sink", (long long)my->getUID()).i("outcome_code", samOutcome).s("outcome", samOutcomeName);
+						SAMLua::dispatchEvent(ev);
+
+						SAMJs::Event jsev;
+						jsev.setName("world.on_sink_used").i("player", i)
+							.i("sink", (long long)my->getUID()).i("outcome_code", samOutcome).s("outcome", samOutcomeName);
+						SAMJs::dispatchEvent(jsev);
 					}
 
 					// run the water particles

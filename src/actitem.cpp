@@ -22,6 +22,8 @@
 #include "paths.hpp"
 #include "prng.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp" // S.A.M scripting hooks
 
 /*-------------------------------------------------------------------------------
 
@@ -814,6 +816,23 @@ void actItem(Entity* my)
 							item = itemPickup(i, item2);
 							if (item)
 							{
+								// S.A.M scripting hook: a player picked an item up off the ground.
+								// Host-authoritative (inside `multiplayer != CLIENT`). Hooked at the
+								// in-world pickup site, NOT itemPickup() itself, which also runs for
+								// starting-inventory grants. item2 is the picked stack (freed below).
+								{
+									SAMLua::Event ev;
+									ev.setName("player.on_item_pickup").i("player", i)
+										.i("item_type", (long long)item2->type).i("count", pickedUpCount)
+										.s("item_name", item2->getName());
+									SAMLua::dispatchEvent(ev);
+
+									SAMJs::Event jsev;
+									jsev.setName("player.on_item_pickup").i("player", i)
+										.i("item_type", (long long)item2->type).i("count", pickedUpCount)
+										.s("item_name", item2->getName());
+									SAMJs::dispatchEvent(jsev);
+								}
 								if (players[i]->isLocalPlayer())
 								{
 									// item is the new inventory stack for server, free the picked up items

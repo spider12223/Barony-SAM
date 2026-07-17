@@ -18,6 +18,8 @@
 #include "net.hpp"
 #include "collision.hpp"
 #include "player.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp" // S.A.M scripting hooks
 
 /*-------------------------------------------------------------------------------
 
@@ -159,6 +161,25 @@ void Entity::actTeleporter()
 					{
 						Player::getPlayerInteractEntity(i)->teleporterMove(teleporterX, teleporterY, teleporterType);
 					}
+
+					// S.A.M scripting hook: a player used a teleporter (host-authoritative;
+					// actTeleporter's interact loop is server-side). Covers both the tunnel
+					// spell teleporter (type 3) and normal pads. dest_x/dest_y are the target
+					// tile the player warped to on the same floor.
+					{
+						SAMLua::Event ev;
+						ev.setName("world.on_teleport").i("player", i)
+							.i("teleporter", (long long)this->getUID()).i("type", (long long)teleporterType)
+							.i("dest_x", (long long)teleporterX).i("dest_y", (long long)teleporterY);
+						SAMLua::dispatchEvent(ev);
+
+						SAMJs::Event jsev;
+						jsev.setName("world.on_teleport").i("player", i)
+							.i("teleporter", (long long)this->getUID()).i("type", (long long)teleporterType)
+							.i("dest_x", (long long)teleporterX).i("dest_y", (long long)teleporterY);
+						SAMJs::dispatchEvent(jsev);
+					}
+
 					return;
 				}
 			}

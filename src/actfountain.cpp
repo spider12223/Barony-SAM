@@ -24,6 +24,8 @@
 #include "scores.hpp"
 #include "prng.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp" // S.A.M scripting hooks
 
 //Fountain functions.
 const std::vector<unsigned int> fountainPotionDropChances =
@@ -633,6 +635,22 @@ void actFountain(Entity* my)
 						messagePlayerColor(i, MESSAGE_STATUS, uint32ColorGreen, Language::get(3246));
 					}
 					messagePlayer(i, MESSAGE_INTERACTION, Language::get(474));
+
+					// S.A.M scripting hook: a player used a fountain (host-authoritative;
+					// actFountain returns early for CLIENT). Fires once, right before the
+					// fountain dries up. `effect` is the fountain's rolled effect type.
+					{
+						SAMLua::Event ev;
+						ev.setName("world.on_fountain_used").i("player", i)
+							.i("fountain", (long long)my->getUID()).i("effect", (long long)my->skill[1]);
+						SAMLua::dispatchEvent(ev);
+
+						SAMJs::Event jsev;
+						jsev.setName("world.on_fountain_used").i("player", i)
+							.i("fountain", (long long)my->getUID()).i("effect", (long long)my->skill[1]);
+						SAMJs::dispatchEvent(jsev);
+					}
+
 					my->skill[0] = 0; //Dry up fountain.
 					serverUpdateEntitySkill(my, 0);
 					//TODO: messagePlayersInSight() instead.

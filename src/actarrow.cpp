@@ -24,6 +24,8 @@
 #include "player.hpp"
 #include "prng.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp" // S.A.M scripting hooks
 
 /*-------------------------------------------------------------------------------
 
@@ -554,6 +556,28 @@ void actArrow(Entity* my)
 			{
 				Entity* parent = uidToEntity(my->parent);
 				Stat* hitstats = hit.entity->getStats();
+
+				// S.A.M scripting hook: a projectile struck an entity. Host-authoritative
+				// (clients bail out of the hit resolution earlier). Fires for player shots,
+				// monster archers and trap arrows alike — `player` is the shooter's index
+				// when a player fired it, else -1. target_type is the struck monster's type
+				// (from its stats) or -1 for a non-creature (chest, furniture, ...).
+				{
+					const long long samShooterPlayer =
+						(parent && parent->behavior == &actPlayer) ? (long long)parent->skill[2] : -1;
+					const long long samTargetType = hitstats ? (long long)hitstats->type : -1;
+					SAMLua::Event ev;
+					ev.setName("world.on_projectile_hit").i("player", samShooterPlayer)
+						.i("shooter_uid", (long long)my->parent).i("target_uid", (long long)hit.entity->getUID())
+						.i("target_type", samTargetType);
+					SAMLua::dispatchEvent(ev);
+
+					SAMJs::Event jsev;
+					jsev.setName("world.on_projectile_hit").i("player", samShooterPlayer)
+						.i("shooter_uid", (long long)my->parent).i("target_uid", (long long)hit.entity->getUID())
+						.i("target_type", samTargetType);
+					SAMJs::dispatchEvent(jsev);
+				}
 				playSoundEntity(my, 72 + local_rng.rand() % 3, 64);
 				if ( hit.entity->behavior == &actChest || hit.entity->isInertMimic() )
 				{

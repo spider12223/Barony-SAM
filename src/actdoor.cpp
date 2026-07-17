@@ -21,6 +21,8 @@
 #include "items.hpp"
 #include "prng.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp" // S.A.M scripting hooks
 
 /*-------------------------------------------------------------------------------
 
@@ -168,6 +170,23 @@ void actDoor(Entity* my)
 								playSoundEntity(my, 22, 96);
 								messagePlayer(i, MESSAGE_INTERACTION, Language::get(465));
 								Compendium_t::Events_t::eventUpdateWorld(i, Compendium_t::CPDM_DOOR_CLOSED, "door", 1);
+							}
+
+							// S.A.M scripting hook: a player opened a door. Host-authoritative
+							// (whole block is inside `multiplayer != CLIENT`). doorStatus is 1/2
+							// after either open branch and 0 after the close branch, so gating on
+							// it fires on opens only and covers both door orientations at once.
+							if ( my->doorStatus != 0 )
+							{
+								SAMLua::Event ev;
+								ev.setName("world.on_door_opened").i("player", i)
+									.i("door", (long long)my->getUID()).i("status", my->doorStatus).s("type", "door");
+								SAMLua::dispatchEvent(ev);
+
+								SAMJs::Event jsev;
+								jsev.setName("world.on_door_opened").i("player", i)
+									.i("door", (long long)my->getUID()).i("status", my->doorStatus).s("type", "door");
+								SAMJs::dispatchEvent(jsev);
 							}
 						}
 						else

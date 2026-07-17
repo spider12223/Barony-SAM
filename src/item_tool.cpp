@@ -23,6 +23,8 @@
 #include "prng.hpp"
 #include "mod_tools.hpp"
 #include "collision.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp" // S.A.M scripting hooks
 
 void Item::applySkeletonKey(int player, Entity& entity)
 {
@@ -1014,6 +1016,23 @@ void Item::applyOrb(int player, ItemType type, Entity& entity)
 			}
 			entity.pedestalHasOrb = type - ARTIFACT_ORB_BLUE + 1;
 			serverUpdateEntitySkill(&entity, 0); // update orb status.
+
+			// S.A.M scripting hook: a player placed an orb on a pedestal (host-authoritative;
+			// this block is inside `multiplayer != CLIENT`). `correct` is 1 when the orb
+			// matched the pedestal (the ritual advanced), 0 when it was the wrong orb.
+			{
+				const long long samCorrect = playSound ? 1 : 0;
+				SAMLua::Event ev;
+				ev.setName("world.on_orb_placed").i("player", player)
+					.i("pedestal", (long long)entity.getUID()).i("orb_type", (long long)type).i("correct", samCorrect);
+				SAMLua::dispatchEvent(ev);
+
+				SAMJs::Event jsev;
+				jsev.setName("world.on_orb_placed").i("player", player)
+					.i("pedestal", (long long)entity.getUID()).i("orb_type", (long long)type).i("correct", samCorrect);
+				SAMJs::dispatchEvent(jsev);
+			}
+
 			Item* item = stats[player]->weapon;
 			consumeItem(item, player);
 			stats[player]->weapon = nullptr;

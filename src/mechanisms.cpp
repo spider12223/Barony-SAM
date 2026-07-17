@@ -19,6 +19,8 @@
 #include "scores.hpp"
 #include "mod_tools.hpp"
 #include "collision.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp" // S.A.M scripting hooks
 
 //Circuits do not overlap. They connect to all their neighbors, allowing for circuits to interfere with eachother.
 static ConsoleVariable<bool> cvar_wire_debug("/wire_debug", false);
@@ -200,6 +202,21 @@ void actSwitch(Entity* my)
 					playSoundEntity(my, 56, 64);
 					my->toggleSwitch();
 					Compendium_t::Events_t::eventUpdateWorld(i, Compendium_t::CPDM_LEVER_PULLED, "lever", 1);
+
+					// S.A.M scripting hook: a player flipped a lever/switch (host-authoritative;
+					// this block is inside `multiplayer != CLIENT`). Read AFTER toggleSwitch()
+					// so `state` is the NEW on/off value (skill[0]).
+					{
+						SAMLua::Event ev;
+						ev.setName("world.on_switch_toggled").i("player", i)
+							.i("switch", (long long)my->getUID()).i("state", (long long)my->skill[0]);
+						SAMLua::dispatchEvent(ev);
+
+						SAMJs::Event jsev;
+						jsev.setName("world.on_switch_toggled").i("player", i)
+							.i("switch", (long long)my->getUID()).i("state", (long long)my->skill[0]);
+						SAMJs::dispatchEvent(jsev);
+					}
 				}
 			}
 		}
