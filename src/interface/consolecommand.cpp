@@ -17,6 +17,7 @@
 #include "../game.hpp"
 #include "../stat.hpp"
 #include "../items.hpp"
+#include "sam_items.hpp"     // resolve custom items in /spawnitem
 #include "../init.hpp"
 #include "../book.hpp"
 #include "../engine/audio/sound.hpp"
@@ -42,6 +43,41 @@ bool logCheckObstacle = false;
 int logCheckObstacleCount = 0;
 bool logCheckMainLoopTimers = false;
 bool autoLimbReload = false;
+
+// S.A.M: the /spawnitem family only searches Barony's built-in name table, which stops at
+// NUMITEMS — custom S.A.M items live at reserved slots >= SAM_ITEM_ID_BASE and never match.
+// Resolve a typed name against the registered custom items too: an exact "namespace:item"
+// id, or the item's own identified name (exact, then substring, case-insensitive). Returns
+// the slot id to spawn, or -1 if it isn't a known custom item.
+static int samResolveCustomItem(const std::string& name)
+{
+	if ( name.empty() ) { return -1; }
+	if ( name.find(':') != std::string::npos )
+	{
+		const int id = SAMItems::itemIdForIdString(name);
+		if ( id >= 0 ) { return id; }
+	}
+	auto lower = [](std::string s) {
+		for ( char& ch : s ) { if ( ch >= 'A' && ch <= 'Z' ) { ch = char(ch - 'A' + 'a'); } }
+		return s;
+	};
+	const std::string want = lower(name);
+	const int total = SAMItems::count();
+	for ( int pass = 0; pass < 2; ++pass ) // 0 = exact name, 1 = substring
+	{
+		for ( int id = SAM_ITEM_ID_BASE; id < SAM_ITEM_ID_BASE + total; ++id )
+		{
+			const SAMItemDef* def = SAMItems::getItem(id);
+			if ( !def ) { continue; }
+			const std::string nm = lower(def->nameIdentified);
+			if ( pass == 0 ? (nm == want) : (nm.find(want) != std::string::npos) )
+			{
+				return id;
+			}
+		}
+	}
+	return -1;
+}
 
 /*******************************************************************************
 	std::string cvars
@@ -566,7 +602,16 @@ namespace ConsoleCommands {
 		}
 		if (c == NUMITEMS)
 		{
-			messagePlayer(clientnum, MESSAGE_MISC, Language::get(278), name.c_str());
+			// Not a vanilla item — try the registered S.A.M custom items before giving up.
+			const int samId = samResolveCustomItem(name);
+			if ( samId >= 0 )
+			{
+				dropItem(newItem(static_cast<ItemType>(samId), EXCELLENT, 0, 1, local_rng.rand(), true, &stats[clientnum]->inventory), 0);
+			}
+			else
+			{
+				messagePlayer(clientnum, MESSAGE_MISC, Language::get(278), name.c_str());
+			}
 		}
 		});
 
@@ -4982,7 +5027,17 @@ namespace ConsoleCommands {
 		}
 		if ( c == NUMITEMS )
 		{
-			messagePlayer(clientnum, MESSAGE_MISC, Language::get(278), name.c_str());
+			// Not a vanilla item — try the registered S.A.M custom items, keeping the
+			// beatitude and status the player asked for.
+			const int samId = samResolveCustomItem(name);
+			if ( samId >= 0 )
+			{
+				dropItem(newItem(static_cast<ItemType>(samId), static_cast<Status>(status), beatitude, 1, local_rng.rand(), true, &stats[clientnum]->inventory), 0);
+			}
+			else
+			{
+				messagePlayer(clientnum, MESSAGE_MISC, Language::get(278), name.c_str());
+			}
 		}
 	});
 
