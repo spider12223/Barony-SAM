@@ -21,6 +21,7 @@
 #include "prng.hpp"
 #include "mod_tools.hpp"
 #include "collision.hpp"
+#include "sam_effects.hpp"   // S.A.M custom status effects -- mod-declared "curable" answer
 
 Stat* stats[MAXPLAYERS];
 
@@ -478,6 +479,7 @@ void Stat::clearStats()
 		}
 	}
 	this->attributes.clear();
+	this->samTraits = 0;   // S.A.M: the cache dies with the map it mirrors
 	this->player_lootbags.clear();
 
 	freePlayerEquipment();
@@ -890,6 +892,7 @@ Stat* Stat::copyStats()
 	newStat->magic_effects.first = NULL;
 	newStat->magic_effects.last = NULL;
 	newStat->attributes = this->attributes;
+	newStat->samTraits = this->samTraits;   // S.A.M: keep the trait cache with its map
 	newStat->player_lootbags = this->player_lootbags;
 	return newStat;
 }
@@ -1642,6 +1645,15 @@ int Stat::numShillelaghDebuffsActive(Entity* my)
 
 bool Stat::statusEffectRemovedByCureAilment(const int effect, Entity* my)
 {
+	// S.A.M: a mod-declared status effect answers from its own registry entry. Placed at the
+	// TOP so it is reachable -- the switch below ends in `default: break;` then `return false;`,
+	// which would swallow anything put after it. Only fires for slots >= SAM_EFFECT_SLOT_BASE
+	// (135), which no vanilla `case` covers, so no vanilla answer can change. Additive only:
+	// it can turn false->true, never the reverse.
+	if ( SAMEffects::any() && effect >= SAM_EFFECT_SLOT_BASE && SAMEffects::isCurable(effect) )
+	{
+		return true;
+	}
 	switch ( effect )
 	{
 		case EFF_ASLEEP:

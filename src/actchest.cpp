@@ -13,6 +13,7 @@
 #include "game.hpp"
 #include "stat.hpp"
 #include "entity.hpp"
+#include "sam_event.hpp"   // world.on_before_chest_open
 #include "interface/interface.hpp"
 #include "items.hpp"
 #include "engine/audio/sound.hpp"
@@ -20,6 +21,13 @@
 #include "player.hpp"
 #include "prng.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp"
+#include "sam_loot.hpp"       // S.A.M: chest-fill events, the roll context, the category draw
+#include <unordered_set>
+
+// S.A.M proximity latch: tracks chest UIDs that have already fired world.on_chest_found this session
+static std::unordered_set<Uint32> samFoundChests;
 
 /*
  * Chest theme ideas:
@@ -132,6 +140,16 @@ void createChestInventory(Entity* my, int chestType)
 		minimumQuality = 5;
 	}
 
+	// S.A.M: world.on_before_chest_fill, once the type and the quality floor are known and before
+	// any item is made. A handler may rewrite chest_type (0..8, 8 = empty) and min_quality, or
+	// cancel: then the switch below takes the empty case and the mod fills the chest from
+	// world.on_chest_filled (the vampire quest book is still placed). Every roll inside the switch
+	// is a "chest" roll for the tables and for world.on_before_loot_roll. A map chest is filled on
+	// the level loader's thread, where the events cannot fire (sam_loot.hpp): only the tables act
+	// there; a chest summoned during play gets both.
+	const bool samFillChest = SAMLoot::beforeChestFill(my, chesttype, minimumQuality);
+	SAMLoot::ContextScope samChestCtx(SAMLoot::Chest, (long long)my->getUID(), -1, chesttype);
+
 	if ( my->chestHasVampireBook && my->behavior == &::actChest )
 	{
 		newItem(SPELLBOOK_VAMPIRIC_AURA, EXCELLENT, 0, 1, rng.rand(), true, inventory);
@@ -140,7 +158,7 @@ void createChestInventory(Entity* my, int chestType)
 	int lastGeneratedItemType = -1;
 	int lastGeneratedItemSpellType = -1;
 
-	switch ( chesttype )   //Note that all of this needs to be properly balanced over time.
+	switch ( samFillChest ? chesttype : 8 )   // S.A.M: a cancelled fill takes case 8, the empty chest. //Note that all of this needs to be properly balanced over time.
 	{
 		//TODO: Make all applicable item additions work on a category based search?
 	case 0:
@@ -156,7 +174,7 @@ void createChestInventory(Entity* my, int chestType)
 			//	itemnum = rng.rand() % NUMITEMS;    //Keep trying until you don't get a spell or invalid item.
 			//}
 			//newItem(static_cast<ItemType>(itemnum), static_cast<Status>(WORN + rng.rand() % 3), 0, 1, rng.rand(), false, inventory);
-			int cat = rng.rand() % (Category::CATEGORY_MAX - 2); // exclude spell_cat
+			int cat = SAMLoot::pickCategory(rng, SAMLoot::PickPlain); // exclude spell_cat -- S.A.M: the vanilla draw, or one weighted by sam_set_loot_category_weight
 			Item* currentItem = newItem(itemLevelCurve(static_cast<Category>(cat), 0, currentlevel + 5, rng), static_cast<Status>(WORN + rng.rand() % 3), 0, 1, rng.rand(), false, inventory);
 			if ( currentItem )
 			{
@@ -780,6 +798,10 @@ void createChestInventory(Entity* my, int chestType)
 			}
 		}
 	}
+
+	// S.A.M: world.on_chest_filled, with the chest's final item_count. A handler adds or removes
+	// through sam_add_item_to_container / sam_remove_item_from_container.
+	SAMLoot::afterChestFill(my, chesttype);
 }
 
 void Entity::actChest()
@@ -851,6 +873,41 @@ void Entity::actChest()
 			spawnAmbientParticles(40, 600, 20 + local_rng.rand() % 30, 0.5, true);
 		}
 		return;
+	}
+
+	// S.A.M world.on_chest_found: proximity-latched discovery (host only, fires once per chest)
+	if ( multiplayer != CLIENT && samFoundChests.find(getUID()) == samFoundChests.end() )
+	{
+		for ( int c = 0; c < MAXPLAYERS; ++c )
+		{
+			if ( players[c] && players[c]->entity )
+			{
+				double sdx = players[c]->entity->x - x;
+				double sdy = players[c]->entity->y - y;
+				if ( (sdx * sdx + sdy * sdy) <= (4.0 * 16) * (4.0 * 16) )
+				{
+					samFoundChests.insert(getUID());
+
+					SAMLua::Event ev;
+					ev.setName("world.on_chest_found");
+					ev.i("player", (long long)c);
+					ev.i("chest_uid", (long long)getUID());
+					ev.i("floor_x", (long long)(x / 16));
+					ev.i("floor_y", (long long)(y / 16));
+					SAMLua::dispatchEvent(ev);
+
+					SAMJs::Event jsev;
+					jsev.setName("world.on_chest_found");
+					jsev.i("player", (long long)c);
+					jsev.i("chest_uid", (long long)getUID());
+					jsev.i("floor_x", (long long)(x / 16));
+					jsev.i("floor_y", (long long)(y / 16));
+					SAMJs::dispatchEvent(jsev);
+
+					break;
+				}
+			}
+		}
 	}
 
 	if (!chestInit)
@@ -1068,6 +1125,22 @@ void Entity::actChest()
 				}
 				else
 				{
+					// S.A.M: cancellable, and this is the only place a chest opens. Nothing has
+					// been mutated at this point, so a veto needs no rollback -- the chest just
+					// stays shut. The open body is wrapped rather than early-returned so the
+					// rest of actChest's tick still runs. The existing player.on_chest_opened
+					// still fires at the end of that body, i.e. only on an open that happened.
+					bool samChestAllowed = true;
+					{
+						SamEvent samChestEv("world.on_before_chest_open");
+						samChestEv.i("player", (long long)chestclicked)
+							.i("chest", (long long)this->getUID())
+							.i("x", (long long)(this->x / 16))
+							.i("y", (long long)(this->y / 16));
+						samChestAllowed = samChestEv.fire();
+					}
+					if ( samChestAllowed )
+					{
 					messagePlayer(chestclicked, MESSAGE_INTERACTION, Language::get(459));
 					openedChest[chestclicked] = this;
 
@@ -1110,6 +1183,26 @@ void Entity::actChest()
 						players[chestclicked]->inventoryUI.chestGUI.openChest(chestVoidState != 0);
 					}
 					chestStatus = 1; //Toggle chest open/closed.
+
+					if ( chestclicked >= 0 && multiplayer != CLIENT )
+					{
+						SAMLua::Event ev;
+						ev.setName("player.on_chest_opened");
+						ev.i("player", (long long)chestclicked);
+						ev.i("chest_uid", (long long)getUID());
+						ev.i("floor_x", (long long)(x / 16));
+						ev.i("floor_y", (long long)(y / 16));
+						SAMLua::dispatchEvent(ev);
+
+						SAMJs::Event jsev;
+						jsev.setName("player.on_chest_opened");
+						jsev.i("player", (long long)chestclicked);
+						jsev.i("chest_uid", (long long)getUID());
+						jsev.i("floor_x", (long long)(x / 16));
+						jsev.i("floor_y", (long long)(y / 16));
+						SAMJs::dispatchEvent(jsev);
+					}
+					}   // if ( samChestAllowed )
 				}
 			}
 			else
@@ -1479,7 +1572,11 @@ Item* Entity::addItemToChestFromInventory(int player, Item* item, int amount, bo
 				}
 			}
 			item->identified = true;
-			Item::onItemIdentified(player, item);
+			// S.A.M: canUnequip above already revealed this item and reported it through
+			// Item::onItemIdentified (the only way it returns false). Reporting it again fired
+			// player.on_item_identified twice, and once more on every later attempt for an item
+			// that was long identified. The stacking half of the call still runs, as before.
+			Item::onItemIdentified(player, item, false);
 			return nullptr;
 		}
 	}

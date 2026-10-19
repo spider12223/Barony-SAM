@@ -10,6 +10,7 @@
 -------------------------------------------------------------------------------*/
 
 #include "player.hpp"
+#include "sam_races.hpp"   // S.A.M custom races: declared relations on the client
 #include "game.hpp"
 #include "main.hpp"
 #include "interface/interface.hpp"
@@ -3752,7 +3753,7 @@ real_t Player::WorldUI_t::tooltipInRange(Entity& tooltip)
 					&& !(parent->isInertMimic())
 					&& ((multiplayer != CLIENT && parent->checkEnemy(player.entity)) 
 						|| (multiplayer == CLIENT 
-							&& !parent->monsterAllyGetPlayerLeader() && !monsterally[parent->getMonsterTypeFromSprite()][stats[player.playernum]->type])) )
+							&& !parent->monsterAllyGetPlayerLeader() && SAMRaces::clientEnemyView(player.playernum, parent->getMonsterTypeFromSprite(), !monsterally[parent->getMonsterTypeFromSprite()][stats[player.playernum]->type]))) )
 				{
 					// monsters have wider interact angle for aim assist
 					interactAngle = (PI / 6);
@@ -7336,7 +7337,11 @@ void Player::PlayerMechanics_t::onItemDegrade(Item* item)
 	{
 		return;
 	}
-	if ( item->type < 0 || item->type >= NUMITEMS )
+	// S.A.M: NUM_ITEM_SLOTS, not NUMITEMS -- a custom item bailed out of the degrade
+	// bookkeeping entirely, so custom shields and weapons wore out far faster than the
+	// vanilla equivalent. itemDegradeRng is a std::map keyed by type, so the wider range
+	// costs nothing and cannot overrun.
+	if ( item->type < 0 || item->type >= NUM_ITEM_SLOTS )
 	{
 		return;
 	}
@@ -7357,7 +7362,9 @@ bool Player::PlayerMechanics_t::itemDegradeRoll(Item* item, int skillID, int* ch
 		return true;
 	}
 	// assuming just shields/spellbooks for now
-	if ( item->type < 0 || item->type >= NUMITEMS )
+	// S.A.M: see onItemDegrade above -- NUMITEMS excluded every custom item from the
+	// degrade interval, so they skipped the "only every Nth hit" damping vanilla gets.
+	if ( item->type < 0 || item->type >= NUM_ITEM_SLOTS )
 	{
 		return true;
 	}

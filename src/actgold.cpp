@@ -21,6 +21,8 @@
 #include "scores.hpp"
 #include "collision.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp"
 
 /*-------------------------------------------------------------------------------
 
@@ -177,6 +179,20 @@ void actGoldBag(Entity* my)
 					{
 						Compendium_t::Events_t::eventUpdateCodex(i, Compendium_t::CPDM_GOLD_COLLECTED, "gold", my->goldAmount);
 						Compendium_t::Events_t::eventUpdateCodex(i, Compendium_t::CPDM_GOLD_COLLECTED_RUN, "gold", my->goldAmount);
+					}
+
+					// S.A.M scripting hook: a player collected a gold pile. Host-authoritative.
+					if ( multiplayer != CLIENT )
+					{
+						SAMLua::Event ev;
+						ev.setName("player.on_gold_collected").i("player", i)
+							.i("amount", my->goldAmount).i("total_gold", stats[i]->GOLD);
+						SAMLua::dispatchEvent(ev);
+
+						SAMJs::Event jsev;
+						jsev.setName("player.on_gold_collected").i("player", i)
+							.i("amount", my->goldAmount).i("total_gold", stats[i]->GOLD);
+						SAMJs::dispatchEvent(jsev);
 					}
 
 					// remove gold entity

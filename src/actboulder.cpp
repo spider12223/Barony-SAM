@@ -23,6 +23,9 @@
 #include "paths.hpp"
 #include "scores.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp"
+#include "sam_loot.hpp"       // S.A.M: world.on_fixture_loot for the luckstone a stuck boulder leaves
 
 #define BOULDER_STOPPED my->skill[0]
 #define BOULDER_AMBIENCE my->skill[1]
@@ -1055,6 +1058,12 @@ void actBoulder(Entity* my)
 				hit.entity = my; // for magicDig
 
 				// spawn luckstone
+				// S.A.M: world.on_fixture_loot("boulder"): rewrite the luckstone or cancel it (then no item
+				// entity is made; the boulder is still removed and the message still shown).
+				int samType = (int)GEM_LUCK, samStatus = (int)WORN, samBeatitude = 0, samCount = 1;
+				const bool samMakeRock = SAMLoot::fixtureLoot("boulder", -1, (int)(my->x / 16), (int)(my->y / 16), samType, samStatus, samBeatitude, samCount);
+				if ( samMakeRock )
+				{
 				Entity* rock = newEntity(-1, 1, map.entities, nullptr); //Rock entity.
 				rock->flags[INVISIBLE] = true;
 				rock->flags[UPDATENEEDED] = true;
@@ -1068,12 +1077,13 @@ void actBoulder(Entity* my)
 				rock->flags[PASSABLE] = true;
 				rock->behavior = &actItem;
 				rock->flags[USERFLAG1] = true; // no collision: helps performance
-				rock->skill[10] = GEM_LUCK;    // type
-				rock->skill[11] = WORN;        // status
-				rock->skill[12] = 0;           // beatitude
-				rock->skill[13] = 1;           // count
+				rock->skill[10] = samType;      // type: GEM_LUCK unless a handler said otherwise
+				rock->skill[11] = samStatus;    // status
+				rock->skill[12] = samBeatitude; // beatitude
+				rock->skill[13] = samCount;     // count
 				rock->skill[14] = 0;           // appearance
 				rock->skill[15] = false;       // identified
+				}   // if ( samMakeRock )
 
 				for ( int c = 0; c < MAXPLAYERS; ++c )
 				{
@@ -1151,6 +1161,12 @@ void actBoulder(Entity* my)
 								hit.entity = my;
 
 								// spawn luckstone
+								// S.A.M: world.on_fixture_loot("boulder"): rewrite the luckstone or cancel it (then no item
+								// entity is made; the boulder is still removed and the message still shown).
+								int samType = (int)GEM_LUCK, samStatus = (int)WORN, samBeatitude = 0, samCount = 1;
+								const bool samMakeRock = SAMLoot::fixtureLoot("boulder", -1, (int)(my->x / 16), (int)(my->y / 16), samType, samStatus, samBeatitude, samCount);
+								if ( samMakeRock )
+								{
 								Entity* rock = newEntity(-1, 1, map.entities, nullptr); //Rock entity.
 								rock->flags[INVISIBLE] = true;
 								rock->flags[UPDATENEEDED] = true;
@@ -1164,12 +1180,13 @@ void actBoulder(Entity* my)
 								rock->flags[PASSABLE] = true;
 								rock->behavior = &actItem;
 								rock->flags[USERFLAG1] = true; // no collision: helps performance
-								rock->skill[10] = GEM_LUCK;    // type
-								rock->skill[11] = WORN;        // status
-								rock->skill[12] = 0;           // beatitude
-								rock->skill[13] = 1;           // count
+								rock->skill[10] = samType;      // type: GEM_LUCK unless a handler said otherwise
+								rock->skill[11] = samStatus;    // status
+								rock->skill[12] = samBeatitude; // beatitude
+								rock->skill[13] = samCount;     // count
 								rock->skill[14] = 0;           // appearance
 								rock->skill[15] = false;       // identified
+								}   // if ( samMakeRock )
 
 								for ( int c = 0; c < MAXPLAYERS; ++c )
 								{
@@ -1803,6 +1820,20 @@ void actBoulderTrap(Entity* my)
 			if ( foundTrapdoor >= 0 )
 			{
 				playSoundEntity(my, 150, 128);
+				if ( multiplayer != CLIENT )
+				{
+					SAMLua::Event ev;
+					ev.setName("world.on_boulder_triggered");
+					ev.i("floor_x", (long long)(my->x / 16));
+					ev.i("floor_y", (long long)(my->y / 16));
+					SAMLua::dispatchEvent(ev);
+
+					SAMJs::Event jsev;
+					jsev.setName("world.on_boulder_triggered");
+					jsev.i("floor_x", (long long)(my->x / 16));
+					jsev.i("floor_y", (long long)(my->y / 16));
+					SAMJs::dispatchEvent(jsev);
+				}
 				playSoundPlayer(clientnum, 150, 64);
 				for ( c = 0; c < MAXPLAYERS; c++ )
 				{
@@ -1896,6 +1927,21 @@ void actBoulderTrapEast(Entity* my)
 				}
 			}
 			my->boulderTrapFired = 1;
+
+			if ( multiplayer != CLIENT )
+			{
+				SAMLua::Event ev;
+				ev.setName("world.on_boulder_triggered");
+				ev.i("floor_x", (long long)(my->x / 16));
+				ev.i("floor_y", (long long)(my->y / 16));
+				SAMLua::dispatchEvent(ev);
+
+				SAMJs::Event jsev;
+				jsev.setName("world.on_boulder_triggered");
+				jsev.i("floor_x", (long long)(my->x / 16));
+				jsev.i("floor_y", (long long)(my->y / 16));
+				SAMJs::dispatchEvent(jsev);
+			}
 
 			c = 0; // direction
 			x = ((int)(my->x)) >> 4;
@@ -2017,6 +2063,21 @@ void actBoulderTrapSouth(Entity* my)
 			}
 			my->boulderTrapFired = 1;
 
+			if ( multiplayer != CLIENT )
+			{
+				SAMLua::Event ev;
+				ev.setName("world.on_boulder_triggered");
+				ev.i("floor_x", (long long)(my->x / 16));
+				ev.i("floor_y", (long long)(my->y / 16));
+				SAMLua::dispatchEvent(ev);
+
+				SAMJs::Event jsev;
+				jsev.setName("world.on_boulder_triggered");
+				jsev.i("floor_x", (long long)(my->x / 16));
+				jsev.i("floor_y", (long long)(my->y / 16));
+				SAMJs::dispatchEvent(jsev);
+			}
+
 			c = 1; // direction
 			x = ((int)(my->x)) >> 4;
 			y = ((int)(my->y)) >> 4;
@@ -2137,6 +2198,21 @@ void actBoulderTrapWest(Entity* my)
 			}
 			my->boulderTrapFired = 1;
 
+			if ( multiplayer != CLIENT )
+			{
+				SAMLua::Event ev;
+				ev.setName("world.on_boulder_triggered");
+				ev.i("floor_x", (long long)(my->x / 16));
+				ev.i("floor_y", (long long)(my->y / 16));
+				SAMLua::dispatchEvent(ev);
+
+				SAMJs::Event jsev;
+				jsev.setName("world.on_boulder_triggered");
+				jsev.i("floor_x", (long long)(my->x / 16));
+				jsev.i("floor_y", (long long)(my->y / 16));
+				SAMJs::dispatchEvent(jsev);
+			}
+
 			c = 2; // direction
 			x = ((int)(my->x)) >> 4;
 			y = ((int)(my->y)) >> 4;
@@ -2256,6 +2332,21 @@ void actBoulderTrapNorth(Entity* my)
 				}
 			}
 			my->boulderTrapFired = 1;
+
+			if ( multiplayer != CLIENT )
+			{
+				SAMLua::Event ev;
+				ev.setName("world.on_boulder_triggered");
+				ev.i("floor_x", (long long)(my->x / 16));
+				ev.i("floor_y", (long long)(my->y / 16));
+				SAMLua::dispatchEvent(ev);
+
+				SAMJs::Event jsev;
+				jsev.setName("world.on_boulder_triggered");
+				jsev.i("floor_x", (long long)(my->x / 16));
+				jsev.i("floor_y", (long long)(my->y / 16));
+				SAMJs::dispatchEvent(jsev);
+			}
 
 			c = 3; // direction
 			x = ((int)(my->x)) >> 4;

@@ -14,6 +14,9 @@
 #include "../stat.hpp"
 #include "magic.hpp"
 #include "../mod_tools.hpp"
+#ifndef EDITOR
+#include "sam_spells.hpp" // S.A.M: (re)build custom spells after setupSpells wipes allGameSpells
+#endif
 
 std::map<int, spell_t*> allGameSpells;
 std::map<int, std::map<int, int>> spellTomeAppearanceToID;
@@ -3535,6 +3538,13 @@ void setupSpells()   ///TODO: Verify this function.
 			}
 		}
 	}
+
+	// S.A.M v0.8.0: setupSpells wipes allGameSpells on every run (incl. modded reload), so
+	// (re)build the registered custom mod spells into it here. No-op before mods load (the
+	// SAM spell registry is empty then); after a mod load it restores the SAM spell_t's.
+#ifndef EDITOR
+	SAMSpells::buildAllEngineSpells();
+#endif
 }
 
 spell_t* createSimpleSpell(int spellID, int difficulty, int mana, int base_mana, int overload_mult, int damage, 

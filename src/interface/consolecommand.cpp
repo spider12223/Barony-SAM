@@ -11,6 +11,8 @@
 
 #include "../main.hpp"
 #include "consolecommand.hpp"
+#include <cstdarg>
+#include "sam_logger.hpp" // test commands log their output so results are readable after the fact
 
 #include <sstream>
 #include "../files.hpp"
@@ -18,6 +20,18 @@
 #include "../stat.hpp"
 #include "../items.hpp"
 #include "sam_items.hpp"     // resolve custom items in /spawnitem
+#include "sam_sync.hpp"      // /sam_saveids: the fingerprint a save (and the host) records
+#include "sam_effects.hpp"   // /sam_effect test command — apply a custom status effect
+#include "sam_bodies.hpp"  // /sam_setmodel — custom creature body models
+#include "sam_models.hpp"  // SAMModels::modelIndexForId
+#include "sam_races.hpp"     // /sam_races + /sam_setrace test commands
+#include "sam_sounds.hpp"    // /sam_sounds + /sam_playsound test commands
+#include "sam_music.hpp"
+#include "sam_loader.hpp"    // /sam_reload — re-run the mod loader without restarting
+#include "sam_classes.hpp"   // /sam_reload — re-resolve class appearance after a reload
+#include "sam_mp_input.hpp"  // /kick: player.on_player_left, and tell the other clients
+#include "sam_loot.hpp"      // /sam_loot, /itemlevelcurve: the "console" roll context
+#include "sam_speed.hpp"     // /sam_gamespeed: the simulation speed (P_SPEED)
 #include "../init.hpp"
 #include "../book.hpp"
 #include "../engine/audio/sound.hpp"
@@ -62,10 +76,12 @@ static int samResolveCustomItem(const std::string& name)
 		return s;
 	};
 	const std::string want = lower(name);
-	const int total = SAMItems::count();
+	// Scan the whole custom range, not [BASE, BASE+count). Framework built-ins such as the
+	// Hunter's Workbench sit at fixed ids in a reserved band above the mod range, so the ids
+	// are no longer contiguous and a count-based bound would skip them entirely.
 	for ( int pass = 0; pass < 2; ++pass ) // 0 = exact name, 1 = substring
 	{
-		for ( int id = SAM_ITEM_ID_BASE; id < SAM_ITEM_ID_BASE + total; ++id )
+		for ( int id = SAM_ITEM_ID_BASE; id < NUM_ITEM_SLOTS; ++id )
 		{
 			const SAMItemDef* def = SAMItems::getItem(id);
 			if ( !def ) { continue; }
@@ -465,6 +481,956 @@ namespace ConsoleCommands {
 		lastname = name.c_str();
 		});
 
+	// ---- S.A.M custom status-effect test commands (local testing) ----
+	static ConsoleCommand ccmd_sam_effects("/sam_effects", "list registered S.A.M custom status effects", []CCMD{
+		if ( !SAMEffects::any() )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: no custom effects registered (load a mod with an effects/ folder).");
+			return;
+		}
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M custom effects (%d):", SAMEffects::count());
+		for ( int slot = SAM_EFFECT_SLOT_BASE; slot < 160; ++slot )
+		{
+			const SAMEffectDef* d = SAMEffects::get(slot);
+			if ( d )
+			{
+				messagePlayer(clientnum, MESSAGE_MISC, "  [%d] %s  (STR%+d DEX%+d CON%+d INT%+d PER%+d CHR%+d, spd x%.2f)",
+					slot, d->id.c_str(), d->attr[0], d->attr[1], d->attr[2], d->attr[3], d->attr[4], d->attr[5], d->moveSpeedMult);
+			}
+		}
+	});
+	static ConsoleCommand ccmd_sam_effect("/sam_effect", "apply a S.A.M custom effect to yourself: /sam_effect <ns:id> [ticks]", []CCMD{
+		if ( argc < 2 )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "usage: /sam_effect <ns:id> [ticks]   (list ids with /sam_effects)");
+			return;
+		}
+		const int slot = SAMEffects::idForName(argv[1]);
+		if ( slot < 0 )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: unknown custom effect '%s' (see /sam_effects).", argv[1]);
+			return;
+		}
+		int ticks = ( argc >= 3 ) ? atoi(argv[2]) : 0;
+		if ( ticks <= 0 ) { ticks = SAMEffects::defaultDurationForSlot(slot); }
+		if ( ticks <= 0 ) { ticks = 500; } // fall back to 10s
+		if ( !players[clientnum] || !players[clientnum]->entity ) { return; }
+		players[clientnum]->entity->setEffect(slot, true, ticks, true);
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: applied '%s' for %d ticks (%.1fs). Check your attributes.",
+			argv[1], ticks, ticks / 50.0);
+	});
+	static ConsoleCommand ccmd_sam_clear_effects("/sam_clear_effects", "clear all active S.A.M custom effects on yourself", []CCMD{
+		if ( !stats[clientnum] ) { return; }
+		int cleared = 0;
+		for ( int slot = SAM_EFFECT_SLOT_BASE; slot < 160; ++slot )
+		{
+			if ( stats[clientnum]->getEffectActive(slot) )
+			{
+				stats[clientnum]->clearEffect(slot);
+				stats[clientnum]->EFFECTS_TIMERS[slot] = 0;
+				++cleared;
+			}
+		}
+		if ( players[clientnum] && players[clientnum]->entity ) { players[clientnum]->entity->serverUpdateEffectsForEntity(true); }
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: cleared %d custom effect(s).", cleared);
+	});
+
+	// Custom potions in alchemy: prove a custom potion mixes SAFELY (no detonation, no item
+	// loss) by calling the real alchemyMixResult the brew GUI uses, with a vanilla control so
+	// a regression in vanilla mixing is caught too. alchemyMixResult is a free function in
+	// interface.cpp with no header, so forward-declare it here.
+	static ConsoleCommand ccmd_sam_alchemy("/sam_alchemy", "S.A.M: check a custom potion mixes safely in alchemy: /sam_alchemy <ns:potion>", []CCMD{
+		extern ItemType alchemyMixResult(ItemType, ItemType, bool&, bool&, bool&, bool&);
+		if ( argc < 2 ) { { char b[512]; snprintf(b, sizeof(b), "usage: /sam_alchemy <ns:potion>"); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); } return; }
+		const int cp = samResolveCustomItem(argv[1]);
+		if ( cp < 0 ) { { char b[512]; snprintf(b, sizeof(b), "S.A.M: unknown item '%s'.", argv[1]); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); } return; }
+		auto report = [&](const char* label, ItemType p1, ItemType p2){
+			bool rnd=false, dup=false, same=false, boom=false;
+			ItemType r = alchemyMixResult(p1, p2, rnd, dup, same, boom);
+			char b[512]; snprintf(b, sizeof(b), "   %-22s -> result=%d explode=%d duplicate=%d%s",
+				label, (int)r, boom?1:0, dup?1:0, (boom ? "  <-- WOULD DETONATE" : ""));
+			messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b);
+		};
+		{ char b[512]; snprintf(b, sizeof(b), "S.A.M alchemy safety for '%s' (id %d):", argv[1], cp); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+		report("custom + ACID",  (ItemType)cp, POTION_ACID);
+		report("ACID + custom",  POTION_ACID, (ItemType)cp);
+		report("WATER + custom", POTION_WATER, (ItemType)cp);
+		report("custom + custom",(ItemType)cp, (ItemType)cp);
+		// Vanilla control: ACID + WATER must still detonate (explode=1), proving the guard did
+		// not neuter vanilla mixing.
+		report("ACID + WATER (ctrl)", POTION_ACID, POTION_WATER);
+		{ char b[512]; snprintf(b, sizeof(b), "   PASS = every custom row explode=0, and the control row explode=1."); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+	});
+
+	// Beatitude-AC proof: for every equipped slot, report whether its item feeds AC from
+	// blessing/cursing (the beatitude_ac trait or a vanilla AC piece) and by how much, then
+	// the total the real getACEffectiveness sees. Equip a blessed custom mask and the mask
+	// line and the blessing total both move -- that is the trait working, in the log.
+	static ConsoleCommand ccmd_sam_ac("/sam_ac", "S.A.M: report each equipped item's beatitude-AC contribution", []CCMD{
+		if ( !stats[clientnum] || !players[clientnum] || !players[clientnum]->entity ) { return; }
+		Stat* st = stats[clientnum];
+		Entity* me = players[clientnum]->entity;
+		struct SlotRef { const char* name; Item* it; };
+		const SlotRef slots[] = {
+			{ "helm", st->helmet }, { "breastplate", st->breastplate }, { "gloves", st->gloves },
+			{ "boots", st->shoes }, { "shield", st->shield }, { "cloak", st->cloak },
+			{ "ring", st->ring }, { "mask", st->mask }, { "amulet", st->amulet },
+		};
+		for ( const SlotRef& s : slots )
+		{
+			if ( !s.it ) { continue; }
+			const bool feeds = Item::doesItemProvideBeatitudeAC(s.it->type);
+			{ char b[512]; snprintf(b, sizeof(b), "   %-11s type=%d beatitude=%d  feeds_AC=%d%s",
+				s.name, (int)s.it->type, (int)s.it->beatitude, feeds ? 1 : 0,
+				( s.it->type >= SAM_ITEM_ID_BASE ) ? "  [MOD]" : ""); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+		}
+		int numBless = 0;
+		const double eff = Entity::getACEffectiveness(me, st, true, me, st, numBless);
+		{ char b[512]; snprintf(b, sizeof(b), "S.A.M: total beatitude blessings feeding AC = %d, AC effectiveness = %.3f", numBless, eff); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+	});
+
+	// Is a custom status effect a curable ailment? Calls the REAL predicate the potion / spell /
+	// Foci-Purity paths call, twice per slot: once as registered, once with the SAM answer forced
+	// off. Identical numbers mean the arm changed nothing -- which is exactly how four traits sat
+	// dead. Vanilla control lines catch a leak into vanilla ids.
+	static ConsoleCommand ccmd_sam_curable("/sam_curable", "S.A.M: is a custom effect a curable ailment? (with/without the flag)", []CCMD{
+		if ( !stats[clientnum] || !players[clientnum] || !players[clientnum]->entity ) { return; }
+		Stat* st = stats[clientnum];
+		Entity* me = players[clientnum]->entity;
+		if ( !SAMEffects::any() )
+		{
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: no custom effects registered -- load a mod, then /sam_effects."); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			return;
+		}
+		// Vanilla controls. EFF_POISONED must read 1/1 (in the vanilla case list, so suppressing the
+		// SAM answer must not change it); EFF_VAMPIRICAURA must read 0/0 (not in the list). If either
+		// pair differs, the arm leaked into vanilla ids.
+		SAMEffects::suppressCurableForTest(false);
+		const int poiWith = st->statusEffectRemovedByCureAilment(EFF_POISONED, me) ? 1 : 0;
+		const int vamWith = st->statusEffectRemovedByCureAilment(EFF_VAMPIRICAURA, me) ? 1 : 0;
+		SAMEffects::suppressCurableForTest(true);
+		const int poiBase = st->statusEffectRemovedByCureAilment(EFF_POISONED, me) ? 1 : 0;
+		const int vamBase = st->statusEffectRemovedByCureAilment(EFF_VAMPIRICAURA, me) ? 1 : 0;
+		SAMEffects::suppressCurableForTest(false);
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M vanilla control: EFF_POISONED=%d/%d (want 1/1)  EFF_VAMPIRICAURA=%d/%d (want 0/0)", poiWith, poiBase, vamWith, vamBase); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		for ( int slot = SAM_EFFECT_SLOT_BASE; slot < 160; ++slot )
+		{
+			const SAMEffectDef* d = SAMEffects::get(slot);
+			if ( !d ) { continue; }
+			SAMEffects::suppressCurableForTest(false);
+			const int withFlag = st->statusEffectRemovedByCureAilment(slot, me) ? 1 : 0;
+			SAMEffects::suppressCurableForTest(true);
+			const int without  = st->statusEffectRemovedByCureAilment(slot, me) ? 1 : 0;
+			SAMEffects::suppressCurableForTest(false);
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "   slot %d '%s' declared=%d -> curable=%d/%d (with/without)  active=%d",
+				slot, d->id.c_str(), d->curable ? 1 : 0, withFlag, without, (int)st->getEffectActive(slot)); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+	});
+
+	// ---- S.A.M world-ops test commands (local testing; ungated like the effect cmds) ----
+
+	// Lists every /sam_ command by WALKING THE REGISTRY, not from a hand-kept list. A
+	// hardcoded list is exactly what rotted in /sam_loot -- its category names drifted out
+	// of step with the enum and six of them silently rolled the wrong table. Enumerating
+	// the real map means a command added tomorrow appears here with no extra step, and one
+	// that is renamed cannot leave a phantom entry behind.
+	static ConsoleCommand ccmd_sam_help("/sam_help", "S.A.M: list every S.A.M console command", []CCMD{
+		const std::string filter = ( argc >= 2 ) ? argv[1] : "";
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M Framework v%s - console commands:", SAM_FRAMEWORK_VERSION); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		int shown = 0;
+		for ( const auto& kv : getConsoleCommands() )
+		{
+			if ( kv.first.rfind("/sam_", 0) != 0 ) { continue; }
+			if ( !filter.empty() && kv.first.find(filter) == std::string::npos ) { continue; }
+			++shown;
+			// desc already begins "S.A.M: ", so trim it -- the header says it once.
+			const char* d = kv.second.desc ? kv.second.desc : "";
+			if ( strncmp(d, "S.A.M: ", 7) == 0 ) { d += 7; }
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "  %-18s %s", kv.first.c_str(), d); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "  (%d commands. /sam_help <word> filters. Everything here also goes to sam_log.txt)", shown); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+	});
+
+	static ConsoleCommand ccmd_sam_pos("/sam_pos", "S.A.M: print your tile position and player uid", []CCMD{
+		if ( !players[clientnum] || !players[clientnum]->entity ) { return; }
+		Entity* e = players[clientnum]->entity;
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: you are at tile (%d, %d), uid %u.",
+			(int)e->x >> 4, (int)e->y >> 4, e->getUID());
+	});
+	static ConsoleCommand ccmd_sam_tp("/sam_tp", "S.A.M: teleport yourself: /sam_tp <x> <y>", []CCMD{
+		if ( argc < 3 ) { messagePlayer(clientnum, MESSAGE_MISC, "usage: /sam_tp <x> <y>   (tile coords; see /sam_pos)"); return; }
+		if ( !players[clientnum] || !players[clientnum]->entity ) { return; }
+		const int tx = atoi(argv[1]), ty = atoi(argv[2]);
+		const bool ok = players[clientnum]->entity->teleport(tx, ty);
+		messagePlayer(clientnum, MESSAGE_MISC, ok
+			? "S.A.M: teleported to (%d, %d)."
+			: "S.A.M: teleport to (%d, %d) refused (wall/blocked/level lock).", tx, ty);
+	});
+	static ConsoleCommand ccmd_sam_gen("/sam_gen", "S.A.M: go to a mod-shipped map or generated branch: /sam_gen <name>", []CCMD{
+		// Mirrors exactly what a level-editor custom portal does, so this exercises the real
+		// code path rather than a test-only shortcut. Without it a mod-shipped dungeon could
+		// only be reached by authoring a portal in the level editor, ie. it was untestable.
+		if ( argc < 2 )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "usage: /sam_gen <name>   (a maps/<name>.lmp your mod ships)");
+			return;
+		}
+		if ( multiplayer == CLIENT ) { messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: /sam_gen is host only."); return; }
+		std::string want = argv[1];
+		const size_t cut = want.rfind(".lmp");
+		if ( cut != std::string::npos ) { want.erase(cut); }
+
+		const std::string base = "maps/" + want + ".lmp";
+		if ( !PHYSFS_getRealDir(base.c_str()) )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: no map named '%s' (looked for %s).", want.c_str(), base.c_str());
+			return;
+		}
+		// <name>00.lmp is what separates a generated LEVELSET from a single static map: the
+		// generator requires it, a plain map never has one.
+		const std::string room0 = "maps/" + want + "00.lmp";
+		if ( PHYSFS_getRealDir(room0.c_str()) )
+		{
+			loadCustomNextMap = "gen:" + want;
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: generating a branch from levelset '%s'...", want.c_str());
+		}
+		else
+		{
+			loadCustomNextMap = want;
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: loading fixed map '%s' (no %s00.lmp, so not a levelset).", want.c_str(), want.c_str());
+		}
+		loadnextlevel = true;
+		Compendium_t::Events_t::previousCurrentLevel = currentlevel;
+		Compendium_t::Events_t::previousSecretlevel = secretlevel;
+		});
+
+	static ConsoleCommand ccmd_sam_spawn("/sam_spawn", "S.A.M: summon a monster in front of you: /sam_spawn <name> [shopType]", []CCMD{
+		if ( argc < 2 ) { messagePlayer(clientnum, MESSAGE_MISC, "usage: /sam_spawn <name> [shopType]   (e.g. /sam_spawn shopkeeper)"); return; }
+		if ( multiplayer == CLIENT ) { messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: /sam_spawn is host only."); return; }
+		if ( !players[clientnum] || !players[clientnum]->entity ) { return; }
+		std::string want = argv[1];
+		for ( char& ch : want ) { ch = (char)tolower((unsigned char)ch); }
+		int creature = -1;
+		for ( int i = 1; i < NUMMONSTERS; ++i ) { if ( want == monstertypename[i] ) { creature = i; break; } }
+
+		// Not a vanilla species? Try a mod-declared VARIANT. A custom monster has no id of
+		// its own -- it is a variant of a vanilla type -- so it can only be summoned by
+		// loading its overlay file and stamping the result onto a fresh base monster.
+		// setStatsAndEquipmentToMonster is what applies the stats AND the declared traits,
+		// so going through it is what makes /sam_spawn ns:monster behave like a real spawn.
+		// Accepts either the declared id ("ns:monster") or the overlay filename ("ns_monster").
+		if ( creature < 0 )
+		{
+			std::string variantFile = argv[1];
+			for ( char& ch : variantFile ) { if ( ch == ':' ) { ch = '_'; } }
+			MonsterStatCustomManager::StatEntry* samEntry = monsterStatCustomManager.readFromFile(variantFile.c_str());
+			if ( samEntry )
+			{
+				Entity* whoV = players[clientnum]->entity;
+				Entity* monV = summonMonster(static_cast<Monster>(samEntry->type),
+					whoV->x + 32 * cos(whoV->yaw), whoV->y + 32 * sin(whoV->yaw));
+				if ( !monV )
+				{
+					{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: could not spawn '%s' (blocked by walls).", argv[1]); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+					delete samEntry;
+					return;
+				}
+				if ( monV->getStats() )
+				{
+					samEntry->setStatsAndEquipmentToMonster(monV->getStats());
+				}
+				{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: spawned variant '%s' on base %s (uid %u).",
+					argv[1], monstertypename[static_cast<Monster>(samEntry->type)], monV->getUID()); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+				delete samEntry;
+				return;
+			}
+		}
+
+		if ( creature < 0 )
+		{
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: unknown monster '%s'.", argv[1]); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "  vanilla species, or a mod variant as 'ns:monster'. /sam_montraits lists what spawned."); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			return;
+		}
+		Entity* who = players[clientnum]->entity;
+		Entity* mon = summonMonster(static_cast<Monster>(creature),
+			who->x + 32 * cos(who->yaw), who->y + 32 * sin(who->yaw));
+		if ( !mon ) { messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: could not spawn '%s' (blocked by walls).", argv[1]); return; }
+		if ( creature == SHOPKEEPER && argc >= 3 )
+		{
+			int shopType = atoi(argv[2]);
+			if ( shopType < 0 ) { shopType = 0; }
+			if ( shopType > 14 ) { shopType = 14; }
+			if ( auto s = mon->getStats() ) { s->MISC_FLAGS[STAT_FLAG_NPC] = 1 + shopType; }
+		}
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: spawned '%s' (uid %u).", argv[1], mon->getUID());
+	});
+	static ConsoleCommand ccmd_sam_give("/sam_give", "S.A.M: give yourself an item: /sam_give <item> [count] [beatitude]", []CCMD{
+		if ( argc < 2 ) { messagePlayer(clientnum, MESSAGE_MISC, "usage: /sam_give <item> [count] [beatitude]   (e.g. /sam_give iron_sword 2, or /sam_give traittest:aegis_mask 1 2 for a +2 blessed one)"); return; }
+		if ( !stats[clientnum] ) { return; }
+		int count = ( argc >= 3 ) ? atoi(argv[2]) : 1;
+		if ( count < 1 ) { count = 1; }
+		// Optional 4th arg: beatitude. Negative = cursed, positive = blessed. Barony has no
+		// quick bless in normal play (beatitude comes from generation), so this is how you
+		// test anything that keys off blessed/cursed -- e.g. the beatitude_ac trait on a mask.
+		const Sint16 beatitude = ( argc >= 4 ) ? (Sint16)atoi(argv[3]) : (Sint16)0;
+		const std::string name = argv[1];
+		int type = -1;
+		if ( name.find(':') != std::string::npos ) { type = samResolveCustomItem(name); }
+		if ( type < 0 )
+		{
+			std::string lower = name;
+			for ( char& ch : lower ) { ch = (char)tolower((unsigned char)ch); }
+			auto it = ItemTooltips.itemNameStringToItemID.find(lower);
+			if ( it != ItemTooltips.itemNameStringToItemID.end() ) { type = it->second; }
+		}
+		// Last resort: match a custom item by DISPLAY NAME even without a namespace, so
+		// "/sam_give workbench" finds the Hunter's Workbench. Only reached once the
+		// namespaced and vanilla lookups have both missed, so it cannot shadow either.
+		// Note argv[1] is a single token: a display name with spaces still needs the
+		// "ns:item" form, which is why that is what the usage line suggests.
+		if ( type < 0 ) { type = samResolveCustomItem(name); }
+		if ( type < 0 ) { messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: unknown item '%s'.", argv[1]); return; }
+		Item* item = newItem(static_cast<ItemType>(type), EXCELLENT, beatitude, (Sint16)count, 0, true, nullptr);
+		if ( item ) { itemPickup(clientnum, item); free(item); }
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: gave %d x '%s' (beatitude %d).", count, argv[1], (int)beatitude);
+	});
+	// S.A.M: what a save written NOW would record about the mod set -- the fingerprint the
+	// host and its clients compare ("ns@version+digest", the digest covering each mod's
+	// declared files) and the item id table saves carry so custom items survive a changed
+	// mod list ("id=ns:item;..."). Read-only; exists so a tester can see both without
+	// opening a save file. The full strings go to the S.A.M log; the chat line may clip.
+	static ConsoleCommand ccmd_sam_saveids("/sam_saveids", "S.A.M: print the mod fingerprint and custom item id table a save would record", []CCMD{
+		const std::string fp = SAMSync::generateFingerprint();
+		const std::string ids = SAMItems::saveIdTable();
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M fingerprint: %s", fp.empty() ? "(no mods)" : fp.c_str());
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M item ids: %s", ids.empty() ? "(no custom items)" : ids.c_str());
+		SAM_INFO("SAM", "/sam_saveids fingerprint = " + (fp.empty() ? std::string("(no mods)") : fp));
+		SAM_INFO("SAM", "/sam_saveids item ids = " + (ids.empty() ? std::string("(no custom items)") : ids));
+	});
+
+	// Re-read every loaded mod's JSON + scripts from disk without restarting the game.
+	// SAMLoader::load() fully rebuilds the registry on every call, so this is the same
+	// work Mods::loadMods() does — we just repeat the S.A.M half of it, skipping the
+	// heavy engine data/model reloads that a JSON edit doesn't need. The two reapply*
+	// calls below are what init_game.cpp runs after a vanilla data reload: without them
+	// custom items lose their reserved slots + tooltips and custom effects lose their
+	// HUD entries, because those maps still hold the PREVIOUS load's entries.
+	static ConsoleCommand ccmd_sam_reload("/sam_reload", "S.A.M: re-read loaded mods' JSON + scripts from disk (no restart)", []CCMD{
+		if ( Mods::mountedFilepaths.empty() )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: no mods are mounted — nothing to reload.");
+			return;
+		}
+		if ( multiplayer != SINGLE )
+		{
+			// Reloading changes registered content; doing it mid-lobby would leave the
+			// host and clients disagreeing about what every custom id means.
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: /sam_reload is singleplayer only.");
+			return;
+		}
+		// `intro` is true only in the main menu. The old test, players[clientnum]->entity, went
+		// false the moment the player died, so a dead singleplayer could reload mid-run with a
+		// live save still holding the old ids.
+		if ( !intro )
+		{
+			// NOT safe while a game is running. The registries hand out custom ids
+			// sequentially (items 5000+, effects 135+, races 200+) and a reload restarts
+			// that numbering, but a live save still holds the OLD numbers: items already in
+			// your inventory, effect bits on your Stat, your class and race. If the mod's
+			// content list changed at all, those ids now point at different things. Reload
+			// from the main menu, where nothing is holding an id yet.
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: /sam_reload only works from the main menu.");
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: quit to the menu first — reloading mid-game can corrupt custom items and effects.");
+			return;
+		}
+		if ( MainMenu::main_menu_frame && MainMenu::main_menu_frame->findFrame("settings") )
+		{
+			// NOT safe under an open Settings window either. That window is built from the
+			// registries a reload empties: its Bindings rows are the mod actions, and its MOD
+			// SETTINGS rows hold an edit the player has not yet confirmed, which the reload
+			// would drop while the widgets still show it. The console opens from anywhere in
+			// the menu, so this is the one place the two can meet. Close the window first.
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: close the Settings window before /sam_reload.");
+			return;
+		}
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: reloading %d mod path(s)...",
+			(int)Mods::mountedFilepaths.size());
+
+		SAMLoader::load(Mods::mountedFilepaths, VERSION);
+		SAMItems::registerModModels();      // frees and rebuilds the whole custom model range
+		SAMClasses::resolveAppearance();
+		SAMRaces::resolveLimbModels();      // re-resolve custom race bodies against the new table
+		SAMItems::reapplyAfterDataReload(); // re-stamp reserved item slots + re-inject tooltips
+		SAMEffects::reapplyDisplayEntries();// custom effects re-add their HUD entries
+		SAMSounds::appendSounds();          // re-append custom sounds onto the engine table
+
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: reload complete.");
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: an edited .vox IS picked up here - the custom model range is freed and rebuilt on every reload. Run /sam_models to see what is registered.");
+	});
+
+	// P_SPEED: the community Game Speed Control's /gamespeed, on S.A.M's own module. Singleplayer
+	// only for the reason SAMSpeed::set gives: the host's world at Nx, every joiner's body at 1x.
+	static ConsoleCommand ccmd_sam_gamespeed("/sam_gamespeed",
+		"S.A.M: simulation speed 0.1-8 (the world runs faster or slower, rendering does not; singleplayer): /sam_gamespeed [mult]", []CCMD{
+		if ( argc < 2 )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: game speed is %.2fx. Usage: /sam_gamespeed <0.1-8>", SAMSpeed::multiplier());
+			return;
+		}
+		if ( multiplayer != SINGLE )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: /sam_gamespeed is singleplayer only.");
+			return;
+		}
+		const double m = atof(argv[1]);
+		if ( !SAMSpeed::set(m, 0) )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: game speed must be 0.1 to 8 (got %s).", argv[1]);
+			return;
+		}
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: game speed set to %.2fx.", SAMSpeed::multiplier());
+		SAM_INFO("SAM", std::string("/sam_gamespeed ") + argv[1]);
+	});
+
+	// ---- test/diagnostic commands -------------------------------------------------
+	// Output goes to the message feed AND to sam_log.txt. A diagnostic whose result only
+	// exists on screen cannot be read after the fact, which defeats the point of having it.
+
+	// These exist so a change can be verified in seconds instead of by hunting chests.
+
+	static ConsoleCommand ccmd_sam_loot("/sam_loot",
+		"S.A.M: roll the loot table N times and report what came out: /sam_loot [category] [count] [level]", []CCMD{
+		// Exercises itemLevelCurve directly -- the same function chests, shops, floor drops
+		// and monster inventories all use -- so a modded item's eligibility can be checked
+		// without opening a single chest.
+		const char* catName = ( argc >= 2 ) ? argv[1] : "RING";
+		const int rolls     = ( argc >= 3 ) ? std::max(1, atoi(argv[2])) : 50;
+		const int level     = ( argc >= 4 ) ? atoi(argv[3]) : std::max(1, currentlevel);
+
+		std::string want = catName;
+		for ( char& ch : want ) { ch = (char)toupper((unsigned char)ch); }
+		// Each name carries its OWN enum constant. A positional list silently rots the
+		// moment the enum is reordered -- this table shipped with TOOL/FOOD/BOOK/THROWN/
+		// SPELL_CAT/GEM in the wrong slots, so six category names rolled a different table
+		// than the one printed on screen, and /sam_loot GEM returned 100 rocks. Paired this
+		// way the compiler places each name correctly no matter what order they appear in.
+		struct SAMCatName { const char* name; Category cat; };
+		static const SAMCatName kCatNames[] = {
+			{ "WEAPON", WEAPON }, { "ARMOR", ARMOR }, { "AMULET", AMULET }, { "POTION", POTION },
+			{ "SCROLL", SCROLL }, { "MAGICSTAFF", MAGICSTAFF }, { "RING", RING },
+			{ "SPELLBOOK", SPELLBOOK }, { "GEM", GEM }, { "THROWN", THROWN }, { "TOOL", TOOL },
+			{ "FOOD", FOOD }, { "BOOK", BOOK }, { "SPELL_CAT", SPELL_CAT }, { "TOME_SPELL", TOME_SPELL }
+		};
+		static_assert(sizeof(kCatNames)/sizeof(kCatNames[0]) == (size_t)CATEGORY_MAX,
+			"/sam_loot category table is missing an entry -- add the new Category here.");
+		int cat = -1;
+		const char* catLabel = catName;
+		for ( const SAMCatName& e : kCatNames )
+		{
+			if ( want == e.name ) { cat = (int)e.cat; catLabel = e.name; break; }
+		}
+		if ( cat < 0 )
+		{
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: unknown category '%s'.", catName); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "  try: WEAPON ARMOR AMULET POTION SCROLL MAGICSTAFF RING SPELLBOOK GEM THROWN TOOL FOOD BOOK"); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			return;
+		}
+
+		std::map<int, int> tally;
+		BaronyRNG rollRng;
+		rollRng.seedTime();
+		SAMLoot::ContextScope samCtx(SAMLoot::Console);   // S.A.M: a diagnostic roll, which a "shop"-only rule or a handler can tell apart
+		for ( int i = 0; i < rolls; ++i )
+		{
+			const ItemType t = itemLevelCurve(static_cast<Category>(cat), 0, level, rollRng);
+			++tally[(int)t];
+		}
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: %d rolls of %s at level %d:", rolls, catLabel, level); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		int customFound = 0;
+		for ( const auto& kv : tally )
+		{
+			const bool isCustom = ( kv.first >= SAM_ITEM_ID_BASE );
+			if ( isCustom ) { customFound += kv.second; }
+			const char* nm = items[kv.first].getIdentifiedName();
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "   %s%-24s x%d",
+				isCustom ? "[MOD] " : "      ", ( nm ? nm : "?" ), kv.second); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+		if ( customFound > 0 )
+		{
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: %d/%d rolls produced a modded item.", customFound, rolls); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+		else
+		{
+			// Name the window that actually excluded it. The old message listed the two
+			// conditions that were usually already SATISFIED (category, level != -1) and
+			// never mentioned depth, sending the author off to re-check correct JSON.
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: no modded item rolled in this window."); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "  eligible = category %s AND level 0..%d  ('level': -1 means never loot)", catLabel, level); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "  an item with level above %d is not broken, just too deep for this roll.", level); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "  run /sam_items for each item's level, then retry deeper: /sam_loot %s %d <level>", catLabel, rolls); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+	});
+
+	static ConsoleCommand ccmd_sam_items("/sam_items",
+		"S.A.M: list every registered custom item and whether it can appear as loot", []CCMD{
+		const int total = SAMItems::count();
+		if ( total <= 0 ) { { char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: no custom items registered."); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); } return; }
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: %d custom item(s):", total); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		for ( int id = SAM_ITEM_ID_BASE; id < NUM_ITEM_SLOTS; ++id )
+		{
+			const SAMItemDef* def = SAMItems::getItem(id);
+			if ( !def ) { continue; }
+			const int lvl = items[id].level;
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "  %d  %-22s %s",
+				id, def->nameIdentified.c_str(),
+				( lvl == -1 ) ? "(not in loot: level -1)" : ( "loot from depth " + std::to_string(lvl) ).c_str()); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+	});
+
+	// The model registry is the one a mod is most likely to get wrong and was the only one
+	// with no way to look at it. A modder whose model does not appear could not tell whether
+	// it failed to load, loaded under a different id, or loaded fine and was drawn wrong.
+	// A custom body is the one visual feature that can look perfect on the host and be
+	// completely absent for everyone else, so it needs a way to see which half is failing.
+	// Run it on BOTH machines: the host reports what it has announced, a client reports what
+	// it was told and whether it could resolve it.
+	static ConsoleCommand ccmd_sam_bodies("/sam_bodies",
+		"S.A.M: report custom creature bodies on this machine (run it on host AND client)", []CCMD{
+		const char* role = ( multiplayer == SERVER ) ? "host" : ( multiplayer == CLIENT ? "client" : "singleplayer" );
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf),
+			"S.A.M bodies [%s]: %d resolved on this machine, %d announced to clients, %d name(s) received.",
+			role, SAMBodies::count(), SAMBodies::announcedCount(), SAMBodies::remoteCount());
+			messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		if ( multiplayer == CLIENT && SAMBodies::remoteCount() == 0 )
+		{
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf),
+				"  No body names received. Either the host has no custom-bodied monster on this floor, or the host is not running S.A.M 2.5+.");
+				messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+	});
+
+	static ConsoleCommand ccmd_sam_models("/sam_models",
+		"S.A.M: list every custom model that registered, its id and its engine index", []CCMD{
+		const std::vector<SAMModels::Entry> reg = SAMModels::list();
+		if ( reg.empty() )
+		{
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: no custom models registered. If you expected one, check sam_log.txt for a [MODELS] line saying why it was skipped."); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			return;
+		}
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: %d custom model(s), engine table is %llu models:", (int)reg.size(), (unsigned long long)nummodels); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		for ( const SAMModels::Entry& e : reg )
+		{
+			// Flag anything that came out of the base game rather than a mod folder: that is
+			// almost always a mistake, and it is invisible without this.
+			//
+			// Read the loader's own verdict rather than recomputing it. Recomputing is what
+			// this did first, and it disagreed: the framework's built-in workbench models live
+			// under sam_builtin/ and resolve to "./" like base-game content, so the one command
+			// meant to tell a modder what is theirs accused S.A.M's own assets.
+			const bool baseGame = e.baseGame;
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "  %-40s -> index %-6d %s%s", e.id.c_str(), e.index, e.path.c_str(), baseGame ? "   [BASE GAME, not your mod]" : ""); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+	});
+
+	static ConsoleCommand ccmd_sam_testhooks("/sam_testhooks",
+		"S.A.M: fire each scripting hook directly and report what happened", []CCMD{
+		// Exercises the hooks without needing the situation that normally triggers them.
+		// Everything is reported AND logged, so a result can be read after the fact.
+		auto say = [&](const char* fmt, ...) {
+			char b[512]; va_list ap; va_start(ap, fmt);
+			vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
+			messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b);
+		};
+
+		say("S.A.M: --- hook test ---");
+
+		// 1. player.on_item_pickup (cancellable). Make a torch and offer it: if a script
+		//    refuses, itemPickup returns null and nothing enters the inventory.
+		{
+			Item* probe = newItem(TOOL_TORCH, EXCELLENT, 0, 1, 0, true, nullptr);
+			if ( probe )
+			{
+				Item* got = itemPickup(clientnum, probe, nullptr, false, /*samAllowVeto=*/true);
+				say("  pickup(torch): %s", got ? "ACCEPTED (no script refused it)" : "REFUSED by a script");
+				// Either way the probe is a temporary: on ACCEPT itemPickup made its own
+				// inventory stack, so `probe` is still ours to free. Not freeing it leaked
+				// one Item per run AND left the player holding a torch they never asked for.
+				free(probe);
+				if ( got )
+				{
+					// Undo the gift: this is a diagnostic, it should not change your inventory.
+					consumeItem(got, clientnum);
+				}
+			}
+		}
+
+		// 2. on_before_monster_damage. Find the nearest monster and hit it for 10, then
+		//    report the HP actually lost -- if a script rewrote the number, they differ.
+		{
+			Entity* target = nullptr;
+			double best = 1e18;
+			for ( node_t* n = map.creatures->first; n; n = n->next )
+			{
+				Entity* e = (Entity*)n->element;
+				if ( !e || e->behavior != &actMonster || !e->getStats() ) { continue; }
+				if ( e->getStats()->HP <= 0 ) { continue; }
+				const double d = entityDist(e, players[clientnum]->entity);
+				if ( d < best ) { best = d; target = e; }
+			}
+			if ( !target )
+			{
+				say("  monster damage: no monster nearby (summon one: /summon rat)");
+			}
+			else
+			{
+				const int before = target->getStats()->HP;
+				target->modHP(-10);
+				const int after = target->getStats()->HP;
+				const int lost = before - after;
+				say("  monster damage: asked for 10, monster lost %d HP  %s",
+					lost, ( lost == 10 ) ? "(unmodified)" : "(A SCRIPT REWROTE IT)");
+			}
+		}
+
+		say("S.A.M: --- end ---");
+	});
+
+	static ConsoleCommand ccmd_sam_montraits("/sam_montraits",
+		"S.A.M: report mod-declared traits on nearby monsters", []CCMD{
+		// Walks live monsters and prints what the engine actually believes about each one --
+		// the trait bitmask AND the predicates that read it. Proves the stamp reached a real
+		// Stat, not just that the JSON parsed.
+		int found = 0;
+		for ( node_t* node = map.creatures->first; node; node = node->next )
+		{
+			Entity* e = (Entity*)node->element;
+			if ( !e || e->behavior != &actMonster ) { continue; }
+			Stat* st = e->getStats();
+			if ( !st ) { continue; }
+			// Report EVERY monster, not only the ones carrying traits. Printing only the
+			// carriers made a negative result ambiguous: "none found" could mean the traits
+			// were lost, or that the monster itself was gone. That distinction is the whole
+			// question when testing whether traits survive a save.
+			++found;
+			// Two lines, one per group of four. Each number is the REAL predicate being
+			// called, not a re-read of the bitmask -- that is the point of the command. A
+			// trait can be present in the mask and still do nothing if nobody consults it,
+			// which is exactly how never_retreat/water_walking/undead/ally_recolour sat
+			// dead for a while: declared, stamped, and never asked about.
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: '%s' traits=0x%llx%s  boss=%d trader=%d untargetable=%d turret=%d",
+				st->name, (unsigned long long)st->samTraits,
+				( st->attributes.find("samtr") != st->attributes.end() ? " [attr present]" : "" ),
+				e->isBossMonster() ? 1 : 0,
+				e->monsterCanTradeWith(-1) ? 1 : 0,
+				e->monsterIsTargetable() ? 0 : 1,
+				monsterIsImmobileTurret(e, st) ? 1 : 0);
+				messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			// Each predicate is called TWICE: once as the monster really is, and once with
+			// the trait mask temporarily cleared. Printed as with/without.
+			//
+			// This exists because the one-number version was untrustworthy. A full-health
+			// rat reports never_retreat=1 whether or not the trait is set, because vanilla
+			// shouldRetreat only returns true below quarter HP -- and ally_recolour reads 1
+			// for almost everything by default. So a lone "1" could mean "the trait works"
+			// or "you would have got that anyway", and those are opposite conclusions.
+			// Differing numbers mean the trait changed the answer; identical numbers mean
+			// it did not, on this monster, right now.
+			// shouldRetreat is only ever interesting on a WOUNDED monster -- vanilla returns
+			// false for anything above quarter health, so at full HP the traited and
+			// untraited answers are identical and tell you nothing. Drop HP to an eighth
+			// for the duration of the two calls so the comparison actually discriminates,
+			// then put it straight back. Nothing observes HP in between: this is a single
+			// synchronous read, and shouldRetreat only reads.
+			const Sint32 samSavedHP = st->HP;
+			st->HP = ( st->MAXHP / 8 > 0 ) ? st->MAXHP / 8 : 1;
+
+			const Uint64 samSavedMask = st->samTraits;
+			const int samWithRetreat  = e->shouldRetreat(*st) ? 0 : 1;
+			const int samWithWater    = e->isWaterWalking() ? 1 : 0;
+			const int samWithLava     = e->isLavaWalking() ? 1 : 0;
+			const int samWithUndead   = e->isSmiteWeakMonster() ? 1 : 0;
+			const int samWithRecolour = monsterChangesColorWhenAlly(st) ? 1 : 0;
+			const int samWithTinker   = e->monsterIsTinkeringCreation() ? 1 : 0;
+			const int samWithNoDigest = e->entityCanVomit() ? 0 : 1;
+			st->samTraits = 0;
+			const int samBaseRetreat  = e->shouldRetreat(*st) ? 0 : 1;
+			const int samBaseWater    = e->isWaterWalking() ? 1 : 0;
+			const int samBaseLava     = e->isLavaWalking() ? 1 : 0;
+			const int samBaseUndead   = e->isSmiteWeakMonster() ? 1 : 0;
+			const int samBaseRecolour = monsterChangesColorWhenAlly(st) ? 1 : 0;
+			const int samBaseTinker   = e->monsterIsTinkeringCreation() ? 1 : 0;
+			const int samBaseNoDigest = e->entityCanVomit() ? 0 : 1;
+			st->samTraits = samSavedMask;
+			st->HP = samSavedHP;
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "        never_retreat=%d/%d (simulated at 1/8 HP) water_walk=%d/%d lava_walk=%d/%d undead=%d/%d ally_recolour=%d/%d  (with/without trait)",
+				samWithRetreat, samBaseRetreat, samWithWater, samBaseWater,
+				samWithLava, samBaseLava, samWithUndead, samBaseUndead,
+				samWithRecolour, samBaseRecolour);
+				messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+			// pass_through has no predicate of its own -- collision.cpp tests the bit inline --
+			// so it is reported from the mask rather than by calling something. Said plainly
+			// here so nobody reads it as the same kind of evidence as the columns above.
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "        tinker_construct=%d/%d no_digestion=%d/%d  pass_through=%d (mask only, no predicate)",
+				samWithTinker, samBaseTinker, samWithNoDigest, samBaseNoDigest,
+				( samSavedMask & SAMMonsterTrait::PASS_THROUGH ) ? 1 : 0);
+				messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+		if ( found == 0 )
+		{
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: no monsters in the world at all. Summon one: /summon traittest_test_boss"); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+	});
+
+	static ConsoleCommand ccmd_sam_spell("/sam_spell",
+		"S.A.M: what spell does this item teach or channel: /sam_spell <item>", []CCMD{
+		// Verifies the spellbook / foci resolvers accept a custom item, without needing to
+		// find one in a dungeon and read it.
+		if ( argc < 2 ) { { char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "usage: /sam_spell <ns:item>"); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); } return; }
+		const int id = samResolveCustomItem(argv[1]);
+		if ( id < 0 ) { { char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: unknown item '%s'.", argv[1]); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); } return; }
+		const int book = getSpellIDFromSpellbook(id);
+		const int foci = getSpellIDFromFoci(id);
+		const int staff = getSpellIDFromMagicstaff(id);
+		// Tome: getTomeSpellID is a non-static Item member, so read the resolved attribute the
+		// same way its arm does -- proves resolveSpellAttributes turned the name into an id.
+		int tomeSpell = 0;
+		if ( id >= 0 && id < NUM_ITEM_SLOTS && items[id].category == TOME_SPELL
+			&& items[id].hasAttribute("tome_spell") )
+		{
+			tomeSpell = items[id].attributes["tome_spell"];
+		}
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: '%s' (id %d)", argv[1], id); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "   spellbook_spell  -> %d %s", book, ( book > 0 ? "(resolves)" : "(none)" )); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "   foci_spell       -> %d %s", foci, ( foci > 0 ? "(resolves)" : "(none)" )); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "   tome_spell       -> %d %s", tomeSpell, ( tomeSpell > 0 ? "(resolves)" : "(none)" )); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "   magicstaff_spell -> %d %s", staff, ( staff > 0 ? "(resolves)" : "(none)" )); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		if ( book > 0 )
+		{
+			const int backToBook = getSpellbookFromSpellID(book);
+			{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "   reverse map: spell %d -> item %d %s", book, backToBook, ( backToBook == id ? "(round-trips to THIS item)" : "" )); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+		}
+	});
+
+	static ConsoleCommand ccmd_sam_traits("/sam_traits",
+		"S.A.M: show the engine traits a custom item declared: /sam_traits <item>", []CCMD{
+		if ( argc < 2 ) { { char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "usage: /sam_traits <ns:item>"); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); } return; }
+		const int id = samResolveCustomItem(argv[1]);
+		if ( id < 0 ) { { char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: unknown item '%s'.", argv[1]); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); } return; }
+		const Uint64 tr = items[id].samTraits;
+		if ( tr == 0 ) { { char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: '%s' declares no traits.", argv[1]); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); } return; }
+		static const struct { const char* n; Uint64 b; } kNames[] = {
+			{ "ranged", SAMItemTrait::RANGED }, { "quiver", SAMItemTrait::QUIVER },
+			{ "foci", SAMItemTrait::FOCI }, { "instrument", SAMItemTrait::INSTRUMENT },
+			{ "thrown_ball", SAMItemTrait::THROWN_BALL }, { "shield_slot", SAMItemTrait::SHIELD_SLOT },
+			{ "potion_bad", SAMItemTrait::POTION_BAD }, { "automaton_food", SAMItemTrait::AUTOMATON_FOOD },
+			{ "tinker_throwable", SAMItemTrait::TINKER_THROWABLE }, { "usable", SAMItemTrait::USABLE },
+			{ "beatitude_ac", SAMItemTrait::BEATITUDE_AC },
+		};
+		std::string out;
+		for ( const auto& k : kNames )
+		{
+			if ( tr & k.b ) { if ( !out.empty() ) { out += ", "; } out += k.n; }
+		}
+		{ char samBuf[512]; snprintf(samBuf, sizeof(samBuf), "S.A.M: '%s' traits: %s", argv[1], out.c_str()); messagePlayer(clientnum, MESSAGE_MISC, "%s", samBuf); SAM_INFO("TEST", samBuf); }
+	});
+
+	static ConsoleCommand ccmd_sam_inventory("/sam_inventory", "S.A.M: list your inventory (uid, item, count, equipped)", []CCMD{
+		if ( !stats[clientnum] ) { return; }
+		int n = 0;
+		for ( node_t* node = stats[clientnum]->inventory.first; node != nullptr; node = node->next )
+		{
+			Item* it = (Item*)node->element;
+			if ( !it ) { continue; }
+			const char* nm = ( (int)it->type >= 0 && (int)it->type < NUMITEMS ) ? itemNameStrings[(int)it->type + 2] : "custom";
+			const bool eq = ( itemSlot(stats[clientnum], it) != nullptr );
+			messagePlayer(clientnum, MESSAGE_MISC, "  uid %u: %s x%d%s", it->uid, nm, it->count, eq ? " [equipped]" : "");
+			++n;
+		}
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: %d item stack(s). Remove one with /sam_remove <uid>.", n);
+	});
+	static ConsoleCommand ccmd_sam_remove("/sam_remove", "S.A.M: remove an inventory item by uid: /sam_remove <uid>", []CCMD{
+		if ( argc < 2 ) { messagePlayer(clientnum, MESSAGE_MISC, "usage: /sam_remove <uid>   (see /sam_inventory)"); return; }
+		const Uint32 uid = (Uint32)strtoul(argv[1], nullptr, 10);
+		Item* it = uidToItem(uid);
+		if ( !it ) { messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: no item uid %u in any inventory.", uid); return; }
+		if ( stats[clientnum] && itemSlot(stats[clientnum], it) != nullptr )
+		{ messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: uid %u is equipped; unequip first.", uid); return; }
+		Item* ref = it;
+		while ( ref ) { consumeItem(ref, clientnum); }
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: removed item uid %u.", uid);
+	});
+
+	// ---- S.A.M custom-race test commands ----
+	static ConsoleCommand ccmd_sam_races("/sam_races", "list registered S.A.M custom playable races", []CCMD{
+		if ( !SAMRaces::any() )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: no custom races registered (load a mod with a races/ folder).");
+			return;
+		}
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M custom races (%d):", SAMRaces::count());
+		for ( int i = 0; i < SAMRaces::count(); ++i )
+		{
+			const int id = SAMRaces::raceIdAtIndex(i);
+			const SAMRaceDef* d = SAMRaces::get(id);
+			if ( d )
+			{
+				// key= is the CROSS-MACHINE identity and id= is this machine's own number.
+				// Two players comparing this line is how you tell "we disagree about which
+				// race this is" from "we disagree about the model": the keys must match, the
+				// ids need not, and before the key existed there was no way to see either.
+				messagePlayer(clientnum, MESSAGE_MISC, "  [%d] %s (%s) body=%s key=%08x  STR%+d DEX%+d CON%+d INT%+d PER%+d CHR%+d HP%+d MP%+d",
+					id, d->id.c_str(), d->name.c_str(), d->hostBodyName.c_str(),
+					(unsigned)SAMRaces::raceKeyFor(id),
+					d->str, d->dex, d->con, d->intel, d->per, d->chr, d->hp, d->mp);
+			}
+		}
+	});
+	// THROWAWAY PROOF (Milestone 4 #55 step 0): retag a LIVE entity with a custom .vox body,
+	// to answer one question before any real feature is built -- does a creature wearing a
+	// custom model still walk, bite, take damage and die, with zero animation code written?
+	// The override is at the draw site only, so the creature stays a normal monster to all
+	// game logic. Usage: /sam_setmodel <uid> <ns:model>   (uid from /sam_spawn or /sam_montraits)
+	static ConsoleCommand ccmd_sam_setmodel("/sam_setmodel", "S.A.M: give a live entity a custom body model: /sam_setmodel <uid> <ns:model>", []CCMD{
+		if ( argc < 3 ) { { char b[512]; snprintf(b, sizeof(b), "usage: /sam_setmodel <uid> <ns:model>   (0 as uid = nearest monster; 'none' clears)"); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); } return; }
+		Uint32 uid = (Uint32)strtoul(argv[1], nullptr, 10);
+		// uid 0 = convenience: pick the nearest monster so you don't have to read a uid off screen.
+		if ( uid == 0 && players[clientnum] && players[clientnum]->entity )
+		{
+			Entity* me = players[clientnum]->entity;
+			double best = 1e9; Entity* bestE = nullptr;
+			for ( node_t* node = map.creatures->first; node; node = node->next )
+			{
+				Entity* e = (Entity*)node->element;
+				if ( !e || e->behavior != &actMonster ) { continue; }
+				const double d = entityDist(me, e);
+				if ( d < best ) { best = d; bestE = e; }
+			}
+			if ( !bestE ) { { char b[256]; snprintf(b, sizeof(b), "S.A.M: no monster nearby to retag."); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); } return; }
+			uid = bestE->getUID();
+		}
+		if ( strcmp(argv[2], "none") == 0 )
+		{
+			SAMBodies::setBody(uid, -1);
+			{ char b[256]; snprintf(b, sizeof(b), "S.A.M: cleared body model on uid %u (%d tagged).", uid, SAMBodies::count()); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+			return;
+		}
+		const int idx = SAMModels::modelIndexForId(argv[2]);
+		if ( idx < 0 ) { { char b[512]; snprintf(b, sizeof(b), "S.A.M: unknown model '%s' (a mod must declare it under \"models\").", argv[2]); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); } return; }
+		SAMBodies::setBody(uid, idx);
+		{ char b[512]; snprintf(b, sizeof(b), "S.A.M: uid %u now renders as '%s' (model index %d). It should still walk, bite and die normally.", uid, argv[2], idx); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+	});
+
+	// Innate racial spells + blood diet for your CURRENT race/class -- proves #48 and #51
+	// without needing to create a character. "not a custom race/class" is the no-op result.
+	static ConsoleCommand ccmd_sam_racespells("/sam_racespells", "S.A.M: innate spells + diet for your current race/class", []CCMD{
+		if ( !stats[clientnum] ) { return; }
+		const SAMRaceDef* d = SAMRaces::get(stats[clientnum]->playerRace);
+		if ( d )
+		{
+			{ char b[512]; snprintf(b, sizeof(b), "S.A.M race '%s': %d innate spell(s), blood_diet=%d", d->id.c_str(), (int)d->startingSpells.size(), d->bloodDiet?1:0); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+			for ( const auto& sp : d->startingSpells ) { char b[256]; snprintf(b, sizeof(b), "   %s", sp.c_str()); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+		}
+		else
+		{
+			{ char b[256]; snprintf(b, sizeof(b), "S.A.M: current race is not a custom race (no innate list)."); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+		}
+		const int cls = client_classes[clientnum];
+		{ char b[512]; snprintf(b, sizeof(b), "S.A.M class id %d: blood_diet=%d protected_spells=%d  playerRequiresBlood=%d",
+			cls, SAMClasses::requiresBloodDiet(cls)?1:0, SAMClasses::numStartingSpells(cls),
+			playerRequiresBloodToSustain(clientnum)?1:0); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); }
+	});
+
+	static ConsoleCommand ccmd_sam_setrace("/sam_setrace", "set your race to a S.A.M custom race: /sam_setrace <ns:id>", []CCMD{
+		if ( argc < 2 ) { messagePlayer(clientnum, MESSAGE_MISC, "usage: /sam_setrace <ns:id>   (list with /sam_races)"); return; }
+		const int id = SAMRaces::raceIdForIdString(argv[1]);
+		if ( id < 0 ) { messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: unknown custom race '%s' (see /sam_races).", argv[1]); return; }
+		if ( !stats[clientnum] ) { return; }
+		stats[clientnum]->playerRace = id;
+		stats[clientnum]->stat_appearance = 0;
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: race set to '%s' (id %d). Body swaps to '%s' on the next floor/new game; stat bonuses roll on a fresh character (char-select).",
+			argv[1], id, SAMRaces::get(id) ? SAMRaces::get(id)->hostBodyName.c_str() : "?");
+	});
+
+	// ---- S.A.M sound and music commands ----
+	// The names a modder needs are the part they cannot see, so these print them.
+	static ConsoleCommand ccmd_sam_sounds("/sam_sounds", "list mod sounds, or search the game's own: /sam_sounds vanilla <text>", []CCMD{
+		if ( argc >= 2 && !strcmp(argv[1], "vanilla") )
+		{
+			std::string want;
+			for ( int a = 2; a < argc; ++a ) { if ( !want.empty() ) { want += " "; } want += argv[a]; }
+			for ( char& c : want ) { c = (char)std::tolower((unsigned char)c); }
+			int shown = 0, matched = 0;
+			for ( int i = 0; i < SAMSounds::vanillaCount(); ++i )
+			{
+				std::string n = SAMSounds::vanillaNameAt(i);
+				std::string l = n;
+				for ( char& c : l ) { c = (char)std::tolower((unsigned char)c); }
+				if ( n.empty() || l == "null" || (!want.empty() && l.find(want) == std::string::npos) ) { continue; }
+				++matched;
+				if ( shown < 40 ) { messagePlayer(clientnum, MESSAGE_MISC, "  %d  %s", i, n.c_str()); ++shown; }
+			}
+			if ( SAMSounds::vanillaCount() == 0 || (matched == 0 && want.empty()) )
+			{
+				messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: the vanilla sound list loads with the first mod that has sounds.");
+			}
+			else
+			{
+				messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: %d vanilla sound(s) match%s%s. Replace one by dropping a file with that name (or the name without its number, for the whole group) in your mod's sounds/replace/ folder.",
+					matched, matched > shown ? " -- narrow the search to see them all" : "", "");
+			}
+			return;
+		}
+		const std::vector<std::string> ids = SAMSounds::listIds();
+		if ( ids.empty() )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: no mod sounds loaded. Put .ogg/.wav/.mp3/.flac files in a mod's sounds/ folder. Search the game's own with /sam_sounds vanilla <text>.");
+			return;
+		}
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M mod sounds (%d):", (int)ids.size());
+		for ( const std::string& id : ids ) { messagePlayer(clientnum, MESSAGE_MISC, "  %s", id.c_str()); }
+	});
+	static ConsoleCommand ccmd_sam_playsound("/sam_playsound", "play a sound to hear it: /sam_playsound <ns:id | vanilla name | index>", []CCMD{
+		if ( argc < 2 ) { messagePlayer(clientnum, MESSAGE_MISC, "usage: /sam_playsound <ns:id | vanilla name | index>   (list with /sam_sounds)"); return; }
+		int idx = SAMSounds::soundIndexForId(argv[1]);
+		if ( idx < 0 )
+		{
+			// A vanilla name plays through any replacement a mod made, so this is how to hear one.
+			const std::vector<int> v = SAMSounds::vanillaIndicesFor(argv[1]);
+			if ( !v.empty() ) { idx = v[local_rng.rand() % v.size()]; }
+		}
+		if ( idx < 0 ) { messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: '%s' is not a mod sound or a vanilla sound name (see /sam_sounds).", argv[1]); return; }
+		playSound((Uint16)idx, 128);
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: played '%s'.", argv[1]);
+	});
+	static ConsoleCommand ccmd_sam_music("/sam_music", "mod music: /sam_music | vanilla | play <ns:id> | stop", []CCMD{
+		if ( argc >= 2 && !strcmp(argv[1], "vanilla") )
+		{
+			std::string line;
+			for ( const std::string& n : SAMMusic::vanillaNames() ) { line += (line.empty() ? "" : ", ") + n; }
+			messagePlayer(clientnum, MESSAGE_MISC, "S.A.M vanilla track names: %s", line.c_str());
+			messagePlayer(clientnum, MESSAGE_MISC, "Replace one by dropping a file with that name in your mod's music/replace/ folder.");
+			return;
+		}
+		if ( argc >= 3 && !strcmp(argv[1], "play") )
+		{
+			std::string err;
+			if ( SAMMusic::play(argv[2], 1.5, true, false, &err) ) { messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: playing '%s'.", argv[2]); }
+			else { messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: %s.", err.c_str()); }
+			return;
+		}
+		if ( argc >= 2 && !strcmp(argv[1], "stop") )
+		{
+			messagePlayer(clientnum, MESSAGE_MISC, SAMMusic::stop() ? "S.A.M: music handed back to the game." : "S.A.M: no script track was playing.");
+			return;
+		}
+		const std::string now = SAMMusic::nowPlaying();
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M: now playing: %s", now.empty() ? "(nothing)" : now.c_str());
+		const std::vector<std::string> ids = SAMMusic::listIds();
+		messagePlayer(clientnum, MESSAGE_MISC, "S.A.M mod tracks (%d)%s", (int)ids.size(), ids.empty() ? " -- put .ogg files in a mod's music/ folder." : ":");
+		for ( const std::string& id : ids ) { messagePlayer(clientnum, MESSAGE_MISC, "  %s", id.c_str()); }
+	});
+
 	static ConsoleCommand ccmd_spawntome("/spawntome", "spawn an item (cheat)", []CCMD{
 		if ( !(svFlags & SV_FLAG_CHEATS) )
 		{
@@ -722,6 +1688,12 @@ namespace ConsoleCommands {
 					net_packet->address.port = net_clients[c - 1].port;
 					net_packet->len = 4;
 					sendPacketSafe(net_sock, -1, net_packet, c - 1);
+					// S.A.M: a kick is a leave (player.on_player_left), and only the kicked player was
+					// ever told: every other client went on counting them in sam_player_count for the
+					// rest of the session. relayPlayerGone sends the vanilla DISC the lobby kick sends,
+					// and only while a script is loaded, so a modless host's wire is unchanged.
+					SAMMpInput::firePlayerLeft(c);
+					SAMMpInput::relayPlayerGone(c);
 					int i;
 					for (i = 0; i < MAXPLAYERS; i++)
 					{
@@ -4053,6 +5025,10 @@ namespace ConsoleCommands {
 	static ConsoleCommand ccmd_loaditems("/loaditems", "", []CCMD{
 		ItemTooltips.readItemsFromFile();
 		setupSpells();
+		// S.A.M: the sheet just overwrote every vanilla slot, including the ones sam_patch_item had
+		// changed (a level patch is how a mod puts an artifact in the loot pool). Put the custom
+		// slots and every live patch back.
+		SAMItems::reapplyAfterDataReload();
 		messagePlayer(clientnum, MESSAGE_MISC, "Reloaded items.json");
 		});
 
@@ -4976,6 +5952,7 @@ namespace ConsoleCommands {
 
 		int cat = atoi(argv[1]);
 		cat = std::min(std::max(0, cat), Category::CATEGORY_MAX - 2);
+		SAMLoot::ContextScope samCtx(SAMLoot::Console);   // S.A.M: a console roll (covers the post-process below too)
 		ItemType type = itemLevelCurve((Category)cat, 0, currentlevel, local_rng);
 		Item* item = newItem(type, EXCELLENT, 0, 1, local_rng.rand(), true, &stats[clientnum]->inventory);
 		itemLevelCurvePostProcess(nullptr, item, local_rng);

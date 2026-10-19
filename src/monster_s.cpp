@@ -22,6 +22,7 @@
 #include "prng.hpp"
 #include "scores.hpp"
 #include "mod_tools.hpp"
+#include "sam_items.hpp" // "worn_like": a mod mask with its own model sits like a vanilla one
 
 real_t getNormalHeightMonsterS(Entity& my)
 {
@@ -1606,6 +1607,9 @@ void monsterSMoveBodyparts(Entity* my, Stat* myStats, double dist)
 					entity->flags[INVISIBLE] = true;
 				}
 			}
+			// S.A.M: a mod mask (or the hat under it) with its own model is placed like the vanilla
+			// item it names in "worn_like"; see SAMItems::wornAsTwinBegin. No-op without one.
+			SAMItems::wornAsTwinBegin(entity, helmet);
 			if ( EquipmentModelOffsets.modelOffsetExists(SALAMANDER, entity->sprite, my->sprite) )
 			{
 				my->setHelmetLimbOffset(entity);
@@ -1617,6 +1621,7 @@ void monsterSMoveBodyparts(Entity* my, Stat* myStats, double dist)
 				entity->focaly = limbs[SALAMANDER][10][1] - 2; // -2
 				entity->focalz = limbs[SALAMANDER][10][2]; // .25
 			}
+			SAMItems::wornAsTwinEnd();
 			break;
 		// tail
 		case 12:

@@ -21,6 +21,8 @@
 #include "scores.hpp"
 #include "prng.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp"
 
 list_t* shopInv[MAXPLAYERS] = { nullptr };
 Uint32 shopkeeper[MAXPLAYERS] = { 0 };
@@ -181,6 +183,22 @@ void startTradingServer(Entity* entity, int player)
 	}
 	entity->skill[0] = 4; // talk state
 	entity->skill[1] = players[player]->entity->getUID();
+
+	if ( player >= 0 && multiplayer != CLIENT )
+	{
+		SAMLua::Event ev;
+		ev.setName("player.on_shop_entered");
+		ev.i("player", (long long)player);
+		ev.i("shopkeeper_uid", (long long)entity->getUID());
+		SAMLua::dispatchEvent(ev);
+
+		SAMJs::Event jsev;
+		jsev.setName("player.on_shop_entered");
+		jsev.i("player", (long long)player);
+		jsev.i("shopkeeper_uid", (long long)entity->getUID());
+		SAMJs::dispatchEvent(jsev);
+	}
+
 	messagePlayer(player, MESSAGE_HINT, Language::get(1122), stats->name);
 }
 
@@ -258,6 +276,22 @@ bool buyItemFromShop(const int player, Item* item, bool& bOutConsumedEntireStack
 		item->count = ocount;
 		if ( multiplayer != CLIENT )
 		{
+			{
+				SAMLua::Event ev;
+				ev.setName("player.on_item_bought");
+				ev.i("player", (long long)player);
+				ev.i("item_type", (long long)item->type);
+				ev.i("gold_spent", (long long)item->buyValue(player));
+				SAMLua::dispatchEvent(ev);
+
+				SAMJs::Event jsev;
+				jsev.setName("player.on_item_bought");
+				jsev.i("player", (long long)player);
+				jsev.i("item_type", (long long)item->type);
+				jsev.i("gold_spent", (long long)item->buyValue(player));
+				SAMJs::dispatchEvent(jsev);
+			}
+
 			if (entity)
 			{
 				Stat* shopstats = entity->getStats();
@@ -656,6 +690,23 @@ bool sellItemToShop(const int player, Item* item)
 
 	shopChangeGoldEvent(player, item->sellValue(player));
 	stats[player]->GOLD += item->sellValue(player);
+
+	if ( player >= 0 && multiplayer != CLIENT )
+	{
+		SAMLua::Event ev;
+		ev.setName("player.on_item_sold");
+		ev.i("player", (long long)player);
+		ev.i("item_type", (long long)item->type);
+		ev.i("gold_received", (long long)item->sellValue(player));
+		SAMLua::dispatchEvent(ev);
+
+		SAMJs::Event jsev;
+		jsev.setName("player.on_item_sold");
+		jsev.i("player", (long long)player);
+		jsev.i("item_type", (long long)item->type);
+		jsev.i("gold_received", (long long)item->sellValue(player));
+		SAMJs::dispatchEvent(jsev);
+	}
 
 	if ( players[player]->isLocalPlayer() )
 	{

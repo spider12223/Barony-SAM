@@ -25,6 +25,7 @@
 #include "collision.hpp"
 #include "sam_lua_runtime.hpp"
 #include "sam_js_runtime.hpp" // S.A.M scripting hooks
+#include "sam_loot.hpp"       // S.A.M: the "chest" roll context and world.on_fixture_loot for the lockpick capstone reward
 
 void Item::applySkeletonKey(int player, Entity& entity)
 {
@@ -369,9 +370,31 @@ void Item::applyLockpick(int player, Entity& entity)
 				{
 					if ( rng.rand() % 2 == 0 )
 					{
-						Item* generated = newItem(itemTypeWithinGoldValue(-1, 80, 600, rng), static_cast<Status>(SERVICABLE + rng.rand() % 2), 0 + rng.rand() % 2, 1, rng.rand(), false, nullptr);
-						entity.addItemToChest(generated, true, nullptr);
-						messagePlayer(player, MESSAGE_INTERACTION, Language::get(3897));
+						// S.A.M: the reward is rolled in the "chest" context (world.on_before_loot_roll
+						// carries this chest's uid), then world.on_fixture_loot("lockpick") may rewrite
+						// it or cancel it (no item, no message; the skill-up below is unchanged).
+						Item* generated = nullptr;
+						{
+							SAMLoot::ContextScope samCtx(SAMLoot::Chest, (long long)entity.getUID(), -1, (int)entity.chestType);
+							generated = newItem(itemTypeWithinGoldValue(-1, 80, 600, rng), static_cast<Status>(SERVICABLE + rng.rand() % 2), 0 + rng.rand() % 2, 1, rng.rand(), false, nullptr);
+						}
+						if ( generated )
+						{
+							int samType = (int)generated->type, samStatus = (int)generated->status, samBeatitude = (int)generated->beatitude, samCount = (int)generated->count;
+							if ( SAMLoot::fixtureLoot("lockpick", player, (int)(entity.x / 16), (int)(entity.y / 16), samType, samStatus, samBeatitude, samCount) )
+							{
+								generated->type = static_cast<ItemType>(samType);
+								generated->status = static_cast<Status>(samStatus);
+								generated->beatitude = (Sint16)samBeatitude;
+								generated->count = (Sint16)samCount;
+								entity.addItemToChest(generated, true, nullptr);
+								messagePlayer(player, MESSAGE_INTERACTION, Language::get(3897));
+							}
+							else
+							{
+								free(generated);
+							}
+						}
 					}
 					else
 					{
@@ -2043,6 +2066,43 @@ void Item::applyTinkeringCreation(Entity* parent, Entity* thrown)
 	{
 		return;
 	}
+
+	// S.A.M scripting hook: a thrown gadget has landed and something must be built here.
+	// The chain below is a hardcoded `type ==` table -- decoy, dummybot, gyrobot, sentry,
+	// spellbot -- so a custom item reached this point and then quietly vanished, because
+	// nothing knew what to make. This asks the mod first.
+	//
+	// CANCELLABLE: a handler returning false means "I built it, do not run the vanilla
+	// chain". That is what lets a mod define its own traps, turrets, totems or markers
+	// without an engine arm per gadget. Returning anything else (or nothing, which every
+	// pre-existing script does) falls through to vanilla unchanged.
+	//
+	// Host-authoritative: thrown items only resolve on the host, so this never fires on a
+	// client and needs no wire format.
+	{
+		const int samThrower = ( parent && parent->behavior == &actPlayer ) ? (int)parent->skill[2] : -1;
+		const long long samX = (long long)((int)thrown->x >> 4);
+		const long long samY = (long long)((int)thrown->y >> 4);
+
+		SAMLua::Event ev;
+		ev.setName("world.on_item_deployed").i("item_type", (int)this->type)
+			.i("player", samThrower).i("x", samX).i("y", samY)
+			.i("status", (int)this->status).i("beatitude", (int)this->beatitude);
+		SAMLua::dispatchEvent(ev);
+		const bool samCancelledLua = SAMLua::lastDispatchCancelled();
+
+		SAMJs::Event jsev;
+		jsev.setName("world.on_item_deployed").i("item_type", (int)this->type)
+			.i("player", samThrower).i("x", samX).i("y", samY)
+			.i("status", (int)this->status).i("beatitude", (int)this->beatitude);
+		SAMJs::dispatchEvent(jsev);
+
+		if ( samCancelledLua || SAMJs::lastDispatchCancelled() )
+		{
+			return; // the mod built whatever belongs here
+		}
+	}
+
 	if ( type == TOOL_DECOY )
 	{
 		Entity* entity = newEntity(894, 1, map.entities, nullptr); //Decoy box.
@@ -2158,6 +2218,12 @@ void Item::applyTinkeringCreation(Entity* parent, Entity* thrown)
 
 bool itemIsThrowableTinkerTool(const Item* item)
 {
+	if ( !item ) { return false; }
+	// S.A.M: a mod may declare this trait on its own item. Checked FIRST because the
+	// list below ends in a `default: return false` that would make a trailing check
+	// unreachable. Vanilla items carry no traits, so every vanilla answer is unchanged.
+	if ( samItemHasTrait(item->type, SAMItemTrait::TINKER_THROWABLE) ) { return true; }
+
 	if ( !item )
 	{
 		return false;

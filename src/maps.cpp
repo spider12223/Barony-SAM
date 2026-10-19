@@ -10,6 +10,9 @@
 -------------------------------------------------------------------------------*/
 
 #include "main.hpp"
+#include "sam_rooms.hpp"   // mod-injected prefab rooms
+#include "sam_event.hpp"   // player.on_before_revive
+#include "sam_mp_input.hpp" // the host's revive answers, decided before the load; floor-load revives noted
 #include "game.hpp"
 #include "stat.hpp"
 #include "entity.hpp"
@@ -28,6 +31,9 @@
 #include "mod_tools.hpp"
 #include "menu.hpp"
 #include "ui/MainMenu.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp"
+#include "sam_loot.hpp"       // S.A.M: the "floor" roll context and the weighted category draw
 
 int startfloor = 0;
 BaronyRNG map_rng;
@@ -1551,6 +1557,41 @@ int generateDungeon(char* levelset, Uint32 seed, std::tuple<int, int, int, int> 
 		loadSubRoomData(fullMapPath, &mapList);
 	}
 
+	// S.A.M: append any rooms mods declared for THIS levelset, so modded content turns up
+	// in the ordinary dungeon instead of only inside a mod's own branch.
+	//
+	// Safe here and nowhere else: the pool loop above has just finished, and possiblerooms
+	// is not allocated until much later (it is sized by numlevels), so growing numlevels
+	// now is picked up automatically by every later step.
+	//
+	// roomsFor() returns a list sorted by (namespace, path). That ordering is load-bearing,
+	// not tidiness: the picker does `map_rng.rand() % numlevels` and walks this list, and in
+	// multiplayer every client regenerates the map ITSELF from a shared seed. An order that
+	// differed between machines would put two players in different dungeons, with nothing
+	// anywhere reporting a problem.
+	if ( SAMRooms::any() )
+	{
+		int samAdded = 0;
+		for ( const std::string& samRoom : SAMRooms::roomsFor(levelset) )
+		{
+			if ( numlevels >= 100 ) // fixed 0..99 index space; never exceed it
+			{
+				printlog("[SAM] room pool for '%s' is full (100); ignoring the rest.", levelset);
+				break;
+			}
+			if ( loadSubRoomData(samRoom, &mapList) )
+			{
+				++numlevels;
+				++samAdded;
+			}
+		}
+		if ( samAdded > 0 )
+		{
+			printlog("[SAM] injected %d mod room(s) into levelset '%s' (pool now %d).",
+				samAdded, levelset, numlevels);
+		}
+	}
+
 	if ( !secretlevel )
 	{
 		if ( treasure_room_generator.orb_floors.find(currentlevel) != treasure_room_generator.orb_floors.end() )
@@ -1773,7 +1814,17 @@ int generateDungeon(char* levelset, Uint32 seed, std::tuple<int, int, int, int> 
 	int subroomCount[100] = {0};
 
 	// a maximum of 100 (0-99 inclusive) sublevels can be added to the pool
-	for ( int subRoomNumLevels = 0; subRoomNumLevels <= numlevels; subRoomNumLevels++ )
+	//
+	// S.A.M: the bound was `<= numlevels`, which writes subroomCount[100] when a levelset
+	// fills the pool -- one past the end of the array declared just above. It has never
+	// fired because no vanilla set comes close (mine tops out at 34 rooms), but a mod
+	// injecting rooms is exactly the thing that inflates a pool to 100.
+	//
+	// `<` is also the correct bound on its own terms: the room loop above breaks at the
+	// first missing file, so rooms 0..numlevels-1 exist and room `numlevels` does not.
+	// The old extra iteration could therefore only ever look for subrooms of a room that
+	// is not there, find nothing, and break. Behaviour is unchanged.
+	for ( int subRoomNumLevels = 0; subRoomNumLevels < numlevels; subRoomNumLevels++ )
 	{
 		for ( char letter = 'a'; letter <= 'z'; letter++ )
 		{
@@ -7005,6 +7056,13 @@ void assignActions(map_t* map)
 		return;
 	}
 
+	// S.A.M: every roll made while this floor is built is a "floor" roll for the loot tables
+	// (sam_set_loot_context, sam_set_loot_fallback); the map's own chests set their "chest" scope
+	// inside createChestInventory. This runs on the level loader's thread, on every machine, so
+	// the loot EVENTS do not fire here (sam_loot.hpp says why); the tables do, and they are the
+	// same on every machine.
+	SAMLoot::ContextScope samFloorCtx(SAMLoot::Floor);
+
 	// update arachnophobia filter
 	arachnophobia_filter = GameplayPreferences_t::getGameConfigValue(GameplayPreferences_t::GOPT_ARACHNOPHOBIA);
 	colorblind_lobby = GameplayPreferences_t::getGameConfigValue(GameplayPreferences_t::GOPT_COLORBLIND);
@@ -7090,9 +7148,30 @@ void assignActions(map_t* map)
 					}
 
 					bool revived = false;
+					// S.A.M: a handler refused this player's revive, so the body below belongs to
+					// someone the mod is keeping dead and has to come down again. See noteKeptDead.
+					bool samKeptDead = false;
                     if ( stats[numplayers]->HP <= 0 )
                     {
+						// S.A.M: cancellable. This block IS Barony's co-op death rule -- it frees
+						// all ten equipment slots and purges the inventory, then stands the player
+						// up on the next floor. A mod that wants to change what dying costs has to
+						// be able to refuse it. On a veto `revived` is still set, because the
+						// `if ( !revived )` top-up further down would otherwise undo the refusal;
+						// only the rebuild is skipped.
+						//
+						// The question is NOT asked here. This runs on the level loader's worker
+						// thread, on every machine: the event used to fire up to four times per
+						// death, a JS handler could fail on the worker thread's stack, and each
+						// machine applied its own answer to its own copy -- a joiner could wipe the
+						// backpack the host had just refused to take. The host asks once, on the
+						// main thread, before the level change goes out (decideFloorRevives), and
+						// the answer travels with LVLC/LVLR; every machine applies that one answer.
+						const bool samReviveAllowed = SAMMpInput::reviveAllowed(numplayers);
 						revived = true;
+						samKeptDead = !samReviveAllowed;
+						if ( samReviveAllowed )
+						{
                         if (!keepInventoryGlobal)
                         {
                             Item** items[] = {
@@ -7146,6 +7225,16 @@ void assignActions(map_t* map)
 									stats[numplayers]->EFFECTS_ACCRETION_TIME[c] = 0;
 								}
 							}
+
+							if ( numplayers >= 0 && multiplayer != CLIENT )
+							{
+								// S.A.M: recorded only. player.on_player_revived fires from the main
+								// thread once the load has finished (SAMMpInput::fireFloorRevives), not
+								// here on the loader thread, where a JS handler could fail on the worker
+								// thread's stack and a handler touching the world raced the load itself.
+								SAMMpInput::noteFloorRevived(numplayers);
+							}
+						}   // if ( samReviveAllowed )
 						}
 					}
 					entity->behavior = &actPlayer;
@@ -7193,6 +7282,14 @@ void assignActions(map_t* map)
 						entity->yaw = entity->playerStartDir * 45 * (PI / 180.f);
 					}
 					entity->playerStartDir = 0;
+					if ( samKeptDead )
+					{
+						// S.A.M: the body is standing where it always stands, but this player is still
+						// dead. The host takes its own copy down on the first actPlayer tick; a client
+						// uses this to give a local player of its own a camera here instead of leaving
+						// them staring at a frozen frame once the host's ENTD removes the body.
+						SAMMpInput::noteKeptDead(numplayers, entity->x, entity->y, entity->yaw);
+					}
 					if ( multiplayer != CLIENT )
 					{
 						if ( numplayers == 0 && minotaurlevel )
@@ -7483,42 +7580,18 @@ void assignActions(map_t* map)
 								if ( map_rng.rand() % 2 == 0 )
 								{
 									// possible magicstaff
-									int randType = map_rng.rand() % (Category::CATEGORY_MAX - 2);
-									if ( randType == THROWN && map_rng.rand() % 3 ) // THROWN items 66% to be re-roll.
-									{
-										randType = map_rng.rand() % (Category::CATEGORY_MAX - 2);
-									}
-									if ( randType == BOOK && map_rng.rand() % 2 ) // BOOK items % to be re-roll, exclude book cat
-									{
-										randType = map_rng.rand() % (Category::CATEGORY_MAX - 3);
-									}
+									// S.A.M: the vanilla draw and its two re-rolls live in SAMLoot::pickCategory
+									// (PickFloorWithStaff) verbatim, so map_rng is consumed exactly as before;
+									// sam_set_loot_category_weight turns it into one weighted draw.
+									int randType = SAMLoot::pickCategory(map_rng, SAMLoot::PickFloorWithStaff);
 									entity->skill[10] = itemLevelCurve(static_cast<Category>(randType), 0, currentlevel, map_rng);
 									rolledLevelCurveItem = true;
 								}
 								else
 								{
 									// impossible magicstaff
-									int randType = map_rng.rand() % (Category::CATEGORY_MAX - 3);
-									if ( randType >= MAGICSTAFF )
-									{
-										randType++;
-									}
-									if ( randType == THROWN && map_rng.rand() % 3 ) // THROWN items 66% to be re-roll.
-									{
-										randType = map_rng.rand() % (Category::CATEGORY_MAX - 3);
-										if ( randType >= MAGICSTAFF )
-										{
-											randType++;
-										}
-									}
-									if ( randType == BOOK && map_rng.rand() % 2 ) // BOOK items % to be re-roll, exclude book cat
-									{
-										randType = map_rng.rand() % (Category::CATEGORY_MAX - 4);
-										if ( randType >= MAGICSTAFF )
-										{
-											randType++;
-										}
-									}
+									// S.A.M: PickFloorNoStaff is this branch's draw moved verbatim (see above).
+									int randType = SAMLoot::pickCategory(map_rng, SAMLoot::PickFloorNoStaff);
 									entity->skill[10] = itemLevelCurve(static_cast<Category>(randType), 0, currentlevel, map_rng);
 									rolledLevelCurveItem = true;
 								}

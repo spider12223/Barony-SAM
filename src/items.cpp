@@ -13,6 +13,9 @@
 #include "game.hpp"
 #include "stat.hpp"
 #include "items.hpp"
+#include "sam_items.hpp" // custom items in random loot generation
+#include "sam_loot.hpp"  // S.A.M: loot tables, roll context and the loot events (sam_loot.hpp)
+#include "sam_races.hpp" // S.A.M: a custom race that can open tins by hand
 #include "messages.hpp"
 #include "interface/interface.hpp"
 #include "magic/magic.hpp"
@@ -25,11 +28,15 @@
 #include "net.hpp"
 #include "player.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
+#include "sam_js_runtime.hpp"
+#include "sam_mp_input.hpp"   // a joiner's Use/equip/identify decided and reported where it counts
 
 #include <assert.h>
 
 Uint32 itemuids = 1;
-ItemGeneric items[NUMITEMS];
+ItemGeneric items[NUM_ITEM_SLOTS];
 const real_t potionDamageSkillMultipliers[6] = { 1.f, 1.1, 1.25, 1.5, 2.5, 4.f };
 const real_t thrownDamageSkillMultipliers[6] = { 1.f, 1.1, 1.25, 1.5, 2.f, 3.f };
 Uint32 enchantedFeatherScrollSeed;
@@ -205,8 +212,10 @@ Item* newItem(const ItemType type, const Status status, const Sint16 beatitude, 
 	}
 
 	// now set all of my data elements
-	// try to sanitize these a bit so that corrupt data doesn't crash the whole game
-	item->type = (type >= 0 && type < NUMITEMS) ? type : ItemType::GEM_ROCK;
+	// try to sanitize these a bit so that corrupt data doesn't crash the whole game.
+	// NUM_ITEM_SLOTS (not NUMITEMS) so S.A.M custom items (ids 5000+) keep their
+	// identity instead of being silently turned into a GEM_ROCK on allocation.
+	item->type = (type >= 0 && type < NUM_ITEM_SLOTS) ? type : ItemType::GEM_ROCK;
 	item->status = (int)status < Status::BROKEN ?
 		Status::BROKEN : ((int)status > EXCELLENT ? EXCELLENT : status);
 	item->beatitude = std::min(std::max((Sint16)-100, beatitude), (Sint16)100);
@@ -371,6 +380,9 @@ bool itemLevelCurvePostProcess(Entity* my, Item* item, BaronyRNG& rng, int itemL
 
 	int itemType = (my && my->behavior == &actItem) ? my->skill[10] : item->type;
 	int itemStatus = (my && my->behavior == &actItem) ? my->skill[11] : item->type;
+	// S.A.M: what the curve handed us, for the post event's is_fallback / was_spellbook_rerolled.
+	const int samOriginalType = itemType;
+	bool samSpellbookRerolled = false;
 	if ( itemType >= BRONZE_TOMAHAWK && itemType <= CRYSTAL_SHURIKEN )
 	{
 		// thrown weapons always fixed status. (tomahawk = decrepit, shuriken = excellent)
@@ -398,7 +410,17 @@ bool itemLevelCurvePostProcess(Entity* my, Item* item, BaronyRNG& rng, int itemL
 	}
 	if ( itemType >= 0 && itemType < NUMITEMS )
 	{
-		if ( items[itemType].category == SPELLBOOK )
+		// S.A.M: world.on_before_spellbook_reroll, asked only when the curve picked a spellbook
+		// and before the candidate list is built (so a handler that keeps the book costs the RNG
+		// nothing). `keep` is what lets a level-patched class spellbook survive this re-roll; a
+		// forced spell_id bypasses the school rotation and the difficulty ladder; allow_hidden
+		// lets sheet-hidden spells (class, race, monster books) into the normal draw. The
+		// per-spell table (sam_set_spell_droppable) is consulted inside the loop, in spellAllowed.
+		int samForcedSpell = -1;
+		bool samAllowHidden = false;
+		const bool samKeepBook = ( items[itemType].category == SPELLBOOK )
+			&& SAMLoot::beforeSpellbookReroll((my && my->behavior == &actItem) ? nullptr : item, itemType, itemLevel, samForcedSpell, samAllowHidden);
+		if ( items[itemType].category == SPELLBOOK && !samKeepBook )
 		{
 			//if ( itemLevelCurveType == ITEM_LEVEL_CURVE_TYPE_DEFAULT )
 			{
@@ -432,13 +454,17 @@ bool itemLevelCurvePostProcess(Entity* my, Item* item, BaronyRNG& rng, int itemL
 					{
 						if ( auto spell = find->second )
 						{
-							if ( spell->ID != SPELL_NONE && !spell->hide_from_ui && itemLevel >= spell->drop_table )
+							// S.A.M: the sheet's rule (not hidden, deep enough) with the mod's override on top;
+							// a forced spell is the only candidate and skips the ladder and the rotation.
+							if ( spell->ID != SPELL_NONE
+								&& ( samForcedSpell < 0 || spell->ID == samForcedSpell )
+								&& SAMLoot::spellAllowed(spell->ID, spell->drop_table, spell->hide_from_ui, itemLevel, samAllowHidden) )
 							{
-								if ( (spell->difficulty / 20) <= (1 + (itemLevel / 5))
+								if ( samForcedSpell >= 0 || (spell->difficulty / 20) <= (1 + (itemLevel / 5))
 									/*&& (spell->difficulty >= minDifficulty)*/ )
 								{
 
-									if ( lastSpellSkill >= 0 )
+									if ( lastSpellSkill >= 0 && samForcedSpell < 0 )
 									{
 										if ( lastSpellSkill == PRO_SORCERY )
 										{
@@ -543,6 +569,7 @@ bool itemLevelCurvePostProcess(Entity* my, Item* item, BaronyRNG& rng, int itemL
 						item->type = static_cast<ItemType>(itemType);
 						item->appearance = appearance;
 					}
+					samSpellbookRerolled = ( itemType != samOriginalType );   // S.A.M
 				}
 			}
 		}
@@ -555,6 +582,20 @@ bool itemLevelCurvePostProcess(Entity* my, Item* item, BaronyRNG& rng, int itemL
 			if ( items[itemType].category == SPELLBOOK )
 			{
 				*lastItemSpellType = itemType;
+			}
+		}
+	}
+
+	// S.A.M: world.on_loot_rolled, once the final type is known (after the spellbook re-roll). A
+	// handler may rewrite the item in place; the school-rotation memory follows the rewrite.
+	{
+		const int samFinal = SAMLoot::afterRoll(my, item, samOriginalType, samSpellbookRerolled);
+		if ( samFinal != itemType )
+		{
+			if ( lastItemType ) { *lastItemType = samFinal; }
+			if ( lastItemSpellType && samFinal >= 0 && samFinal < NUMITEMS && items[samFinal].category == SPELLBOOK )
+			{
+				*lastItemSpellType = samFinal;
 			}
 		}
 	}
@@ -624,17 +665,36 @@ bool isHatShopItem(ItemType hat)
 	return false;
 }
 
-ItemType itemLevelCurve(const Category cat, const int minLevel, const int maxLevel, BaronyRNG& rng)
+ItemType itemLevelCurve(const Category catIn, const int minLevelIn, const int maxLevelIn, BaronyRNG& rng)
 {
 	const int numitems = NUMITEMS;
 	bool chances[NUMITEMS];
 	int c;
 
-	if ( cat < 0 || cat >= Category::CATEGORY_MAX )
+	if ( catIn < 0 || catIn >= Category::CATEGORY_MAX )
 	{
 		printlog("warning: itemLevelCurve() called with bad category value!\n");
 		return GEM_ROCK;
 	}
+
+	// S.A.M: world.on_before_loot_roll, asked BEFORE the candidate loop. A handler may rewrite
+	// the category and the window, or force a type -- and a forced type returns here, before
+	// any rng.rand() below, so the stream is untouched either way: a handler that declines
+	// leaves this call consuming exactly what vanilla consumes. With no script loaded the call
+	// is one bool test and the three values pass through unchanged.
+	int samCat = (int)catIn;
+	int samMin = minLevelIn;
+	int samMax = maxLevelIn;
+	{
+		const int samForced = SAMLoot::beforeRoll(samCat, samMin, samMax);
+		if ( samForced >= 0 )
+		{
+			return static_cast<ItemType>(samForced);
+		}
+	}
+	const Category cat = static_cast<Category>(samCat);
+	const int minLevel = samMin;
+	const int maxLevel = samMax;
 
 	Uint32 numoftype = 0;
 	for ( c = 0; c < numitems; ++c )
@@ -730,24 +790,51 @@ ItemType itemLevelCurve(const Category cat, const int minLevel, const int maxLev
 			}
 		}
 	}
-	if ( numoftype == 0 )
+	// S.A.M: modded items eligible for random generation, judged by the SAME rule applied
+	// to vanilla above (matching category, level in range, level != -1). Asked of the
+	// registry rather than by widening the loop: the reserved custom slots are zeroed, so an
+	// unregistered one reads as category WEAPON at level 0 and WOULD pass the filter,
+	// flooding weapon rolls with phantoms even with no mod loaded.
+	//
+	// With no mod the vector stays empty, no extra rng.rand() is consumed, and a seeded run
+	// produces byte-identical loot to vanilla.
+	std::vector<int> samCandidates;
+	SAMItems::lootCandidates((int)cat, minLevel, maxLevel, samCandidates);
+	if ( numoftype == 0 && samCandidates.empty() )
 	{
 		printlog("warning: category passed to itemLevelCurve has no items!\n");
-		return GEM_ROCK;
+		return static_cast<ItemType>(SAMLoot::fallback((int)cat));   // S.A.M: sam_set_loot_fallback, else GEM_ROCK
 	}
 
 	// calculate number of items left
+	//
+	// S.A.M: the per-item tables (weight 0, floor window, context allow-list) are applied HERE,
+	// after the vanilla loop has taken its stochastic draws, so a mod that drops an item changes
+	// which items survive but not how many rng.rand() calls the loop made. With no table
+	// entries anyItemRules() is false and this loop is the vanilla count.
+	const bool samRules = SAMLoot::anyItemRules();
 	Uint32 numleft = 0;
 	for ( c = 0; c < numitems; c++ )
 	{
 		if ( chances[c] == true )
 		{
+			if ( samRules && SAMLoot::candidateWeight(c) <= 0 )
+			{
+				chances[c] = false;
+				continue;
+			}
 			numleft++;
 		}
 	}
+	if ( samRules && !samCandidates.empty() )
+	{
+		samCandidates.erase(std::remove_if(samCandidates.begin(), samCandidates.end(),
+			[](int id) { return SAMLoot::candidateWeight(id) <= 0; }), samCandidates.end());
+	}
+	numleft += (Uint32)samCandidates.size();   // S.A.M: modded items share the same draw
 	if ( numleft == 0 )
 	{
-		return GEM_ROCK;
+		return static_cast<ItemType>(SAMLoot::fallback((int)cat));   // S.A.M: sam_set_loot_fallback, else GEM_ROCK
 	}
 
 	// most gems are worthless pieces of glass
@@ -756,6 +843,35 @@ ItemType itemLevelCurve(const Category cat, const int minLevel, const int maxLev
 		if ( rng.rand() % 10 )
 		{
 			return GEM_GLASS;
+		}
+	}
+
+	// S.A.M: a weighted draw over the SAME survivors in the SAME order, used only when some
+	// weight is above 1 (sam_set_loot_weight). A table of weights that are all 1 or 0 never
+	// comes here, so the vanilla modulo below keeps the vanilla stream.
+	if ( SAMLoot::anyWeightAboveOne() )
+	{
+		std::vector<unsigned int> samWeights;
+		std::vector<int> samIds;
+		samWeights.reserve(numleft);
+		samIds.reserve(numleft);
+		for ( c = 0; c < numitems; c++ )
+		{
+			if ( items[c].category == cat && chances[c] == true )
+			{
+				samWeights.push_back((unsigned int)SAMLoot::candidateWeight(c));
+				samIds.push_back(c);
+			}
+		}
+		for ( int id : samCandidates )
+		{
+			samWeights.push_back((unsigned int)SAMLoot::candidateWeight(id));
+			samIds.push_back(id);
+		}
+		if ( !samIds.empty() )
+		{
+			const int samPick = rng.discrete(samWeights.data(), (int)samWeights.size());
+			return static_cast<ItemType>(samIds[std::max(0, std::min((int)samIds.size() - 1, samPick))]);
 		}
 	}
 
@@ -780,7 +896,15 @@ ItemType itemLevelCurve(const Category cat, const int minLevel, const int maxLev
 		}
 	}
 
-	return GEM_ROCK;
+	// S.A.M: the pick fell past every vanilla candidate, so it belongs to a modded one.
+	// Unreachable with no mod: samCandidates is empty, so numleft never rose above the
+	// vanilla count and pick can never reach here.
+	if ( pick < samCandidates.size() )
+	{
+		return static_cast<ItemType>(samCandidates[pick]);
+	}
+
+	return static_cast<ItemType>(SAMLoot::fallback((int)cat));   // S.A.M: unreachable in practice; the fallback table if ever
 }
 
 /*-------------------------------------------------------------------------------
@@ -872,7 +996,14 @@ char* Item::description() const
 			}
 			else
 			{
-				snprintf(&tempstr[c], 1024 - c, "ITEM%03d", type);
+				if ( type >= NUMITEMS && type < NUM_ITEM_SLOTS ) // S.A.M custom item: show its real name, not ITEM<N>
+				{
+					snprintf(&tempstr[c], 1024 - c, "%s", identified ? items[type].getIdentifiedName() : items[type].getUnidentifiedName());
+				}
+				else
+				{
+					snprintf(&tempstr[c], 1024 - c, "ITEM%03d", type);
+				}
 			}
 		}
 		else
@@ -950,7 +1081,14 @@ char* Item::description() const
 			}
 			else
 			{
-				snprintf(&tempstr[c], 1024 - c, "ITEM%03d", type);
+				if ( type >= NUMITEMS && type < NUM_ITEM_SLOTS ) // S.A.M custom item: show its real name, not ITEM<N>
+				{
+					snprintf(&tempstr[c], 1024 - c, "%s", identified ? items[type].getIdentifiedName() : items[type].getUnidentifiedName());
+				}
+				else
+				{
+					snprintf(&tempstr[c], 1024 - c, "ITEM%03d", type);
+				}
 			}
 		}
 	}
@@ -1034,7 +1172,14 @@ char* Item::description() const
 			}
 			else
 			{
-				snprintf(&tempstr[c], 1024 - c, "ITEM%03d", type);
+				if ( type >= NUMITEMS && type < NUM_ITEM_SLOTS ) // S.A.M custom item: show its real name, not ITEM<N>
+				{
+					snprintf(&tempstr[c], 1024 - c, "%s", identified ? items[type].getIdentifiedName() : items[type].getUnidentifiedName());
+				}
+				else
+				{
+					snprintf(&tempstr[c], 1024 - c, "ITEM%03d", type);
+				}
 			}
 		}
 		else
@@ -1115,7 +1260,14 @@ char* Item::description() const
 			}
 			else
 			{
-				snprintf(&tempstr[c], 1024 - c, "ITEM%03d", type);
+				if ( type >= NUMITEMS && type < NUM_ITEM_SLOTS ) // S.A.M custom item: show its real name, not ITEM<N>
+				{
+					snprintf(&tempstr[c], 1024 - c, "%s", identified ? items[type].getIdentifiedName() : items[type].getUnidentifiedName());
+				}
+				else
+				{
+					snprintf(&tempstr[c], 1024 - c, "ITEM%03d", type);
+				}
 			}
 		}
 	}
@@ -1132,7 +1284,10 @@ char* Item::description() const
 
 Category itemCategory(const Item* const item)
 {
-	if ( !item || item->type < 0 || item->type >= NUMITEMS )
+	// NUM_ITEM_SLOTS (not NUMITEMS) so S.A.M custom items (type >= 5000) report their
+	// real category (e.g. ARMOR for a shield) instead of being mis-read as GEM — which
+	// otherwise breaks the equip string + the "Equip" context-menu option.
+	if ( !item || item->type < 0 || item->type >= NUM_ITEM_SLOTS )
 	{
 		return GEM;
 	}
@@ -1181,6 +1336,10 @@ char* Item::getName() const
 				strcpy(tempstr, items[type].getUnidentifiedName());
 			}
 		}
+	}
+	else if ( type >= NUMITEMS && type < NUM_ITEM_SLOTS ) // S.A.M custom item: real name, not ITEM<N>
+	{
+		snprintf(tempstr, sizeof(tempstr), "%s", identified ? items[type].getIdentifiedName() : items[type].getUnidentifiedName());
 	}
 	else
 	{
@@ -1269,7 +1428,21 @@ int getItemVariationFromSpellbookOrTome(const Item& item)
 
 Sint32 itemModel(const Item* const item, bool shortModel, Entity* creature)
 {
-	if ( !item || item->type < 0 || item->type >= NUMITEMS )
+	// S.A.M: a custom item may declare a different model for a state -- broken, cursed,
+	// blessed, unidentified. This is the one funnel every world/held model goes through and
+	// it holds the Item itself, so nothing extra has to be plumbed or networked: status,
+	// beatitude and identified are already saved and synced. Returns -1 for every vanilla
+	// item and for any custom item that declares no state, so this is a no-op then.
+	if ( item )
+	{
+		const int samState = SAMItems::stateModelFor((int)item->type, (int)item->status,
+			(int)item->beatitude, item->identified, false);
+		if ( samState >= 0 ) { return samState; }
+	}
+	// S.A.M: custom items live in slots [NUMITEMS, NUM_ITEM_SLOTS) and carry a valid
+	// cloned model index in items[type]; only bail past the real array end so their
+	// in-hand / world 3D model renders (instead of falling back to model 0).
+	if ( !item || item->type < 0 || item->type >= NUM_ITEM_SLOTS )
 	{
 		return 0;
 	}
@@ -1386,6 +1559,12 @@ Sint32 itemModel(const Item* const item, bool shortModel, Entity* creature)
 			return index + variation;
 		}
 	}
+	// S.A.M: a slot with no image variations makes this modulo a divide-by-zero. Vanilla
+	// never hits it (every vanilla slot gets variations from its image list), but a save
+	// that still references a custom item whose mod has since been removed lands on an
+	// unregistered slot with variations == 0. Return the base index so the item renders as
+	// a placeholder instead of crashing the load.
+	if ( items[item->type].variations <= 0 ) { return index; }
 	return index + item->appearance % items[item->type].variations;
 }
 
@@ -1399,10 +1578,26 @@ Sint32 itemModel(const Item* const item, bool shortModel, Entity* creature)
 
 Sint32 itemModelFirstperson(const Item* const item)
 {
-	if ( !item || item->type < 0 || item->type >= NUMITEMS )
+	// S.A.M: the first-person twin of the state models in itemModel above.
+	if ( item )
+	{
+		const int samState = SAMItems::stateModelFor((int)item->type, (int)item->status,
+			(int)item->beatitude, item->identified, true);
+		if ( samState >= 0 ) { return samState; }
+	}
+	// S.A.M: allow custom item slots (< NUM_ITEM_SLOTS) through so the cloned
+	// first-person model index in items[type] is used instead of falling back to 0.
+	if ( !item || item->type < 0 || item->type >= NUM_ITEM_SLOTS )
 	{
 		return 0;
 	}
+	// S.A.M: a slot with no image variations makes every modulo below a divide-by-zero.
+	// Vanilla never hits it (each vanilla slot takes its variations from its image list),
+	// but a save still referencing a custom item whose mod has been removed lands on an
+	// unregistered slot where variations == 0. Bail to the base index so the item renders
+	// as a placeholder instead of crashing the load. Hoisted above the TOOL_DUCK branch,
+	// which performs the same modulo.
+	if ( items[item->type].variations <= 0 ) { return items[item->type].fpindex; }
 
 	if ( item->type == MAGICSTAFF_SCEPTER )
 	{
@@ -1480,8 +1675,14 @@ int itemCompare(const Item* const item1, const Item* const item2, bool checkAppe
 	{
 		return 1;
 	}
-	model1 = items[item1->type].index + item1->appearance % items[item1->type].variations;
-	model2 = items[item2->type].index + item2->appearance % items[item2->type].variations;
+	// S.A.M: an unregistered slot has variations == 0 (a save that still references a
+	// custom item whose mod has been removed). Comparing by base index alone is correct
+	// there -- there are no variants to distinguish -- and avoids a divide-by-zero on a
+	// path reached by itemSlot/itemIsEquipped/itemPickup during save load.
+	model1 = items[item1->type].index
+		+ ( items[item1->type].variations > 0 ? item1->appearance % items[item1->type].variations : 0 );
+	model2 = items[item2->type].index
+		+ ( items[item2->type].variations > 0 ? item2->appearance % items[item2->type].variations : 0 );
 	//messagePlayer(0, "item1- %d, item2 - %d", model1, model2);
 	if ( model1 != model2 )
 	{
@@ -1923,6 +2124,19 @@ bool dropItem(Item* const item, const int player, const bool notifyMessage, cons
 		entity->parent = players[player]->entity->getUID();
 		entity->itemOriginalOwner = entity->parent;
 
+		if ( player >= 0 && multiplayer != CLIENT )
+		{
+			{
+				SamEvent samEv;
+				samEv.setName("player.on_item_dropped");
+				samEv.i("player", (long long)player);
+				samEv.i("item_type", (long long)item->type);
+				samEv.i("floor_x", (long long)(entity->x / 16));
+				samEv.i("floor_y", (long long)(entity->y / 16));
+				samEv.fire();
+			}
+		}
+
 		// play sound - not in the same tick
 		if ( ticks - dropItemSfxTicks[player] > 1 )
 		{
@@ -1977,6 +2191,39 @@ bool dropItem(Item* const item, const int player, const bool notifyMessage, cons
 
 		return false;
 	}
+}
+
+// S.A.M host helper: spawn a ground item Entity at map tile (tx,ty), mirroring the
+// actItem spawn block in dropItemMonster but at an arbitrary tile center. The entity
+// carries the item purely as primitives in skill[10..15] — no Item* is allocated.
+// Returns the new Entity* (nullptr on a bad tile). Server-authoritative: the
+// UPDATENEEDED flag replicates the new ground item to clients. Used by sam_spawn_item.
+Entity* spawnGroundItem(ItemType type, Status status, Sint16 beatitude, Sint16 count, int tx, int ty)
+{
+	if ( tx < 0 || tx >= (int)map.width || ty < 0 || ty >= (int)map.height )
+	{
+		return nullptr;
+	}
+	Entity* entity = newEntity(-1, 1, map.entities, nullptr);
+	entity->flags[INVISIBLE] = true;
+	entity->flags[UPDATENEEDED] = true;
+	entity->x = tx * 16.0 + 8.0;
+	entity->y = ty * 16.0 + 8.0;
+	entity->sizex = 4;
+	entity->sizey = 4;
+	entity->vel_z = -.5;
+	entity->flags[PASSABLE] = true;
+	entity->flags[USERFLAG1] = true;
+	entity->behavior = &actItem;
+	entity->skill[10] = type;
+	entity->skill[11] = status;
+	entity->skill[12] = beatitude;
+	entity->skill[13] = count;
+	entity->skill[14] = 0; // appearance
+	entity->skill[15] = 1; // identified
+	entity->itemOriginalOwner = 0;
+	entity->parent = 0;
+	return entity;
 }
 
 Entity* dropItemMonster(Item* const item, Entity* const monster, Stat* const monsterStats, Sint16 count)
@@ -2378,7 +2625,8 @@ EquipItemResult equipItem(Item* const item, Item** const slot, const int player,
 					(*slot)->identified = true;
 					if ( !prevIdentified )
 					{
-						Item::onItemIdentified(player, item);
+						// S.A.M: the item revealed is the one in the slot, not the one being put on.
+						Item::onItemIdentified(player, *slot);
 					}
 					return EQUIP_ITEM_FAIL_CANT_UNEQUIP;
 				}
@@ -2465,6 +2713,31 @@ EquipItemResult equipItem(Item* const item, Item** const slot, const int player,
 		{
 			players[player]->paperDoll.updateSlots();
 		}
+		// S.A.M scripting hook: a player equipped an item into a slot. Host-authoritative.
+		if ( player >= 0 && multiplayer != CLIENT && item )
+		{
+			const char* samSlot =
+				slot == &stats[player]->weapon      ? "weapon"      :
+				slot == &stats[player]->shield      ? "shield"      :
+				slot == &stats[player]->helmet      ? "helmet"      :
+				slot == &stats[player]->breastplate ? "breastplate" :
+				slot == &stats[player]->gloves      ? "gloves"      :
+				slot == &stats[player]->shoes       ? "boots"       :
+				slot == &stats[player]->cloak       ? "cloak"       :
+				slot == &stats[player]->amulet      ? "amulet"      :
+				slot == &stats[player]->ring        ? "ring"        :
+				slot == &stats[player]->mask        ? "mask"        : "unknown";
+
+			SAMLua::Event ev;
+			ev.setName("player.on_equip").i("player", player)
+				.i("item_type", (int)item->type).s("slot", samSlot);
+			SAMLua::dispatchEvent(ev);
+
+			SAMJs::Event jsev;
+			jsev.setName("player.on_equip").i("player", player)
+				.i("item_type", (int)item->type).s("slot", samSlot);
+			SAMJs::dispatchEvent(jsev);
+		}
 		return EQUIP_ITEM_SUCCESS_NEWITEM;
 	}
 	else
@@ -2496,7 +2769,8 @@ EquipItemResult equipItem(Item* const item, Item** const slot, const int player,
 					(*slot)->identified = true;
 					if ( !prevIdentified )
 					{
-						Item::onItemIdentified(player, item);
+						// S.A.M: the item revealed is the one in the slot (same item here, by value).
+						Item::onItemIdentified(player, *slot);
 					}
 					return EQUIP_ITEM_FAIL_CANT_UNEQUIP;
 				}
@@ -2546,6 +2820,10 @@ EquipItemResult equipItem(Item* const item, Item** const slot, const int player,
 				}
 			}
 		}
+		// S.A.M: capture the unequipped item's primitives BEFORE the remote-server
+		// branch below frees `item`, so the on_unequip dispatch at the return is safe.
+		const int samUneqType  = item ? (int)item->type  : -1;
+		const int samUneqCount = item ? (int)item->count : 0;
 		if ( !players[player]->isLocalPlayer() && multiplayer == SERVER )
 		{
 			if ( item->node )
@@ -2582,6 +2860,32 @@ EquipItemResult equipItem(Item* const item, Item** const slot, const int player,
 		*slot = nullptr;
 
 		players[player]->paperDoll.updateSlots();
+
+		// S.A.M scripting hook: a player unequipped an item. Host-authoritative.
+		if ( player >= 0 && multiplayer != CLIENT )
+		{
+			const char* samSlot =
+				slot == &stats[player]->weapon      ? "weapon"      :
+				slot == &stats[player]->shield      ? "shield"      :
+				slot == &stats[player]->helmet      ? "helmet"      :
+				slot == &stats[player]->breastplate ? "breastplate" :
+				slot == &stats[player]->gloves      ? "gloves"      :
+				slot == &stats[player]->shoes       ? "boots"       :
+				slot == &stats[player]->cloak       ? "cloak"       :
+				slot == &stats[player]->amulet      ? "amulet"      :
+				slot == &stats[player]->ring        ? "ring"        :
+				slot == &stats[player]->mask        ? "mask"        : "unknown";
+
+			SAMLua::Event ev;
+			ev.setName("player.on_unequip").i("player", player)
+				.i("item_type", samUneqType).i("item_count", samUneqCount).s("slot", samSlot);
+			SAMLua::dispatchEvent(ev);
+
+			SAMJs::Event jsev;
+			jsev.setName("player.on_unequip").i("player", player)
+				.i("item_type", samUneqType).i("item_count", samUneqCount).s("slot", samSlot);
+			SAMJs::dispatchEvent(jsev);
+		}
 		return EQUIP_ITEM_SUCCESS_UNEQUIP;
 	}
 }
@@ -2594,7 +2898,7 @@ EquipItemResult equipItem(Item* const item, Item** const slot, const int player,
 
 -------------------------------------------------------------------------------*/
 
-void useItem(Item* item, const int player, Entity* usedBy, bool unequipForDropping, bool serverCheckUse)
+void useItem(Item* item, const int player, Entity* usedBy, bool unequipForDropping, bool serverCheckUse, bool samDeliberateUse, bool samPlayerEquip)
 {
 	if ( item == nullptr )
 	{
@@ -2622,7 +2926,11 @@ void useItem(Item* item, const int player, Entity* usedBy, bool unequipForDroppi
 	}
 
 	// tins need a tin opener to open...
-	if ( player >= 0 && players[player]->isLocalPlayer() && !(stats[player]->type == GOATMAN || stats[player]->type == AUTOMATON) )
+	// S.A.M (v3.3.0): ...unless a custom race says "can_open_tins", as a Goatman or an Automaton
+	// can. Those two bodies short-circuit before the race call; everyone else reaches it, and it
+	// answers false at once for a vanilla race, for race abilities turned off, and with no race mod.
+	if ( player >= 0 && players[player]->isLocalPlayer() && !(stats[player]->type == GOATMAN || stats[player]->type == AUTOMATON
+		|| SAMRaces::canOpenTins(stats[player]->playerRace, stats[player]->stat_appearance)) )
 	{
 		if ( item->type == FOOD_TIN )
 		{
@@ -2648,6 +2956,17 @@ void useItem(Item* item, const int player, Entity* usedBy, bool unequipForDroppi
 		}
 	}
 
+	// S.A.M: a joiner's deliberate Use is decided by the HOST before anything happens here.
+	// This machine used to drink the potion (read the scroll, learn the book) first and tell
+	// the host with USEI afterwards, so a mod's on_item_use veto on the host could stop the
+	// effect but never give the item back. Now the host fires on_item_use and answers, and
+	// SAMMpInput runs this again only on "allow" -- that second pass returns false here and
+	// carries on exactly as before. Only while the host runs S.A.M; otherwise nothing changes.
+	if ( samDeliberateUse && SAMMpInput::askHostBeforeUse(item, player) )
+	{
+		return;
+	}
+
 	int equipItemResult = -1;
 
 	bool checkInventorySpaceForPaperDoll = players[player]->paperDoll.isItemOnDoll(*item);
@@ -2664,6 +2983,7 @@ void useItem(Item* item, const int player, Entity* usedBy, bool unequipForDroppi
 		Uint32 appearance = 0;
 		bool identified = false;
 		bool sendToServer = false;
+		bool deliberate = false;   // S.A.M: the player deliberately chose Use (vs equip)
 		void setItem(Item& item)
 		{
 			type = item.type;
@@ -2685,9 +3005,12 @@ void useItem(Item* item, const int player, Entity* usedBy, bool unequipForDroppi
 			SDLNet_Write32(static_cast<Uint32>(appearance), &net_packet->data[20]);
 			net_packet->data[24] = identified;
 			net_packet->data[25] = clientnum;
+			// S.A.M: byte 26 carries whether this was a deliberate "Use", so the host can let
+			// a mod's on_item_use veto a CLIENT player's use, not only the host's own.
+			net_packet->data[26] = deliberate ? 1 : 0;
 			net_packet->address.host = net_server.host;
 			net_packet->address.port = net_server.port;
-			net_packet->len = 26;
+			net_packet->len = 27;
 			sendPacketSafe(net_sock, -1, net_packet, 0);
 		}
 	};
@@ -2704,6 +3027,7 @@ void useItem(Item* item, const int player, Entity* usedBy, bool unequipForDroppi
 		else
 		{
 			itemDetailsForServer.setItem(*item);
+			itemDetailsForServer.deliberate = samDeliberateUse;
 		}
 	}
 
@@ -2729,6 +3053,116 @@ void useItem(Item* item, const int player, Entity* usedBy, bool unequipForDroppi
 		}
 	}
 
+	// S.A.M scripting hook: a player used an item. Host-authoritative.
+	//
+	// CANCELLABLE. A handler returning false means "I handled this myself, do not run the
+	// vanilla behaviour" -- the mod decides, the game obeys. Returning anything else (or
+	// nothing, which is what every pre-existing script does) lets the game carry on exactly
+	// as before, so this is backwards compatible.
+	//
+	// Fires for EVERY category, not just consumables: a custom TOOL had no way to do
+	// anything at all when used, because the switch below dispatches by exact item type and
+	// a custom id falls through it. This hook is that missing arm, and it is general.
+	{
+		const auto samUseCat = itemCategory(item);
+		if ( player >= 0 && multiplayer != CLIENT )
+		{
+			// A joiner's deliberate Use arrives here twice over: once as a question, when the host
+			// already fired this event and said yes (SAMMpInput), and then as this USEI. Firing it
+			// again would run every handler twice for one potion.
+			const bool samAlreadyDecided = samDeliberateUse && serverCheckUse
+				&& SAMMpInput::takeApprovedUse(player, item);
+			if ( !samAlreadyDecided )
+			{
+				SamEvent ev("player.on_item_use");
+				ev.i("player", player)
+					.i("item_type", (int)item->type).i("item_count", (int)item->count)
+					.i("category", (int)samUseCat).i("deliberate_use", samDeliberateUse ? 1 : 0);
+				// Read once, straight from fire(): it captures the Lua verdict before the JS pass
+				// can reset it, and asks JS too.
+				const bool samUseAllowed = ev.fire();
+
+				// Only a DELIBERATE use may be cancelled. useItem is also the equip path, and a
+				// script cancelling there would block equipping -- including a class's starting
+				// gear at game start, which routes through here too. The event is always
+				// delivered (scripts still see equips) but the veto only applies when the player
+				// actually chose "Use".
+				if ( samDeliberateUse && !samUseAllowed )
+				{
+					// The mod took responsibility. Consume nothing and run nothing: whatever
+					// should happen, the script already did it. For a joiner, `item` is the copy
+					// the USEI handler just put in this machine's list for them, which nothing
+					// else will ever free.
+					if ( serverCheckUse )
+					{
+						SAMMpInput::dropVetoedUseCopy(player, item);
+					}
+					return;
+				}
+			}
+		}
+
+		// S.A.M scripting hook: player.on_before_equip — the player is about to wear or
+		// wield something. CANCELLABLE, and this is the one place to do it: useItem has
+		// ~30 separate equipItem call sites, so checking here covers every slot at once
+		// instead of threading a flag through all of them.
+		//
+		// Gated on samPlayerEquip, which only the "the player chose this" UI paths set.
+		// Starting gear, shop purchases and internal grants all leave it false and equip
+		// exactly as vanilla -- this hook has crashed the game once already by intercepting
+		// a path that was never a player action.
+		//
+		// Decided on the machine of the player who is equipping, NOT only on the host: a
+		// joiner equips locally and only then tells the host, and there is no packet that
+		// takes an equip back, so a host-side veto could only ever stop the host. Returning
+		// here on the joiner's own game stops both the local equip and the USEI that follows.
+		if ( samPlayerEquip && player >= 0 && player < MAXPLAYERS && players[player]->isLocalPlayer()
+			&& items[item->type].item_slot != ItemEquippableSlot::NO_EQUIP
+			&& !itemIsEquipped(item, player) )
+		{
+			if ( !SAMMpInput::playerMayEquip(player, item) )
+			{
+				return;
+			}
+		}
+	}
+
+	if ( item->type >= NUMITEMS && item->type < NUM_ITEM_SLOTS )
+	{
+		// S.A.M custom SPELLBOOK / TOME: "use" means READ-and-learn, not equip -- exactly like
+		// a vanilla spellbook (which is weapon-slot but reads via item_Spellbook, never equips).
+		// Checked FIRST so it takes precedence over the equip dispatch: a custom SPELLBOOK is
+		// usually weapon-slot, so the switch below would otherwise silently equip it instead of
+		// teaching its spell. Both categories funnel into item_Spellbook, which resolves the
+		// spell (getSpellIDFromSpellbook / getTomeSpellID) and calls addSpell.
+		if ( items[item->type].category == SPELLBOOK || items[item->type].category == TOME_SPELL )
+		{
+			item_Spellbook(item, player);
+		}
+		else
+		{
+			// S.A.M custom item: this switch dispatches equip by item->type, so a custom
+			// id (>= 5000) would hit default and never equip ("can't wield it"). Route it
+			// to the correct slot by its declared item_slot (SAM sets items[type].item_slot).
+			Item** eqslot = nullptr;
+			switch ( items[item->type].item_slot )
+			{
+				case EQUIPPABLE_IN_SLOT_WEAPON:      eqslot = &stats[player]->weapon; break;
+				case EQUIPPABLE_IN_SLOT_SHIELD:      eqslot = &stats[player]->shield; break;
+				case EQUIPPABLE_IN_SLOT_MASK:        eqslot = &stats[player]->mask; break;
+				case EQUIPPABLE_IN_SLOT_HELM:        eqslot = &stats[player]->helmet; break;
+				case EQUIPPABLE_IN_SLOT_GLOVES:      eqslot = &stats[player]->gloves; break;
+				case EQUIPPABLE_IN_SLOT_BOOTS:       eqslot = &stats[player]->shoes; break;
+				case EQUIPPABLE_IN_SLOT_BREASTPLATE: eqslot = &stats[player]->breastplate; break;
+				case EQUIPPABLE_IN_SLOT_CLOAK:       eqslot = &stats[player]->cloak; break;
+				case EQUIPPABLE_IN_SLOT_AMULET:      eqslot = &stats[player]->amulet; break;
+				case EQUIPPABLE_IN_SLOT_RING:        eqslot = &stats[player]->ring; break;
+				default: break; // NO_EQUIP custom item — nothing to equip
+			}
+			if ( eqslot ) { equipItemResult = equipItem(item, eqslot, player, checkInventorySpaceForPaperDoll); }
+		}
+	}
+	else
 	switch ( item->type )
 	{
 		case WOODEN_SHIELD:
@@ -3854,12 +4288,42 @@ void useItem(Item* item, const int player, Entity* usedBy, bool unequipForDroppi
 
 -------------------------------------------------------------------------------*/
 
-Item* itemPickup(const int player, Item* const item, Item* addToSpecificInventoryItem, bool forceNewStack)
+Item* itemPickup(const int player, Item* const item, Item* addToSpecificInventoryItem, bool forceNewStack, bool samAllowVeto)
 {
 	if (!item)
 	{
 		return nullptr;
 	}
+
+	// S.A.M scripting hook: player.on_before_item_pickup — fires BEFORE the item enters the
+	// inventory. Distinct from the existing player.on_item_pickup (actitem.cpp), which is a
+	// notification fired AFTER a successful world pickup: two different moments deserve two
+	// different names, and sharing one meant handlers ran twice on disjoint payloads.
+	// CANCELLABLE: a handler returning false refuses the pickup, which is what
+	// makes soulbound items, class gear restrictions and "this cursed thing rejects you"
+	// expressible. Returning null is the same thing vanilla does when a pickup fails, so
+	// every caller already handles it. Host-authoritative.
+	if ( samAllowVeto && player >= 0 && player < MAXPLAYERS && multiplayer != CLIENT )
+	{
+		SAMLua::Event ev;
+		ev.setName("player.on_before_item_pickup").i("player", player)
+			.i("item_type", (int)item->type).i("item_count", (int)item->count)
+			.i("category", (int)itemCategory(item));
+		SAMLua::dispatchEvent(ev);
+		const bool samCancelledLua = SAMLua::lastDispatchCancelled();
+
+		SAMJs::Event jsev;
+		jsev.setName("player.on_before_item_pickup").i("player", player)
+			.i("item_type", (int)item->type).i("item_count", (int)item->count)
+			.i("category", (int)itemCategory(item));
+		SAMJs::dispatchEvent(jsev);
+
+		if ( samCancelledLua || SAMJs::lastDispatchCancelled() )
+		{
+			return nullptr; // the mod refused it; the item stays where it was
+		}
+	}
+
 	Item* item2;
 
 	/*if ( stats[player]->getProficiency(PRO_APPRAISAL) >= CAPSTONE_UNLOCK_LEVEL[PRO_APPRAISAL] )
@@ -4622,6 +5086,19 @@ Sint32 Item::weaponGetAttack(const Stat* const wielder) const
 			attack = abs(beatitude);
 		}
 	}
+	// S.A.M custom item: the chain below is a hardcoded `type ==` table that no custom
+	// id matches, so a custom weapon would otherwise deal beatitude only. Add the base
+	// damage declared in the item JSON's `attributes: { "ATK": n }`. Kept additive and
+	// separate from the chain so a custom MAGICSTAFF/GEM still gets its category bonus
+	// and every custom weapon still reaches the shared `status - 3` tail below.
+	if ( type >= NUMITEMS && type < NUM_ITEM_SLOTS )
+	{
+		auto samAtk = items[type].attributes.find("ATK");
+		if ( samAtk != items[type].attributes.end() )
+		{
+			attack += samAtk->second;
+		}
+	}
 	if ( itemCategory(this) == MAGICSTAFF )
 	{
 		attack += 1;
@@ -4925,6 +5402,13 @@ Sint32 Item::weaponGetAttack(const Stat* const wielder) const
 
 bool Item::doesItemProvideBeatitudeAC(ItemType type)
 {
+	// S.A.M: a mod may declare this on its own item (the case that matters is a custom mask,
+	// which otherwise gains no AC from being blessed). Checked FIRST because BOTH exclusion
+	// groups below end in `return false` -- so a check placed after them would be unreachable
+	// for exactly the custom items that need it. Vanilla items carry mask 0, so every vanilla
+	// answer is unchanged. samItemHasTrait bounds-checks type, unlike the line that follows.
+	if ( samItemHasTrait(type, SAMItemTrait::BEATITUDE_AC) ) { return true; }
+
 	if ( itemTypeIsQuiver(type) || items[type].category == SPELLBOOK
 		|| itemTypeIsFoci(type)
 		|| itemTypeIsInstrument(type)
@@ -5365,7 +5849,10 @@ Sint32 Item::potionGetCursedEffectDurationRandom(Entity* my, Stat* myStats) cons
 
 Sint32 Item::getGoldValue() const
 {
-	if ( type >= 0 && type < NUMITEMS )
+	// S.A.M: NUMITEMS is the vanilla enum count, so this bound returned 0 for every
+	// custom item -- its declared weight and value were stored correctly but never read,
+	// leaving custom gear weightless and worthless. NUM_ITEM_SLOTS covers the custom band.
+	if ( type >= 0 && type < NUM_ITEM_SLOTS )
 	{
 		if ( items[type].category == TOME_SPELL )
 		{
@@ -5429,7 +5916,10 @@ Sint32 Item::getGoldValue() const
 
 Sint32 Item::getWeight() const
 {
-	if ( type >= 0 && type < NUMITEMS )
+	// S.A.M: NUMITEMS is the vanilla enum count, so this bound returned 0 for every
+	// custom item -- its declared weight and value were stored correctly but never read,
+	// leaving custom gear weightless and worthless. NUM_ITEM_SLOTS covers the custom band.
+	if ( type >= 0 && type < NUM_ITEM_SLOTS )
 	{
 		if ( itemTypeIsQuiver(type) )
 		{
@@ -5528,6 +6018,18 @@ Sint32 Item::armorGetAC(const Stat* const wielder) const
 	if ( !Item::doesItemProvideBeatitudeAC(type) )
 	{
 		armor = 0;
+	}
+
+	// S.A.M custom item: the chain below is a hardcoded `type ==` table that no custom
+	// id matches, so custom armor would otherwise give beatitude-only AC. Add the AC
+	// declared in the item JSON's `attributes: { "AC": n }`.
+	if ( type >= NUMITEMS && type < NUM_ITEM_SLOTS )
+	{
+		auto samAc = items[type].attributes.find("AC");
+		if ( samAc != items[type].attributes.end() )
+		{
+			armor += samAc->second;
+		}
 	}
 
 	if ( type == LEATHER_HELM )
@@ -6260,6 +6762,11 @@ SummonProperties::~SummonProperties() noexcept = default;
 
 bool isPotionBad(const Item& potion)
 {
+	// S.A.M: a mod may declare this trait on its own item. Checked FIRST because the
+	// list below ends in a `default: return false` that would make a trailing check
+	// unreachable. Vanilla items carry no traits, so every vanilla answer is unchanged.
+	if ( samItemHasTrait(potion.type, SAMItemTrait::POTION_BAD) ) { return true; }
+
 	if (itemCategory(&potion) != POTION)
 	{
 		return false;
@@ -6288,6 +6795,9 @@ bool isPotionBad(const Item& potion)
 
 void createCustomInventory(Stat* const stats, const int itemLimit, BaronyRNG& rng)
 {
+	// S.A.M: these rolls are a monster's pockets. The uid comes from actMonster's scope around
+	// the species init when there is one; a scope of the same kind inherits it.
+	SAMLoot::ContextScope samCtx(SAMLoot::Monster, -1, -1, -1, stats ? (int)stats->type : -1);
 	int itemSlots[6] = { ITEM_SLOT_INV_1, ITEM_SLOT_INV_2, ITEM_SLOT_INV_3, ITEM_SLOT_INV_4, ITEM_SLOT_INV_5, ITEM_SLOT_INV_6 };
 	int i = 0;
 	Sint32 itemId = -1;
@@ -6394,7 +6904,14 @@ void createCustomInventory(Stat* const stats, const int itemLimit, BaronyRNG& rn
 				chance = stats->EDITOR_ITEMS[itemSlots[i] + 5];
 				if ( rng.rand() % 100 < chance )
 				{
-					newItem(static_cast<ItemType>(itemId), itemStatus, itemBless, itemCount, itemAppearance, itemIdentified, &stats->inventory);
+					Item* samMade = newItem(static_cast<ItemType>(itemId), itemStatus, itemBless, itemCount, itemAppearance, itemIdentified, &stats->inventory);
+					// S.A.M: world.on_loot_rolled for a slot the curve rolled, once the item exists.
+					// No itemLevelCurvePostProcess here: vanilla runs none, and it would re-roll a
+					// spellbook and rewrite a thrown weapon's status.
+					if ( samMade && category > 0 && stats->EDITOR_ITEMS[itemSlots[i]] == 1 )
+					{
+						SAMLoot::afterRoll(nullptr, samMade, (int)itemId, false);
+					}
 				}
 				itemsGenerated++;
 			}
@@ -6543,6 +7060,11 @@ bool isRangedWeapon(const Item& item)
 
 bool isRangedWeapon(const ItemType type)
 {
+	// S.A.M: a mod may declare this trait on its own item. Checked FIRST because the
+	// list below ends in a `default: return false` that would make a trailing check
+	// unreachable. Vanilla items carry no traits, so every vanilla answer is unchanged.
+	if ( samItemHasTrait(type, SAMItemTrait::RANGED) ) { return true; }
+
 	switch ( type )
 	{
 	case SLING:
@@ -6741,7 +7263,7 @@ void copyItem(Item* const itemToSet, const Item* const itemToCopy) //This should
 	itemToSet->isDroppable = itemToCopy->isDroppable;
 }
 
-ItemType itemTypeWithinGoldValue(const int cat, const int minValue, const int maxValue, BaronyRNG& rng)
+ItemType itemTypeWithinGoldValue(const int catIn, const int minValueIn, const int maxValueIn, BaronyRNG& rng)
 {
 	const int numitems = NUMITEMS;
 	int numoftype = 0;
@@ -6749,10 +7271,25 @@ ItemType itemTypeWithinGoldValue(const int cat, const int minValue, const int ma
 	bool pickAnyCategory = false;
 	int c;
 
-	if ( cat < -1 || cat >= Category::CATEGORY_MAX )
+	if ( catIn < -1 || catIn >= Category::CATEGORY_MAX )
 	{
 		printlog("warning: pickItemWithinGoldValue() called with bad category value!\n");
 		return GEM_ROCK;
+	}
+
+	// S.A.M: the same pre-roll event the level curve fires, with min_value/max_value in place
+	// of the level window ("ANY" for the any-category form). Before the loop, so a forced type
+	// or a declined handler leaves the RNG stream where vanilla leaves it.
+	int cat = catIn;
+	int minValue = minValueIn;
+	int maxValue = maxValueIn;
+	{
+		const int samForced = SAMLoot::beforeValueRoll(cat, minValue, maxValue);
+		if ( samForced >= 0 )
+		{
+			return static_cast<ItemType>(samForced);
+		}
+		if ( cat < -1 || cat >= Category::CATEGORY_MAX ) { cat = catIn; }
 	}
 
 	if ( cat == -1 )
@@ -6777,7 +7314,7 @@ ItemType itemTypeWithinGoldValue(const int cat, const int minValue, const int ma
 	if ( numoftype == 0 )
 	{
 		printlog("warning: category passed has no items within gold values!\n");
-		return GEM_ROCK;
+		return static_cast<ItemType>(SAMLoot::fallback(cat));   // S.A.M: sam_set_loot_fallback (category -1 = "ANY"), else GEM_ROCK
 	}
 
 	// pick the item
@@ -6797,7 +7334,7 @@ ItemType itemTypeWithinGoldValue(const int cat, const int minValue, const int ma
 		}
 	}
 
-	return GEM_ROCK;
+	return static_cast<ItemType>(SAMLoot::fallback(cat));   // S.A.M
 }
 
 bool Item::isThisABetterWeapon(const Item& newWeapon, const Item* const weaponAlreadyHave)
@@ -6963,12 +7500,21 @@ bool shouldInvertEquipmentBeatitude(const Stat* const wielder)
 
 bool isItemEquippableInShieldSlot(const Item* const item)
 {
+	if ( !item ) { return false; }
+	// S.A.M: a mod may declare this trait on its own item. Checked FIRST because the
+	// list below ends in a `default: return false` that would make a trailing check
+	// unreachable. Vanilla items carry no traits, so every vanilla answer is unchanged.
+	if ( samItemHasTrait(item->type, SAMItemTrait::SHIELD_SLOT) ) { return true; }
+
 	if ( !item )
 	{
 		return false;
 	}
 
-	if ( item->type < 0 || item->type >= NUMITEMS )
+	// S.A.M: NUM_ITEM_SLOTS so a custom shield answers true here like a vanilla one. The
+	// guard that stops you swapping a shield mid-cast reads this, and was silently skipping
+	// custom shields.
+	if ( item->type < 0 || item->type >= NUM_ITEM_SLOTS )
 	{
 		return false;
 	}
@@ -7028,6 +7574,21 @@ bool Item::usableWhileShapeshifted(const Stat* const wielder) const
 
 int Item::getTomeSpellID() const
 {
+	// S.A.M: a mod's tome declares the spell it teaches, exactly like spellbook_spell /
+	// foci_spell. A custom id matches none of the three vanilla tome types below, so it
+	// fell straight through to `return SPELL_NONE` -- a tome of nothing. Validated against
+	// allGameSpells (not `< NUM_SPELLS`) so a custom tome can teach a CUSTOM spell too.
+	// First statement in the body, so it cannot be shadowed by the vanilla arms below.
+	if ( type >= 0 && type < NUM_ITEM_SLOTS && items[type].category == TOME_SPELL
+		&& items[type].hasAttribute("tome_spell") )
+	{
+		const int samSpellID = items[type].attributes["tome_spell"];
+		if ( samSpellID > SPELL_NONE && allGameSpells.find(samSpellID) != allGameSpells.end() )
+		{
+			return samSpellID;
+		}
+	}
+
 	if ( type == TOME_SORCERY )
 	{
 		auto find = spellTomeAppearanceToID[PRO_SORCERY].find(appearance % TOME_APPEARANCE_MAX);
@@ -7171,11 +7732,21 @@ bool itemSpriteIsQuiverBaseThirdPersonModel(const int sprite)
 
 bool itemTypeIsQuiver(const ItemType type)
 {
+	// S.A.M: a mod may declare this trait on its own item. Checked FIRST because the
+	// list below ends in a `default: return false` that would make a trailing check
+	// unreachable. Vanilla items carry no traits, so every vanilla answer is unchanged.
+	if ( samItemHasTrait(type, SAMItemTrait::QUIVER) ) { return true; }
+
 	return (type >= QUIVER_SILVER && type <= QUIVER_HUNTING) || (type >= QUIVER_BONE && type <= QUIVER_BLACKIRON);
 }
 
 bool itemTypeIsFoci(const ItemType type)
 {
+	// S.A.M: a mod may declare this trait on its own item. Checked FIRST because the
+	// list below ends in a `default: return false` that would make a trailing check
+	// unreachable. Vanilla items carry no traits, so every vanilla answer is unchanged.
+	if ( samItemHasTrait(type, SAMItemTrait::FOCI) ) { return true; }
+
 	switch ( type )
 	{
 	case TOOL_FOCI_FIRE:
@@ -7203,11 +7774,21 @@ bool itemTypeIsFoci(const ItemType type)
 
 bool itemTypeIsInstrument(const ItemType type)
 {
+	// S.A.M: a mod may declare this trait on its own item. Checked FIRST because the
+	// list below ends in a `default: return false` that would make a trailing check
+	// unreachable. Vanilla items carry no traits, so every vanilla answer is unchanged.
+	if ( samItemHasTrait(type, SAMItemTrait::INSTRUMENT) ) { return true; }
+
 	return (type >= INSTRUMENT_FLUTE && type <= INSTRUMENT_HORN);
 }
 
 bool itemTypeIsThrownBall(const ItemType type)
 {
+	// S.A.M: a mod may declare this trait on its own item. Checked FIRST because the
+	// list below ends in a `default: return false` that would make a trailing check
+	// unreachable. Vanilla items carry no traits, so every vanilla answer is unchanged.
+	if ( samItemHasTrait(type, SAMItemTrait::THROWN_BALL) ) { return true; }
+
 	return type == DUST_BALL || type == GREASE_BALL || type == SLOP_BALL;
 }
 
@@ -7470,7 +8051,7 @@ bool playerCanSpawnMoreTinkeringBots(const Stat* const myStats)
 	return false;
 }
 
-void playerTryEquipItemAndUpdateServer(const int player, Item* const item, bool checkInventorySpaceForPaperDoll)
+void playerTryEquipItemAndUpdateServer(const int player, Item* const item, bool checkInventorySpaceForPaperDoll, bool samPlayerEquip)
 {
 	if ( !item )
 	{
@@ -7484,7 +8065,7 @@ void playerTryEquipItemAndUpdateServer(const int player, Item* const item, bool 
 
 	if ( checkInventorySpaceForPaperDoll )
 	{
-		if ( players[player]->isLocalPlayer() 
+		if ( players[player]->isLocalPlayer()
 			&& players[player]->paperDoll.enabled
 			&& players[player]->paperDoll.isItemOnDoll(*item) )
 		{
@@ -7494,6 +8075,20 @@ void playerTryEquipItemAndUpdateServer(const int player, Item* const item, bool 
 				playSoundPlayer(player, 90, 64);
 				return;
 			}
+		}
+	}
+
+	// S.A.M: player.on_before_equip for weapons and spellbooks. Wielding one from the item
+	// menu or the hotbar comes HERE and never through useItem, so the hook there never saw
+	// them -- a class that may not wield swords could wield any sword, even in singleplayer.
+	// Only when the player chose to wield it (samPlayerEquip), and only for an equip, not the
+	// same click taking an equipped item off. Decided on the equipping player's own machine,
+	// before anything is equipped or sent to the host.
+	if ( samPlayerEquip && players[player]->isLocalPlayer() && !itemIsEquipped(item, player) )
+	{
+		if ( !SAMMpInput::playerMayEquip(player, item) )
+		{
+			return;
 		}
 	}
 
@@ -7711,6 +8306,17 @@ int Item::getLootBagNumItems() const
 
 void Item::itemFindUniqueAppearance(Item* tempItem, std::unordered_set<Uint32>& appearancesOfSimilarItems)
 {
+	// S.A.M: this whole function divides by variations eight times over. An unregistered
+	// slot (a save still holding a custom item whose mod was removed) has variations == 0.
+	// There is also nothing to do there -- picking a "unique appearance" is meaningless for
+	// an item with no variants -- so bail before the first divide rather than guard each.
+	// Note this became REACHABLE only once itemCompare stopped crashing earlier in the same
+	// call chain: fixing that moved the crash here instead of removing it.
+	if ( tempItem && ( tempItem->type < 0 || tempItem->type >= NUM_ITEM_SLOTS
+		|| items[tempItem->type].variations <= 0 ) )
+	{
+		return;
+	}
 	if ( !appearancesOfSimilarItems.empty() && tempItem )
 	{
 		Uint32 originalAppearance = tempItem->appearance;
@@ -7786,8 +8392,19 @@ void Item::itemFindUniqueAppearance(Item* tempItem, std::unordered_set<Uint32>& 
 	}
 }
 
-void Item::onItemIdentified(int player, Item* tempItem)
+void Item::onItemIdentified(int player, Item* tempItem, bool samReport)
 {
+	// S.A.M scripting hook: player.on_item_identified. It used to fire only where
+	// multiplayer != CLIENT -- but an identify scroll, an identify spell or a cursed item that
+	// refuses to come off all happen on the OWNER's machine, so for a joiner it fired on no
+	// machine at all (or, once in a while, off the host's equipped copy). SAMMpInput fires it on
+	// the host for every player: the host's own directly, a joiner's reported by their game.
+	// samReport is false for a caller whose identification was already reported (actchest.cpp).
+	if ( samReport && player >= 0 && player < MAXPLAYERS && tempItem )
+	{
+		SAMMpInput::reportItemIdentified(player, tempItem);
+	}
+
 	if ( player >= 0 && player < MAXPLAYERS && players[player]->isLocalPlayer() && stats[player] )
 	{
 		std::unordered_set<Uint32> appearancesOfSimilarItems;

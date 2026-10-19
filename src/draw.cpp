@@ -14,6 +14,9 @@
 #include "files.hpp"
 #include "hash.hpp"
 #include "entity.hpp"
+#ifndef EDITOR
+#include "sam_bodies.hpp" // custom creature bodies on an invisible main entity
+#endif
 #include "player.hpp"
 #include "ui/Frame.hpp"
 #ifdef EDITOR
@@ -2104,7 +2107,22 @@ void drawEntities3D(view_t* camera, int mode)
         
         if ( entity->flags[INVISIBLE] && !entity->flags[INVISIBLE_DITHER] )
         {
-            continue;
+#ifndef EDITOR
+            // S.A.M: six vanilla monsters (bat, duck, mimic, moth, sentrybot, summons)
+            // deliberately hide their MAIN entity -- it is only an "AI bodypart" and all
+            // the visuals live in their limbs. A mod-declared custom body is drawn on that
+            // main entity, so without this the creature would be completely invisible: the
+            // body never draws, and its limbs are hidden because the mod replaced them.
+            // Only ever un-skips an entity that actually carries a custom body; returns
+            // instantly when no mod declares one, so vanilla invisibility is untouched.
+            // ... but NOT when the creature is invisible because of a potion or a spell:
+            // that is a real gameplay state, and un-skipping it left an invisible monster
+            // fully visible and, because this pass also runs for ENTITYUIDS, clickable.
+            if ( SAMBodies::modelForEntity(entity) < 0 || SAMBodies::hiddenByEffect(entity) )
+#endif
+            {
+                continue;
+            }
         }
         if ( entity->flags[UNCLICKABLE] && mode == ENTITYUIDS )
         {

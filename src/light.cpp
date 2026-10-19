@@ -13,6 +13,12 @@
 #include "light.hpp"
 #include "draw.hpp"
 
+// <windows.h> (pulled in via GL/glew.h in main.hpp) #defines a GetObject macro
+// that mangles rapidjson's Value::GetObject() used below. Undo it for this TU.
+#ifdef GetObject
+#undef GetObject
+#endif
+
 /*-------------------------------------------------------------------------------
 
 	lightSphereShadow

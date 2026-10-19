@@ -24,6 +24,7 @@ See LICENSE for details.
 #include "prng.hpp"
 #include "interface/consolecommand.hpp"
 #include "scores.hpp"
+#include "sam_items.hpp" // "worn_like": a mod mask with its own model sits like a vanilla one
 
 static ConsoleVariable<bool> cvar_spawnArtemisia("/spawn_artemisia", false);
 
@@ -1368,6 +1369,9 @@ void shadowMoveBodyparts(Entity* my, Stat* myStats, double dist)
 						entity->flags[INVISIBLE] = true;
 					}
 				}
+				// S.A.M: a mod mask (or the hat under it) with its own model is placed like the vanilla
+				// item it names in "worn_like"; see SAMItems::wornAsTwinBegin. No-op without one.
+				SAMItems::wornAsTwinBegin(entity, nullptr);
 				if ( entity->sprite != 165 && entity->sprite != 1196 )
 				{
 					entity->focalx = limbs[SHADOW][10][0] + .35; // .35
@@ -1380,6 +1384,7 @@ void shadowMoveBodyparts(Entity* my, Stat* myStats, double dist)
 					entity->focaly = limbs[SHADOW][10][1] - 2.25; // -2.25
 					entity->focalz = limbs[SHADOW][10][2]; // .25
 				}
+				SAMItems::wornAsTwinEnd();
 				break;
 		}
 	}

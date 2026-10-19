@@ -16,7 +16,7 @@ See LICENSE for details.
 #include "entity.hpp"
 
 Uint32 itemuids = 1;
-ItemGeneric items[NUMITEMS];
+ItemGeneric items[NUM_ITEM_SLOTS];
 
 /*-------------------------------------------------------------------------------
 

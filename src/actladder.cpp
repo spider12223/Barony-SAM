@@ -23,6 +23,9 @@
 #include "files.hpp"
 #include "items.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp"
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
 #include "ui/MainMenu.hpp"
 #include "colors.hpp"
 
@@ -125,6 +128,30 @@ void actLadder(Entity* my)
 					loadnextlevel = true;
 					Compendium_t::Events_t::previousCurrentLevel = currentlevel;
 					Compendium_t::Events_t::previousSecretlevel = secretlevel;
+
+					// S.A.M scripting hook: the party is going down a ladder. EVERY player changes
+					// floor with it, so this fires once per connected player (`player`), with
+					// `initiator` naming the one who climbed -- it used to fire only for the
+					// climber, so a "heal on floor change" reached one player in four. A handler
+					// that should act once per descent checks `player == initiator`.
+					// Host-authoritative, and ladders only: game.on_level_entered fires for every
+					// player on every arrival, whatever the route. new_floor is a best-effort
+					// estimate (currentlevel+1); secret-level branches below can change it.
+					if ( multiplayer != CLIENT )
+					{
+						for ( int samP = 0; samP < MAXPLAYERS; ++samP )
+						{
+							if ( client_disconnected[samP] || !players[samP] )
+							{
+								continue;
+							}
+							SamEvent ev("player.on_floor_change");
+							ev.i("player", samP).i("initiator", i)
+								.i("old_floor", currentlevel).i("new_floor", currentlevel + 1);
+							ev.fire();
+						}
+					}
+
 					if (secretlevel)
 					{
 						switch (currentlevel)
@@ -204,6 +231,24 @@ void actPortal(Entity* my)
 	int playercount = 0;
 	double dist;
 	int i, c;
+
+	// S.A.M decorative portal (sam_spawn_portal): skill[19]==1 marks a script-spawned
+	// portal that is purely visual — it animates and glows but is NEVER interactive and
+	// never descends anyone. skill[19]/[20] sit OUTSIDE the entire portal alias range
+	// (skill[0-18] = portalAmbience .. portalCustomLevelText8, see entity.hpp) and no
+	// portal behavior reads them, so newEntity zero-inits them and no real portal ever
+	// carries the marker — this guard is a pure no-op for every vanilla portal.
+	if ( my->skill[19] == 1 )
+	{
+		if ( !my->skill[20] )
+		{
+			my->skill[20] = 1;
+			my->light = addLight(my->x / 16, my->y / 16, "portal_purple");
+		}
+		my->yaw += 0.01;                            // rotate slowly, like a real portal
+		my->sprite = 254 + (my->ticks / 20) % 4;    // animate the 4-frame swirl
+		return;
+	}
 
 	if ( !my->portalInit )
 	{
@@ -561,6 +606,27 @@ void actWinningPortal(Entity* my)
 
 				victory = my->portalVictoryType;
 
+				if ( multiplayer != CLIENT )
+				{
+					SAMLua::Event ev;
+					ev.setName("game.on_game_end");
+					ev.i("player", (long long)i);
+					ev.i("won", (long long)1);
+					ev.i("floor_reached", (long long)currentlevel);
+					ev.i("kills", (long long)gameStatistics[STATISTICS_TOTAL_KILLS]);
+					ev.i("time_played", (long long)ticks);
+					SAMLua::dispatchEvent(ev);
+
+					SAMJs::Event jsev;
+					jsev.setName("game.on_game_end");
+					jsev.i("player", (long long)i);
+					jsev.i("won", (long long)1);
+					jsev.i("floor_reached", (long long)currentlevel);
+					jsev.i("kills", (long long)gameStatistics[STATISTICS_TOTAL_KILLS]);
+					jsev.i("time_played", (long long)ticks);
+					SAMJs::dispatchEvent(jsev);
+				}
+
 				Uint8 cutscene = 0;
 				if (!strncmp(map.name, "Boss", 4)) {
 				    cutscene = 1;
@@ -809,6 +875,28 @@ void Entity::actExpansionEndGamePortal()
 					}
 				}
 				victory = portalVictoryType;
+
+				if ( multiplayer != CLIENT )
+				{
+					SAMLua::Event ev;
+					ev.setName("game.on_game_end");
+					ev.i("player", (long long)i);
+					ev.i("won", (long long)1);
+					ev.i("floor_reached", (long long)currentlevel);
+					ev.i("kills", (long long)gameStatistics[STATISTICS_TOTAL_KILLS]);
+					ev.i("time_played", (long long)::ticks);
+					SAMLua::dispatchEvent(ev);
+
+					SAMJs::Event jsev;
+					jsev.setName("game.on_game_end");
+					jsev.i("player", (long long)i);
+					jsev.i("won", (long long)1);
+					jsev.i("floor_reached", (long long)currentlevel);
+					jsev.i("kills", (long long)gameStatistics[STATISTICS_TOTAL_KILLS]);
+					jsev.i("time_played", (long long)::ticks);
+					SAMJs::dispatchEvent(jsev);
+				}
+
 				if ( multiplayer == SERVER )
 				{
 					for ( c = 1; c < MAXPLAYERS; c++ )
@@ -1208,7 +1296,35 @@ int customPortalLookForMapWithName(char* mapToSearch, bool isSecretLevel, int le
 		}
 		else
 		{
-			loadCustomNextMap = mapToSearch;
+			// S.A.M: a portal can now reach a GENERATED branch, not just a fixed map.
+			//
+			// Barony's generator is "load <set>.lmp as an open arena, then stamp the prefab
+			// rooms <set>00.lmp, <set>01.lmp ... into it", so a mod can ship a whole
+			// procedural branch as data. The catch is that a generated set ALSO has a
+			// <set>.lmp, so the probe above finds it and we would load the bare arena as a
+			// static map -- an empty room, which looks like the feature is broken.
+			//
+			// The presence of <set>00.lmp is what distinguishes the two: a static map never
+			// has one, and generateDungeon requires it. Tag the name so physfsLoadMapFile
+			// emits "gen:" instead of "map:". The tag rides the existing level-change packet,
+			// and clients regenerate from the shared mapseed exactly as they do for vanilla
+			// generated floors.
+			std::string samRoom0 = "maps/";
+			samRoom0.append(mapToSearch);
+			const size_t samLmp = samRoom0.rfind(".lmp");
+			if ( samLmp != std::string::npos ) { samRoom0.erase(samLmp); }
+			samRoom0.append("00.lmp");
+			if ( PHYSFS_getRealDir(samRoom0.c_str()) )
+			{
+				std::string samSet = mapToSearch;
+				const size_t samCut = samSet.rfind(".lmp");
+				if ( samCut != std::string::npos ) { samSet.erase(samCut); }
+				loadCustomNextMap = "gen:" + samSet;
+			}
+			else
+			{
+				loadCustomNextMap = mapToSearch;
+			}
 			return -999;
 		}
 	}

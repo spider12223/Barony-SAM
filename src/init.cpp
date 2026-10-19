@@ -10,6 +10,9 @@
 -------------------------------------------------------------------------------*/
 
 #include "main.hpp"
+#ifndef EDITOR
+#include "sam_models.hpp" // keep model paths so a mod can name one without an index
+#endif
 
 #include <memory>
 #include <ctime>
@@ -39,6 +42,7 @@
 #include "player.hpp"
 #endif
 #include "items.hpp"
+#include "sam_logger.hpp" // S.A.M Framework logger
 #include "cppfuncs.hpp"
 #include "ui/Text.hpp"
 #include "ui/Font.hpp"
@@ -223,6 +227,11 @@ int initApp(char const * const title, int fullscreen)
     if (!mountBaseDataFolders()) {
         return 13;
     }
+
+	// S.A.M Framework — bring the logger up as early as possible, right after the
+	// base data folders are mounted (outputdir is now the PhysFS write dir, so
+	// sam_log.txt is writable). SAM_DEBUG env var enables verbose DEBUG output.
+	SAMLogger::init(outputdir, getenv("SAM_DEBUG") != nullptr);
 
 	// load default language file (english)
 	Language::languageCode = "en";
@@ -762,6 +771,16 @@ int initApp(char const * const title, int fullscreen)
 				filename = filename.substr(strlen("models/"));
 			}
 			modelFileNames[c] = filename;
+#endif
+#ifndef EDITOR
+			// S.A.M: the game build read this name, loaded the voxel, and dropped the name
+			// on the floor -- it was only kept under EDITOR, for the block above. Keeping
+			// it lets a mod write "gharbad_head.vox" where it would otherwise have to
+			// write 1025, which is unreadable and one subtraction from being wrong.
+			//
+			// Game-only: the editor links init.cpp but not sam_models.cpp, and it has
+			// modelFileNames for this already.
+			SAMModels::noteVanillaModelPath(c, name);
 #endif
 		}
 		updateLoadingScreen(30);

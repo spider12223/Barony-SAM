@@ -13,6 +13,7 @@
 
 #ifdef USE_FMOD
 #include <fmod.hpp>
+#include <cstdlib> // strtoull, for the S.A.M trait cache
 #endif
 #include <cassert>
 #include "items.hpp"
@@ -310,6 +311,23 @@ enum KilledBy {
 	DEATH_KNOCKBACK
 };
 
+// S.A.M monster traits: one bit per "closed list" question the engine asks about a monster.
+// A mod sets these on its custom monster; every vanilla monster leaves them all zero.
+namespace SAMMonsterTrait
+{
+	static const Uint64 BOSS            = 1ULL << 0;  // isBossMonster: boss music, bars, drops
+	static const Uint64 TRADER          = 1ULL << 1;  // monsterCanTradeWith: a shopkeeper
+	static const Uint64 UNTARGETABLE    = 1ULL << 2;  // monsterIsTargetable: scenery/prop
+	static const Uint64 IMMOBILE_TURRET = 1ULL << 3;  // monsterIsImmobileTurret
+	static const Uint64 NEVER_RETREAT   = 1ULL << 4;  // shouldRetreat: fights to the death
+	static const Uint64 WATER_WALKING   = 1ULL << 5;  // isWaterWalking: crosses water/lava
+	static const Uint64 UNDEAD          = 1ULL << 6;  // isSmiteWeakMonster: holy damage
+	static const Uint64 ALLY_RECOLOUR   = 1ULL << 7;  // monsterChangesColorWhenAlly
+	static const Uint64 TINKER_CONSTRUCT = 1ULL << 8; // monsterIsTinkeringCreation: a robot
+	static const Uint64 NO_DIGESTION    = 1ULL << 9;  // entityCanVomit: no gut, never pukes
+	static const Uint64 PASS_THROUGH    = 1ULL << 10; // collision: walk through it, still hittable
+}
+
 class Stat
 {
 	Sint32 PROFICIENCIES[NUMPROFICIENCIES];
@@ -454,6 +472,20 @@ public:
 #endif
 	int monster_idlevar;
 	std::map<std::string, std::string> attributes;
+
+	// S.A.M: mod-declared monster traits, as a bitmask. Barony answers questions like "is
+	// this a boss?" or "can I trade with this?" from hardcoded lists of vanilla Monster
+	// types, and a custom monster is a VARIANT of a vanilla type -- so it shares that type
+	// and has no id of its own to key a trait on. This is that key.
+	//
+	// The SOURCE OF TRUTH is attributes["samtr"], a short hex string, because the attributes
+	// map already round-trips through saves for followers and is already carried by
+	// copyStats. This field is only a decoded CACHE of it, so the predicates (one of which
+	// runs per frame) do not pay a std::string construction plus a tree walk per call.
+	// Rebuild it with samRefreshTraits() anywhere attributes is assigned.
+	//
+	// Zero for every vanilla monster, so a modless game never leaves the vanilla path.
+	Uint64 samTraits = 0;
 	struct Lootbag_t
 	{
 		int spawn_x = 0;
@@ -541,6 +573,26 @@ public:
 	MonsterRangedAccuracy monsterRangedAccuracy;
 	std::map<ItemType, Uint32> itemLastDegradeTick;
 };
+
+// S.A.M: does this monster carry `trait`? Short-circuits on the zero cache, so a vanilla
+// monster costs one compare and never touches the attributes map.
+inline bool samMonsterHasTrait(const Stat* myStats, Uint64 trait)
+{
+	return myStats && myStats->samTraits != 0 && (myStats->samTraits & trait) != 0;
+}
+
+// Re-derive the samTraits cache from attributes["samtr"]. Call anywhere `attributes` is
+// assigned or restored (copyStats, the follower save-load, the variant stamp). The value is
+// a short hex string on purpose: the save round-trip truncates attribute keys AND values to
+// 31 characters, so a comma-separated list of trait names would silently corrupt.
+inline void samRefreshTraits(Stat* myStats)
+{
+	if ( !myStats ) { return; }
+	myStats->samTraits = 0;
+	auto it = myStats->attributes.find("samtr");
+	if ( it == myStats->attributes.end() ) { return; }
+	myStats->samTraits = (Uint64)strtoull(it->second.c_str(), nullptr, 16);
+}
 extern Stat* stats[MAXPLAYERS];
 
 inline bool skillCapstoneUnlocked(int player, int proficiency)

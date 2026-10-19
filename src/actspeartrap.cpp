@@ -18,6 +18,8 @@
 #include "collision.hpp"
 #include "player.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp"
 
 /*-------------------------------------------------------------------------------
 
@@ -141,6 +143,29 @@ void actSpearTrap(Entity* my)
 			}
 			else if ( SPEARTRAP_OUTTIME == 1 )
 			{
+				if ( multiplayer != CLIENT )
+				{
+					const long long samDamage = gameModeManager.currentSession.challengeRun.isActive(GameModeManager_t::CurrentSession_t::ChallengeRun_t::CHEVENT_STRONG_TRAPS) ? 75 : 50;
+
+					SAMLua::Event ev;
+					ev.setName("world.on_trap_triggered");
+					ev.s("trap_type", std::string("spike"));
+					ev.i("player", (long long)(-1));
+					ev.i("floor_x", (long long)(my->x / 16));
+					ev.i("floor_y", (long long)(my->y / 16));
+					ev.i("damage", (long long)samDamage);
+					SAMLua::dispatchEvent(ev);
+
+					SAMJs::Event jsev;
+					jsev.setName("world.on_trap_triggered");
+					jsev.s("trap_type", std::string("spike"));
+					jsev.i("player", (long long)(-1));
+					jsev.i("floor_x", (long long)(my->x / 16));
+					jsev.i("floor_y", (long long)(my->y / 16));
+					jsev.i("damage", (long long)samDamage);
+					SAMJs::dispatchEvent(jsev);
+				}
+
 				node_t* node;
 				for ( node = map.creatures->first; node != nullptr; node = node->next ) //Searching explicitly for players and monsters, so search only creature list, not map.entities.
 				{

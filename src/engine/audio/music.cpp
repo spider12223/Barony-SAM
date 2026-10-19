@@ -16,6 +16,7 @@
 #include "../../player.hpp"
 #include "../../prng.hpp"
 #include "../../files.hpp"
+#include "sam_music.hpp"   // S.A.M: mod music -- replacements, floor tracks, forced tracks
 #ifdef NINTENDO
  #include "../../nintendo/music.hpp"
 #else
@@ -117,6 +118,10 @@ void playMusic(FMOD::Sound* sound, bool loop, bool crossfade, bool resume)
 		printlog("Can't play music.\n");
 		return;
 	}
+	// S.A.M: a mod's replacement for this vanilla track. Every track the game plays comes through
+	// here -- level, boss, shop, menu, game over -- so one substitution covers them all and the
+	// game's own choice of WHICH track is untouched. One bool test with no mod music.
+	if ( sound && SAMMusic::active() ) { sound = SAMMusic::substitute(sound); }
 	if ( resume && music_channel2 )
 	{
 		FMOD::Sound* lastmusic = nullptr;
@@ -246,6 +251,25 @@ void handleLevelMusic()
 	bool playing = true;
 	music_channel->isPlaying(&playing);
 
+	// S.A.M: a forced track -- a script's (sam_play_music) or a declared monster's theme -- takes
+	// the music the way Herx and the devil already do. When it lets go, every "already playing"
+	// flag is dropped so the chain below picks the right track this frame and crossfades to it.
+	if ( SAMMusic::active() )
+	{
+		bool samReleased = false;
+		if ( SAMMusic::handleForced(playing, &samReleased) ) { return; }
+		if ( samReleased )
+		{
+			levelmusicplaying = false;
+			devilmusicplaying = false;
+			herxmusicplaying = false;
+			minotaurmusicplaying = false;
+			combatmusicplaying = false;
+			shopmusicplaying = false;
+			sanctummusicplaying = false;
+		}
+	}
+
 	if ( currenttrack == -1 )
 	{
 		currenttrack = local_rng.rand();
@@ -255,7 +279,14 @@ void handleLevelMusic()
 		&& !inshop 
 		&& (!activeminotaur || !strcmp(map.name, "Hell Boss")) && !herxaround && !devilaround && !magisteraround )
 	{
-		if ( !strncmp(map.name, "The Mines", 9) )     // the mines
+		// S.A.M: a mod's track for this floor or this map, ahead of the game's own by-name choice.
+		FMOD::Sound* samLevel = nullptr;
+		bool samLoop = true;
+		if ( SAMMusic::active() && SAMMusic::levelTrack(currentlevel, map.name, &samLevel, &samLoop) )
+		{
+			playMusic(samLevel, samLoop, true, true);
+		}
+		else if ( !strncmp(map.name, "The Mines", 9) )     // the mines
 		{
 			if ( !playing )
 			{
@@ -532,7 +563,13 @@ void handleLevelMusic()
 		&& strcmp(map.name, "Hell Boss")
 		&& strcmp(map.name, "Sanctum") )
 	{
-		if ( !strncmp(map.name, "The Swamp", 9) || !strncmp(map.name, "The Temple", 10) )   // the swamp
+		// S.A.M: a mod's fight track for this floor or map.
+		FMOD::Sound* samFight = nullptr;
+		if ( SAMMusic::active() && SAMMusic::combatTrack(currentlevel, map.name, &samFight) )
+		{
+			playMusic(samFight, true, true, true);
+		}
+		else if ( !strncmp(map.name, "The Swamp", 9) || !strncmp(map.name, "The Temple", 10) )   // the swamp
 		{
 			playMusic(swampmusic[0], true, true, true);
 		}

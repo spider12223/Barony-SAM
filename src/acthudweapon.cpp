@@ -13,6 +13,9 @@
 #include "game.hpp"
 #include "stat.hpp"
 #include "items.hpp"
+#include "sam_classes.hpp" // S.A.M whole-body classes (jet): suppress the first-person arm/weapon
+#include "sam_items.hpp"   // "worn_like": a mod's gloves show as a vanilla pair in first person
+#include "sam_races.hpp"   // S.A.M custom races: the first-person arm you see of yourself
 #include "engine/audio/sound.hpp"
 #include "magic/magic.hpp"
 #include "interface/interface.hpp"
@@ -159,6 +162,14 @@ void actHudArm(Entity* my)
 	}
 	HUD_LASTSHAPESHIFT_FORM = playerRace;
 
+	// S.A.M whole-body class (e.g. a jet): the player IS a vehicle, so there is no
+	// first-person humanoid arm — hide it entirely.
+	if ( !intro && SAMClasses::bodyModelFor(client_classes[HUDARM_PLAYERNUM]) >= 0 )
+	{
+		my->flags[INVISIBLE] = true;
+		my->flags[INVISIBLE_DITHER] = false;
+	}
+
 	bool noGloves = false;
 	bool hideWeapon = false;
 	if (stats[HUDARM_PLAYERNUM]->gloves == nullptr
@@ -172,59 +183,62 @@ void actHudArm(Entity* my)
 	}
 	else
 	{
-		if ( stats[HUDARM_PLAYERNUM]->gloves->type == GLOVES || stats[HUDARM_PLAYERNUM]->gloves->type == GLOVES_DEXTERITY )
+		// S.A.M: a mod's gloves show as the vanilla pair setGloveSprite draws them as. A custom
+		// type matched nothing here and left the arm on its previous model.
+		const int samGloveType = SAMItems::wornTypeFor(stats[HUDARM_PLAYERNUM]->gloves->type);
+		if ( samGloveType == GLOVES || samGloveType == GLOVES_DEXTERITY )
 		{
 			my->sprite = 637;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == BRACERS || stats[HUDARM_PLAYERNUM]->gloves->type == BRACERS_CONSTITUTION )
+		else if ( samGloveType == BRACERS || samGloveType == BRACERS_CONSTITUTION )
 		{
 			my->sprite = 638;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == GAUNTLETS || stats[HUDARM_PLAYERNUM]->gloves->type == GAUNTLETS_STRENGTH )
+		else if ( samGloveType == GAUNTLETS || samGloveType == GAUNTLETS_STRENGTH )
 		{
 			my->sprite = 639;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == BRASS_KNUCKLES )
+		else if ( samGloveType == BRASS_KNUCKLES )
 		{
 			my->sprite = 640;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == IRON_KNUCKLES )
+		else if ( samGloveType == IRON_KNUCKLES )
 		{
 			my->sprite = 641;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == SPIKED_GAUNTLETS )
+		else if ( samGloveType == SPIKED_GAUNTLETS )
 		{
 			my->sprite = 642;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == CRYSTAL_GLOVES )
+		else if ( samGloveType == CRYSTAL_GLOVES )
 		{
 			my->sprite = 591;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == ARTIFACT_GLOVES )
+		else if ( samGloveType == ARTIFACT_GLOVES )
 		{
 			my->sprite = 590;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == SUEDE_GLOVES )
+		else if ( samGloveType == SUEDE_GLOVES )
 		{
 			my->sprite = 802;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == BONE_BRACERS )
+		else if ( samGloveType == BONE_BRACERS )
 		{
 			my->sprite = 2107;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == BLACKIRON_GAUNTLETS )
+		else if ( samGloveType == BLACKIRON_GAUNTLETS )
 		{
 			my->sprite = 2109;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == SILVER_GAUNTLETS )
+		else if ( samGloveType == SILVER_GAUNTLETS )
 		{
 			my->sprite = 2111;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == QUILTED_GLOVES )
+		else if ( samGloveType == QUILTED_GLOVES )
 		{
 			my->sprite = 2113;
 		}
-		else if ( stats[HUDARM_PLAYERNUM]->gloves->type == CHAIN_GLOVES )
+		else if ( samGloveType == CHAIN_GLOVES )
 		{
 			my->sprite = 2115;
 		}
@@ -325,6 +339,19 @@ void actHudArm(Entity* my)
 			default:
 				my->sprite = 634;
 				break;
+		}
+
+		// S.A.M: a custom race's own first-person arm. Everyone else already sees this race's
+		// arms; without this the player themselves sees the HOST body's, which is the first
+		// thing they notice and the last thing anyone thinks to check. Guarded on the drawn
+		// body still matching the race's host, so a polymorphed player keeps the shape they
+		// were turned into. Local-only and never networked: this entity is created for a
+		// local player and carries NOUPDATE.
+		if ( stats[HUDARM_PLAYERNUM]->playerRace >= SAM_RACE_ID_BASE
+			&& (int)playerRace == SAMRaces::hostMonsterForRace(stats[HUDARM_PLAYERNUM]->playerRace) )
+		{
+			const int samFpArm = SAMRaces::fpArmModelFor(stats[HUDARM_PLAYERNUM]->playerRace);
+			if ( samFpArm >= 0 ) { my->sprite = samFpArm; }
 		}
 
 		if ( stats[HUDARM_PLAYERNUM]->weapon == nullptr || hideWeapon )
@@ -590,6 +617,9 @@ void actHudWeapon(Entity* my)
 	{
 		hideWeapon = true;
 	}
+
+	// S.A.M whole-body class (jet): no first-person weapon model either.
+	if ( !intro && SAMClasses::bodyModelFor(client_classes[HUDWEAPON_PLAYERNUM]) >= 0 ) { hideWeapon = true; }
 
 	HUDWEAPON_HIDEWEAPON = hideWeapon;
 	HUDWEAPON_SHOOTING_RANGED_WEAPON = RANGED_ANIM_IDLE;

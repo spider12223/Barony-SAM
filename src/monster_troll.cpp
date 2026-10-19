@@ -21,6 +21,7 @@
 #include "player.hpp"
 #include "prng.hpp"
 #include "scores.hpp"
+#include "sam_loot.hpp"   // S.A.M: the weighted category draw for a troll's hoard
 
 void initTroll(Entity* my, Stat* myStats)
 {
@@ -129,8 +130,11 @@ void initTroll(Entity* my, Stat* myStats)
 						int i = 1 + rng.rand() % 3;
 						for ( c = 0; c < i; c++ )
 						{
-							Category cat = static_cast<Category>(rng.rand() % (Category::CATEGORY_MAX - 2));
-							newItem(static_cast<ItemType>(itemLevelCurve(cat, 0, currentlevel + 10, rng)), static_cast<Status>(1 + rng.rand() % 4), -1 + rng.rand() % 3, 1, rng.rand(), false, &myStats->inventory);
+							Category cat = static_cast<Category>(SAMLoot::pickCategory(rng, SAMLoot::PickPlain));   // S.A.M: the vanilla draw, or one weighted by sam_set_loot_category_weight
+							Item* samHoard = newItem(static_cast<ItemType>(itemLevelCurve(cat, 0, currentlevel + 10, rng)), static_cast<Status>(1 + rng.rand() % 4), -1 + rng.rand() % 3, 1, rng.rand(), false, &myStats->inventory);
+							// S.A.M: world.on_loot_rolled once the item exists (vanilla runs no
+							// itemLevelCurvePostProcess here, and adding one would re-roll a spellbook).
+							if ( samHoard ) { SAMLoot::afterRoll(nullptr, samHoard, (int)samHoard->type, false); }
 						}
 					}
 					break;

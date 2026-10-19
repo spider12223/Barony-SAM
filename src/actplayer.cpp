@@ -27,6 +27,15 @@
 #include "colors.hpp"
 #include "draw.hpp"
 #include "mod_tools.hpp"
+#include "sam_classes.hpp"    // per-class appearance (forced head) + isPlayerHeadSprite widening
+#include "sam_lua_runtime.hpp"
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
+#include "sam_effects.hpp"
+#include "sam_rules.hpp"      // S.A.M custom status effects — move-speed multiplier
+#include "sam_races.hpp"        // S.A.M custom races — host body + custom limb models
+#include "sam_items.hpp"        // "worn_like": a mod mask with its own model sits like a vanilla one
+#include "sam_js_runtime.hpp"
+#include "sam_mp_input.hpp"   // appraisals reported to the host; ghost respawn and party-wipe events
 #include "classdescriptions.hpp"
 #include "ui/MainMenu.hpp"
 #include "interface/consolecommand.hpp"
@@ -1655,6 +1664,9 @@ Entity* Player::Ghost_t::respawn()
 		players[player.playernum]->entity = entity;
 		stats[player.playernum]->HP = stats[player.playernum]->MAXHP / 2;
 		player.ghost.reset();
+		// S.A.M: a ghost coming back to life is a revive -- the multiplayer-only one -- and it
+		// fired nothing. The host's own players respawn here; a joiner's arrives as REZZ.
+		SAMMpInput::firePlayerRevived(player.playernum, "ghost_respawn");
 		return entity;
 	}
 
@@ -2239,6 +2251,23 @@ void actDeathGhost(Entity* my)
 
 	players[playernum]->ghost.my = my;
 	players[playernum]->ghost.uid = my->getUID();
+
+	// S.A.M: fired once, when this ghost first initialises. GHOSTCAM_INIT is skill[0] and
+	// skill[0] is NOT on the wire, so this single point covers all four ways a ghost comes
+	// into being (host spawnGhost, the server's 'GHOS' handler, client replication, and
+	// Project Spirit) without firing twice for any of them. Host-only, like every other
+	// script hook. NOT cancellable: refusing a ghost would strand a dead player with no
+	// body and no camera.
+	if ( !GHOSTCAM_INIT && multiplayer != CLIENT )
+	{
+		SamEvent samGhostEv("player.on_became_ghost");
+		samGhostEv.i("player", (long long)playernum)
+			.i("uid", (long long)my->getUID())
+			.i("x", (long long)(my->x / 16))
+			.i("y", (long long)(my->y / 16))
+			.i("spirit", players[playernum]->ghost.isSpiritGhost() ? 1 : 0);
+		samGhostEv.fire();
+	}
 
 	if ( !GHOSTCAM_INIT )
 	{
@@ -4287,7 +4316,10 @@ int Player::PlayerMovement_t::getCharacterEquippedWeight()
 		Item* item = (Item*)node->element;
 		if ( item != NULL && player.paperDoll.isItemOnDoll(*item) )
 		{
-			if ( item->type >= 0 && item->type < NUMITEMS )
+			// S.A.M: NUM_ITEM_SLOTS, not NUMITEMS -- a custom item was skipped entirely by
+			// the carry-weight loop, so custom gear was weightless no matter what it declared.
+			// getWeight() bounds-checks for itself, so this is purely the outer guard.
+			if ( item->type >= 0 && item->type < NUM_ITEM_SLOTS )
 			{
 				weight += item->getWeight();
 			}
@@ -4304,7 +4336,10 @@ int Player::PlayerMovement_t::getCharacterWeight()
 		Item* item = (Item*)node->element;
 		if ( item != NULL )
 		{
-			if ( item->type >= 0 && item->type < NUMITEMS )
+			// S.A.M: NUM_ITEM_SLOTS, not NUMITEMS -- a custom item was skipped entirely by
+			// the carry-weight loop, so custom gear was weightless no matter what it declared.
+			// getWeight() bounds-checks for itself, so this is purely the outer guard.
+			if ( item->type >= 0 && item->type < NUM_ITEM_SLOTS )
 			{
 				weight += item->getWeight();
 			}
@@ -4584,6 +4619,7 @@ void Player::PlayerMovement_t::handlePlayerMovement(bool useRefreshRateDelta)
 		{75,  1}
 	};
 	real_t speedFactorMult = 1.0;
+	real_t samRulesSpeedRatio = 1.0;   // S.A.M: how far a SPEED modifier scaled this frame's speed
 	auto find = dragToSpeedFactor.find(static_cast<int>(100 * movementDrag));
 	if ( find != dragToSpeedFactor.end() )
 	{
@@ -4771,6 +4807,27 @@ void Player::PlayerMovement_t::handlePlayerMovement(bool useRefreshRateDelta)
 		}
 
 		speedFactor *= speedFactorMult;
+		// S.A.M: a script-set per-player multiplier (sam_set_move_speed).
+		//
+		// Applied HERE, not inside getSpeedFactor(): the UI calls that function from ~15
+		// sites in ui/GameUI.cpp to render the speed/weight tooltips, so a multiplier
+		// there would quietly rewrite the numbers on the player's own stat sheet too.
+		// By this point every stat, effect, weight, drag and terrain term is folded in
+		// and speedFactor's only remaining consumers are the four velocity lines below,
+		// so this scales movement and nothing else.
+		speedFactor *= SAMLua::getMoveSpeedMult(PLAYER_NUM);
+		// S.A.M custom status effects: multiply by any active effect's move_speed_mult (dead
+		// when no mod registers an effect). Applied here, not in getSpeedFactor(), for the same
+		// reason as the script multiplier above — it scales movement only, not the UI numbers.
+		if ( SAMEffects::any() && stats[PLAYER_NUM] ) { speedFactor *= SAMEffects::speedMult(stats[PLAYER_NUM]); }
+		// S.A.M: general move-speed modifiers, beside the custom-effect one and for the same
+		// reason -- movement only, never the UI numbers.
+		if ( SAMRules::anyStatMod() && stats[PLAYER_NUM] )
+		{
+			const real_t samBefore = speedFactor;
+			speedFactor = SAMRules::apply(stats[PLAYER_NUM], my, SAMRules::SAM_ST_SPEED, speedFactor);
+			if ( samBefore > 0.0 ) { samRulesSpeedRatio = speedFactor / samBefore; }
+		}
 		speedFactor *= refreshRateDelta;
 
 		real_t defendPenalty = (stats[PLAYER_NUM]->defending || stats[PLAYER_NUM]->sneaking == 1) ? 1.0 : 0.0;
@@ -4804,7 +4861,19 @@ void Player::PlayerMovement_t::handlePlayerMovement(bool useRefreshRateDelta)
 	PLAYER_VELX *= pow(movementDrag, refreshRateDelta);
 	PLAYER_VELY *= pow(movementDrag, refreshRateDelta);
 	real_t magnitude = sqrt(pow(PLAYER_VELX, 2) + pow(PLAYER_VELY, 2));
-	const real_t magnitudeMax = 5.0;
+	// Vanilla caps a player's per-frame velocity magnitude at 5.0 so you can't move far
+	// enough in one frame to skip collision and clip through a wall. S.A.M: a script-boosted
+	// player (sam_set/add_move_speed > 1) may exceed that so a high multiplier actually
+	// translates to speed, but only up to a tunnel-safe 7.0 — still well under the 16-unit
+	// wall thickness clipMove tests against. Normal play, dash and knockback keep the 5.0 cap.
+	real_t magnitudeMax = 5.0;
+	// A SPEED stat modifier (sam_add_stat_modifier) earns the same headroom, so a mod's x2 is
+	// not quietly capped back to vanilla's ceiling. Same tunnel-safe 7.0 limit either way.
+	const real_t samHeadroom = std::max((real_t)SAMLua::getMoveSpeedMult(PLAYER_NUM), samRulesSpeedRatio);
+	if ( samHeadroom > 1.0 )
+	{
+		magnitudeMax = std::min(5.0 * samHeadroom, 7.0);
+	}
 	if ( magnitude > magnitudeMax )
 	{
 		PLAYER_VELX *= (magnitudeMax / magnitude);
@@ -8479,6 +8548,13 @@ void actPlayer(Entity* my)
 				tempItem->identified = true;
 				tempItem->notifyIcon = true;
 				messagePlayer(PLAYER_NUM, MESSAGE_INVENTORY, Language::get(570), tempItem->description());
+				// S.A.M: player.on_item_identified. Appraisal runs on the appraiser's own machine, and
+				// this used to fire only where multiplayer != CLIENT -- so a joiner's appraisals fired on
+				// no machine at all. SAMMpInput fires it on the host, reported by the joiner's game.
+				if ( tempItem )
+				{
+					SAMMpInput::reportItemIdentified(PLAYER_NUM, tempItem);
+				}
 				players[PLAYER_NUM]->inventoryUI.appraisal.appraisalProgressionItems.erase(players[PLAYER_NUM]->inventoryUI.appraisal.current_item);
 				players[PLAYER_NUM]->inventoryUI.appraisal.current_item = 0;
 				players[PLAYER_NUM]->inventoryUI.appraisal.timer = 0;
@@ -8594,6 +8670,11 @@ void actPlayer(Entity* my)
 						tempItem->identified = true;
 						tempItem->notifyIcon = true;
 						messagePlayer(PLAYER_NUM, MESSAGE_INVENTORY, Language::get(570), tempItem->description());
+						// S.A.M: player.on_item_identified, on the host for every player (see above).
+						if ( tempItem )
+						{
+							SAMMpInput::reportItemIdentified(PLAYER_NUM, tempItem);
+						}
 						if ( tempItem->type == GEM_GLASS )
 						{
 							steamStatisticUpdate(STEAM_STAT_RHINESTONE_COWBOY, STEAM_STAT_INT, 1);
@@ -8880,51 +8961,161 @@ void actPlayer(Entity* my)
 	if ( stats[PLAYER_NUM]->helmet != NULL )
 		if ( stats[PLAYER_NUM]->helmet->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->helmet->type);
+					samEv.s("slot", std::string("helmet"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->helmet = NULL;
 		}
 	if ( stats[PLAYER_NUM]->breastplate != NULL )
 		if ( stats[PLAYER_NUM]->breastplate->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->breastplate->type);
+					samEv.s("slot", std::string("breastplate"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->breastplate = NULL;
 		}
 	if ( stats[PLAYER_NUM]->gloves != NULL )
 		if ( stats[PLAYER_NUM]->gloves->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->gloves->type);
+					samEv.s("slot", std::string("gloves"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->gloves = NULL;
 		}
 	if ( stats[PLAYER_NUM]->shoes != NULL )
 		if ( stats[PLAYER_NUM]->shoes->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->shoes->type);
+					samEv.s("slot", std::string("boots"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->shoes = NULL;
 		}
 	if ( stats[PLAYER_NUM]->shield != NULL )
 		if ( stats[PLAYER_NUM]->shield->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->shield->type);
+					samEv.s("slot", std::string("shield"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->shield = NULL;
 		}
 	if ( stats[PLAYER_NUM]->weapon != NULL )
 		if ( stats[PLAYER_NUM]->weapon->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->weapon->type);
+					samEv.s("slot", std::string("weapon"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->weapon = NULL;
 		}
 	if ( stats[PLAYER_NUM]->cloak != NULL )
 		if ( stats[PLAYER_NUM]->cloak->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->cloak->type);
+					samEv.s("slot", std::string("cloak"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->cloak = NULL;
 		}
 	if ( stats[PLAYER_NUM]->amulet != NULL )
 		if ( stats[PLAYER_NUM]->amulet->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->amulet->type);
+					samEv.s("slot", std::string("amulet"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->amulet = NULL;
 		}
 	if ( stats[PLAYER_NUM]->ring != NULL )
 		if ( stats[PLAYER_NUM]->ring->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->ring->type);
+					samEv.s("slot", std::string("ring"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->ring = NULL;
 		}
 	if ( stats[PLAYER_NUM]->mask != NULL )
 		if ( stats[PLAYER_NUM]->mask->status == BROKEN )
 		{
+			if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_item_broken");
+					samEv.i("player", (long long)PLAYER_NUM);
+					samEv.i("item_type", (long long)stats[PLAYER_NUM]->mask->type);
+					samEv.s("slot", std::string("mask"));
+					samEv.fire();
+				}
+			}
 			stats[PLAYER_NUM]->mask = NULL;
 		}
 
@@ -10458,6 +10649,20 @@ void actPlayer(Entity* my)
 	{
 		equipmentBonus += 2;
 	}
+	// S.A.M (v3.2.0): a custom race's "vision" / "sneak_vision" and the VISION / SNEAK_VISION
+	// stat modifiers. range_bonus is Perception's light bonus and reaches every light below;
+	// equipmentBonus is the sneaking bonus the Gremlin's +2 lives in. samSneakExtra is S.A.M's
+	// sneaking part, which never depends on the engine's (see SAMRules::sneakVisionRange): added to
+	// equipmentBonus here, and on its own in the four bodies whose sneaking light never reads
+	// equipmentBonus. Gated: with no race mod and no modifier both keep the vanilla numbers and
+	// samSneakExtra is 0.
+	int samSneakExtra = 0;
+	if ( SAMRules::anyVision() )
+	{
+		range_bonus = SAMRules::visionRange(stats[PLAYER_NUM], my, range_bonus);
+		samSneakExtra = SAMRules::sneakVisionRange(stats[PLAYER_NUM], my, 0);
+		equipmentBonus += samSneakExtra;
+	}
 	const int fociCastRange = -2;
 	if (!intro && *cvar_playerLight) {
         if (!players[PLAYER_NUM]->isLocalPlayer() && multiplayer == CLIENT) {
@@ -10626,6 +10831,7 @@ void actPlayer(Entity* my)
 					if ( stats[PLAYER_NUM]->sneaking )
 					{
 						light_type = "player_ambient_rat_sneaking";
+						range_bonus += samSneakExtra;   // S.A.M: this light never reads equipmentBonus
 					}
 					else
 					{
@@ -10636,6 +10842,7 @@ void actPlayer(Entity* my)
 					if ( stats[PLAYER_NUM]->sneaking )
 					{
 						light_type = "player_ambient_spider_sneaking";
+						range_bonus += samSneakExtra;   // S.A.M: this light never reads equipmentBonus
 					}
 					else
 					{
@@ -10646,6 +10853,7 @@ void actPlayer(Entity* my)
 					if ( stats[PLAYER_NUM]->sneaking )
 					{
 						light_type = "player_ambient_troll_sneaking";
+						range_bonus += samSneakExtra;   // S.A.M: this light never reads equipmentBonus
 					}
 					else
 					{
@@ -10656,6 +10864,7 @@ void actPlayer(Entity* my)
 					if ( stats[PLAYER_NUM]->sneaking )
 					{
 						light_type = "player_ambient_imp_sneaking";
+						range_bonus += samSneakExtra;   // S.A.M: this light never reads equipmentBonus
 					}
 					else
 					{
@@ -10744,12 +10953,74 @@ void actPlayer(Entity* my)
 		}
 	}
 
+	// S.A.M: a REMOTE player's custom-race head, on a client.
+	//
+	// The block below is gated on isLocalPlayer() || SERVER, so on a client nothing ever
+	// computes the head of another player -- it arrives as a raw sprite index over ENTU
+	// (net.cpp) and that index came out of the HOST's appended model table, which is not ours.
+	// The client can work this out for itself with no help from the host, so it does. This
+	// costs one integer compare when no race mod is loaded: headModelFor returns -1 for any
+	// id below SAM_RACE_ID_BASE and for an empty registry (sam_races.cpp:651).
+	//
+	// Re-applied every frame rather than once, for the same reason the block below re-applies
+	// it: an incoming ENTU overwrites my->sprite, and actPlayer runs after packet handling
+	// within the frame, so this is what the renderer sees.
+	if ( multiplayer == CLIENT && !players[PLAYER_NUM]->isLocalPlayer()
+		&& stats[PLAYER_NUM]->playerRace >= SAM_RACE_ID_BASE
+		&& (int)playerRace == SAMRaces::hostMonsterForRace(stats[PLAYER_NUM]->playerRace) )
+	{
+		const int samRemoteHead = SAMRaces::headModelFor(stats[PLAYER_NUM]->playerRace);
+		if ( samRemoteHead >= 0 ) { my->sprite = samRemoteHead; }
+	}
+
 	// server controls players primarily
 	if ( players[PLAYER_NUM]->isLocalPlayer() || multiplayer == SERVER || StatueManager.activeEditing )
 	{
 		// set head model
         my->sprite = playerHeadSprite(playerRace, stats[PLAYER_NUM]->sex,
             playerAppearance, PLAYER_ATTACK ? PLAYER_ATTACKTIME : 0, PLAYER_NUM);
+
+		// S.A.M: a custom race's own head. Re-applied every frame for the same reason the
+		// class head below is -- the line above recomputes the head unconditionally, so
+		// setting it once at spawn would be stomped within a tick. Sits BEFORE the class
+		// block so a class that dresses this race still wins: the race is the default body,
+		// a class look is the deliberate exception to it.
+		// stat_appearance is deliberately NOT consulted here: "disable monster abilities"
+		// keeps the LOOK and drops the abilities, exactly as it does for a vanilla goatman.
+		if ( stats[PLAYER_NUM]->playerRace >= SAM_RACE_ID_BASE
+			&& (int)playerRace == SAMRaces::hostMonsterForRace(stats[PLAYER_NUM]->playerRace) )
+		{
+			const int samRaceHead = SAMRaces::headModelFor(stats[PLAYER_NUM]->playerRace);
+			if ( samRaceHead >= 0 ) { my->sprite = samRaceHead; }
+		}
+
+		// S.A.M: a class can force its own head. This must be re-applied every frame —
+		// the line above unconditionally recomputes the head from race/sex/appearance, so
+		// setting it once at spawn would be stomped within a tick. It sits here, right
+		// after the vanilla assignment, because this is the one limb the engine never
+		// gates behind an equipment check, which is why the head (and only the head) can
+		// be reliably forced. -1 means "this class doesn't dress this race" -> untouched.
+		// S.A.M forced look. A whole-body model (e.g. a jet) is drawn as my->sprite (with
+		// every limb hidden below) and applies EVERYWHERE — including the character-creation
+		// preview (intro), so you see the jet on the class-select screen. A forced HEAD stays
+		// in-game only (!intro), matching prior behaviour.
+		{
+			const bool samShifted = ( my->effectPolymorph != NOTHING || my->effectShapeshift != NOTHING );
+			const SAMClassDef* samDef = SAMClasses::getClass(client_classes[PLAYER_NUM]);
+			if ( samDef && (!samShifted || samDef->surviveShapeshift) )
+			{
+				const int samBody = SAMClasses::bodyModelFor(client_classes[PLAYER_NUM]);
+				if ( samBody >= 0 )
+				{
+					my->sprite = samBody;   // whole-body model — previews too
+				}
+				else if ( !intro )
+				{
+					const int samHead = SAMClasses::headSpriteFor(client_classes[PLAYER_NUM], playerRace);
+					if ( samHead >= 0 ) { my->sprite = samHead; }
+				}
+			}
+		}
 	}
 	if ( multiplayer != CLIENT )
 	{
@@ -10833,7 +11104,100 @@ void actPlayer(Entity* my)
 					}
 					if ( stats[PLAYER_NUM]->HP <= 0 )
 					{
+						// S.A.M: everything below happens once per DEATH. A mod that refuses
+						// player.on_before_revive (the permadeath rule the docs advertise) leaves
+						// this player at 0 HP, and assignActions still stands the body up on the
+						// next floor, so without this the whole procedure ran again on every floor
+						// the party descended: a second player.on_death carrying floor 3's killer
+						// and obituary, another obituary line for everyone, another nine gibs, and
+						// the backpack bagged a second time because the refusal also skipped the
+						// purge that empties it. A kill-counting or death-penalty mod saw one
+						// death per floor for a player who died once.
+						//
+						// What a player kept dead still needs on a new floor is here: their limbs
+						// are gone (above), the body is taken off the map (below), and a local
+						// player gets a camera to watch from, because the deathcam they had died
+						// with the previous map. Nothing is announced, nothing is dropped, and no
+						// event fires.
+						if ( !SAMMpInput::claimPlayerDeath(PLAYER_NUM) )
+						{
+							if ( players[PLAYER_NUM]->isLocalPlayer() && my->playerCreatedDeathCam == 0 )
+							{
+								entity = newEntity(-1, 1, map.entities, nullptr); //Deathcam entity.
+								entity->x = my->x;
+								entity->y = my->y;
+								entity->z = -2;
+								entity->flags[NOUPDATE] = true;
+								entity->flags[PASSABLE] = true;
+								entity->flags[INVISIBLE] = true;
+								entity->behavior = &actDeathCam;
+								entity->skill[2] = PLAYER_NUM;
+								// DEATHCAM_DISABLE_GAMEOVER: they answered the game-over prompt when
+								// they died. Without this a fresh camera reopens it on every floor the
+								// party descends, because the test that normally suppresses it wants a
+								// player entity that this branch has just taken away.
+								entity->skill[6] = 1;
+								entity->yaw = my->yaw;
+								entity->pitch = PI / 8;
+								players[PLAYER_NUM]->ghost.initTeleportLocations(my->x / 16, my->y / 16);
+								players[PLAYER_NUM]->closeAllGUIs(CloseGUIShootmode::CLOSEGUI_ENABLE_SHOOTMODE, CloseGUIIgnore::CLOSEGUI_CLOSE_ALL);
+								players[PLAYER_NUM]->bControlEnabled = false;
+							}
+							my->removeLightField();
+							list_RemoveNode(my->mynode);
+							return;
+						}
+
 						Compendium_t::Events_t::eventUpdateCodex(PLAYER_NUM, Compendium_t::CPDM_CLASS_WGT_SLOWEST, "wgt", players[PLAYER_NUM]->movement.getCharacterWeight());
+
+						// S.A.M scripting hook: this player died (confirmed). Host-authoritative.
+						// killer / killer_uid / killer_monster are already populated on the Stat.
+						if ( PLAYER_NUM >= 0 && multiplayer != CLIENT )
+						{
+							SAMLua::Event ev;
+							ev.setName("player.on_death").i("player", PLAYER_NUM)
+								.i("killer_type", (long long)stats[PLAYER_NUM]->killer)
+								.i("killer_uid", (long long)stats[PLAYER_NUM]->killer_uid)
+								.i("killer_monster", (long long)stats[PLAYER_NUM]->killer_monster)
+								.s("obituary", stats[PLAYER_NUM]->obituary);
+							SAMLua::dispatchEvent(ev);
+
+							SAMJs::Event jsev;
+							jsev.setName("player.on_death").i("player", PLAYER_NUM)
+								.i("killer_type", (long long)stats[PLAYER_NUM]->killer)
+								.i("killer_uid", (long long)stats[PLAYER_NUM]->killer_uid)
+								.i("killer_monster", (long long)stats[PLAYER_NUM]->killer_monster)
+								.s("obituary", stats[PLAYER_NUM]->obituary);
+							SAMJs::dispatchEvent(jsev);
+
+							// S.A.M scripting hook: fire game.on_game_end only on a full party wipe (loss).
+							// ONCE per run: this runs in every player's death procedure, so two players
+							// dying in the same tick both saw "all dead", and an automaton (whose death is
+							// delayed two seconds with its HP already at 0) let a teammate's death end the
+							// game and then ended it again itself.
+							bool samAllDead = true;
+							for ( int c = 0; c < MAXPLAYERS; ++c )
+							{
+								if ( !client_disconnected[c] && stats[c] && stats[c]->HP > 0 )
+								{
+									samAllDead = false;
+									break;
+								}
+							}
+							if ( samAllDead && SAMMpInput::claimPartyWipe() )
+							{
+								{
+									SamEvent samEv;
+									samEv.setName("game.on_game_end");
+									samEv.i("player", (long long)PLAYER_NUM);
+									samEv.i("won", (long long)0);
+									samEv.i("floor_reached", (long long)currentlevel);
+									samEv.i("kills", (long long)gameStatistics[STATISTICS_TOTAL_KILLS]);
+									samEv.i("time_played", (long long)ticks);
+									samEv.fire();
+								}
+							}
+						}
 
 						if ( stats[PLAYER_NUM]->type == MYCONID )
 						{
@@ -11404,6 +11768,9 @@ void actPlayer(Entity* my)
 			{
 				my->playerCreatedDeathCam = 0;
 				PLAYER_DEATH_AUTOMATON = 0;
+				// S.A.M: alive and connected, so the next death is a new death and gets its own
+				// announcement (see claimPlayerDeath above).
+				SAMMpInput::notePlayerAlive(PLAYER_NUM);
 			}
 		}
 	}
@@ -11965,6 +12332,29 @@ void actPlayer(Entity* my)
 	// move bodyparts
 	if ( isHumanoid )
 	{
+		// S.A.M whole-body class (e.g. a jet): this class draws a single custom model as
+		// my->sprite (set in the head block above), so every humanoid limb must be hidden.
+		// Computed once; applied at the end of each limb iteration below. Respects
+		// shapeshift/polymorph the same way the forced head does.
+		bool samBodyClass = false;
+		if ( SAMClasses::bodyModelFor(client_classes[PLAYER_NUM]) >= 0 )
+		{
+			const bool shifted = ( my->effectPolymorph != NOTHING || my->effectShapeshift != NOTHING );
+			const SAMClassDef* d = SAMClasses::getClass(client_classes[PLAYER_NUM]);
+			samBodyClass = ( !shifted || (d && d->surviveShapeshift) );
+		}
+		// S.A.M extra limbs (a tail, wings, horns). Barony creates 29 limb entities per player
+		// and only ever uses 16 -- children 16..28 are parented, position-synced every frame
+		// and then forced invisible by the gate below. This hands those thirteen slots to a
+		// race. Nothing crosses the wire: every machine runs this same code from the player's
+		// race, exactly as the SALAMANDER tail (case 11) already does.
+		const std::vector<SAMRaceDef::SAMExtraLimb>* samExtraLimbs = nullptr;
+		if ( stats[PLAYER_NUM]->playerRace >= SAM_RACE_ID_BASE
+			&& (int)playerRace == SAMRaces::hostMonsterForRace(stats[PLAYER_NUM]->playerRace) )
+		{
+			samExtraLimbs = SAMRaces::extraLimbsFor(stats[PLAYER_NUM]->playerRace);
+		}
+
 		for ( bodypart = 0, node = my->children.first; node != NULL; node = node->next, bodypart++ )
 		{
 			if ( bodypart == 0 )
@@ -12006,7 +12396,15 @@ void actPlayer(Entity* my)
 				entity->flags[INVISIBLE_DITHER] = false;
 				if ( bodypart > 15 )
 				{
-					continue;
+					// S.A.M: slots 16.. are the unused ones. Let through only the ones this
+					// race claims; every other slot keeps vanilla's behaviour of being hidden
+					// and skipped, so a player with no extra limbs pays one pointer test.
+					const size_t samSlot = (size_t)(bodypart - 16);
+					if ( !samExtraLimbs || samSlot >= samExtraLimbs->size()
+						|| (*samExtraLimbs)[samSlot].modelIdx < 0 )
+					{
+						continue;
+					}
 				}
 			}
 
@@ -12948,9 +13346,34 @@ void actPlayer(Entity* my)
 							// successfully set sprite for the human model
 						}
 					}
-					if ( (!PLAYER_ARMBENDED && showEquipment) 
+					// S.A.M: these `+= 2` steps walk from an arm model to its bent / weapon-holding
+					// variant, and they only work because vanilla authors those variants at
+					// CONSECUTIVE indices. A custom race supplies ONE appended index per limb with
+					// nothing reserved after it, so the same arithmetic lands on an unrelated model
+					// (or past the table, drawing nothing) the moment the player picks up a weapon.
+					// Skip it for a race-supplied arm; the mod's arm then stays itself in every
+					// pose, which is the best answer available until per-pose limb slots exist.
+					// Pure no-op for every vanilla race.
+					const bool samArmPose = ((!PLAYER_ARMBENDED && showEquipment)
 						|| ((PLAYER_ATTACK == MONSTER_POSE_MAGIC_WINDUP1 || PLAYER_ATTACK == MONSTER_POSE_MAGIC_WINDUP2) && showEquipment)
-						|| (insectoidLevitating && PLAYER_ATTACK == 0 && PLAYER_ATTACKTIME == 0) )
+						|| (insectoidLevitating && PLAYER_ATTACK == 0 && PLAYER_ATTACKTIME == 0));
+					// The two steps below are what "bent" means for a vanilla arm, so this is the
+					// same question asked once: is this hand holding something (or mid cast)?
+					const bool samArmIsBent = samArmPose
+						&& (stats[PLAYER_NUM]->weapon != nullptr
+							|| insectoidLevitating
+							|| ((PLAYER_ATTACK == MONSTER_POSE_MAGIC_WINDUP1 || PLAYER_ATTACK == MONSTER_POSE_MAGIC_WINDUP2) && showEquipment));
+					// S.A.M: a race that authored a bent arm ("limb_models": { "arm_right": {
+					// "model": ..., "bent": ... } }) draws THAT model here, because the += 2 walk
+					// below cannot reach it: a mod's arm is one appended index with nothing
+					// reserved after it. A race that declared only the straight arm keeps its one
+					// pose, which is what the guard on the walk is for.
+					const int samBentRightArm = SAMRaces::limbBentModelFor(stats[PLAYER_NUM]->playerRace, LIMB_HUMANOID_RIGHTARM);
+					if ( samArmIsBent && samBentRightArm >= 0 )
+					{
+						entity->sprite = samBentRightArm;
+					}
+					else if ( !SAMRaces::usesLimbOverride(stats[PLAYER_NUM]->playerRace, LIMB_HUMANOID_RIGHTARM) && samArmPose )
 					{
 						entity->sprite += 2 * (stats[PLAYER_NUM]->weapon != NULL);
 
@@ -13111,7 +13534,18 @@ void actPlayer(Entity* my)
 								bendArm = true;
 							}
 						}
-						entity->sprite += 2 * (bendArm);
+						// S.A.M: the race's own bent arm if it authored one, because the += 2 walk
+						// below cannot reach a mod's single appended index; otherwise the walk,
+						// skipped for a race arm that has no bent variant to step onto.
+						const int samBentLeftArm = SAMRaces::limbBentModelFor(stats[PLAYER_NUM]->playerRace, LIMB_HUMANOID_LEFTARM);
+						if ( bendArm && samBentLeftArm >= 0 )
+						{
+							entity->sprite = samBentLeftArm;
+						}
+						else if ( !SAMRaces::usesLimbOverride(stats[PLAYER_NUM]->playerRace, LIMB_HUMANOID_LEFTARM) )
+						{
+							entity->sprite += 2 * (bendArm);
+						}
 					}
 					if ( multiplayer == SERVER )
 					{
@@ -13884,6 +14318,9 @@ void actPlayer(Entity* my)
 					helmscalez = helmet->scalez;
 				}
 
+				// S.A.M: a mod mask (or the hat under it) with its own model is placed like the vanilla
+				// item it names in "worn_like"; see SAMItems::wornAsTwinBegin. No-op without one.
+				SAMItems::wornAsTwinBegin(entity, helmet);
 				if ( EquipmentModelOffsets.modelOffsetExists(playerRace, entity->sprite, my->sprite) )
 				{
 					my->setHelmetLimbOffset(entity);
@@ -13972,6 +14409,8 @@ void actPlayer(Entity* my)
 					entity->focaly = limbs[playerRace][10][1] - 2; // -2
 					entity->focalz = limbs[playerRace][10][2]; // .5
 				}
+
+				SAMItems::wornAsTwinEnd();
 
 				if ( ignoreHelmetOffsetFromMask && helmet )
 				{
@@ -14617,7 +15056,70 @@ void actPlayer(Entity* my)
 					//entity->pitch = legright->pitch;
 					break;
 				default:
+				{
+					// S.A.M extra limb. Reached only by bodypart >= 16: 0 continues earlier and
+					// 1..15 all have their own case. Modelled on the SALAMANDER tail (case 11),
+					// which is the engine's own shipped extra limb.
+					const size_t samSlot = (size_t)(bodypart - 16);
+					if ( !samExtraLimbs || samSlot >= samExtraLimbs->size() ) { break; }
+					const SAMRaceDef::SAMExtraLimb& lim = (*samExtraLimbs)[samSlot];
+					if ( lim.modelIdx < 0 ) { break; }
+
+					entity->sprite = lim.modelIdx;
+					// Visibility follows the player, the way the tail does -- so the limb
+					// vanishes with an invisibility potion instead of floating alone.
+					entity->flags[INVISIBLE] = my->flags[INVISIBLE];
+					entity->flags[INVISIBLE_DITHER] = my->flags[INVISIBLE_DITHER];
+					entity->scalex = (real_t)lim.scale;
+					entity->scaley = (real_t)lim.scale;
+					entity->scalez = (real_t)lim.scale;
+					entity->focalx = lim.focalX;
+					entity->focaly = lim.focalY;
+					entity->focalz = lim.focalZ;
+					entity->yaw = my->yaw + (real_t)(lim.yawOffsetDeg * PI / 180.0);
+					entity->pitch = (real_t)lim.pitch;
+					entity->roll = (real_t)lim.roll;
+
+					if ( lim.attach == "torso" && torso )
+					{
+						// The robe legs (cases 14/15) attach this way.
+						entity->x = torso->x;
+						entity->y = torso->y;
+						entity->z = torso->z;
+					}
+					else if ( lim.attach == "head" )
+					{
+						// The MASK (case 10) never touches x/y: glDrawVoxel applies focal AFTER
+						// the rotation, so focal is in the limb's own frame and follows the head
+						// without any trigonometry here.
+						entity->pitch = my->pitch + (real_t)lim.pitch;
+					}
+					// "body" and the fallthrough both keep the x/y/z already snapped to the
+					// player at the top of the loop.
+
+					// Offsets are in the player's facing, like the SALAMANDER tail's.
+					if ( lim.offFwd != 0.0 || lim.offSide != 0.0 )
+					{
+						entity->x += lim.offSide * cos(my->yaw + PI / 2) + lim.offFwd * cos(my->yaw);
+						entity->y += lim.offSide * sin(my->yaw + PI / 2) + lim.offFwd * sin(my->yaw);
+					}
+					entity->z += lim.offUp;
+
+					if ( lim.sway )
+					{
+						// The tail's ping-pong, kept per-limb in its own fskill/skill so two
+						// swaying limbs do not share a phase.
+						real_t samDist = sqrt(my->vel_x * my->vel_x + my->vel_y * my->vel_y);
+						real_t samRate = ( samDist > 0.1 ) ? (samDist * 0.1) : 0.01;
+						if ( entity->skill[0] == 0 ) { entity->fskill[0] += samRate; }
+						else                          { entity->fskill[0] -= samRate; }
+						if ( entity->fskill[0] > PI / 3 )       { entity->skill[0] = 1; }
+						else if ( entity->fskill[0] < -PI / 3 ) { entity->skill[0] = 0; }
+						entity->pitch += 0.5 * sin(entity->fskill[0]);
+						entity->roll += -0.25 * sin(entity->fskill[0]);
+					}
 					break;
+				}
 			}
 
 
@@ -14648,6 +15150,56 @@ void actPlayer(Entity* my)
 							entity->flags[INVISIBLE_DITHER] = false;
 						}
 					}
+				}
+			}
+
+			// S.A.M whole-body class (jet): only my->sprite draws — hide every limb. Last
+			// statement in the loop body, so it overrides the vanilla limb + equipment
+			// assignment above.
+			if ( samBodyClass )
+			{
+				entity->flags[INVISIBLE] = true;
+				entity->flags[INVISIBLE_DITHER] = false;
+			}
+
+			// S.A.M per-limb transform, applied LAST on purpose. setHumanoidLimbOffset and the
+			// bodypart switch above both write focal and rotation, so a transform applied any
+			// earlier is overwritten before it is ever drawn. Unguarded by multiplayer: every
+			// machine knows every player's race and derives the same numbers locally, which is
+			// what keeps this correct in co-op -- networking a scale would have capped it at
+			// the 1.99 the wire can carry. Costs one pointer test per limb for a vanilla race.
+			// The host-body compare matches every sibling S.A.M site: a polymorphed or
+			// shapeshifted player is wearing a body that is not their race's, and stretching
+			// its limbs to the race's proportions would be wrong.
+			if ( bodypart >= 1 && bodypart <= 5
+				&& stats[PLAYER_NUM]->playerRace >= SAM_RACE_ID_BASE
+				&& (int)playerRace == SAMRaces::hostMonsterForRace(stats[PLAYER_NUM]->playerRace) )
+			{
+				static const int samLimbForPart[6] = { -1, LIMB_HUMANOID_TORSO, LIMB_HUMANOID_RIGHTLEG,
+					LIMB_HUMANOID_LEFTLEG, LIMB_HUMANOID_RIGHTARM, LIMB_HUMANOID_LEFTARM };
+				const SAMRaceDef::LimbXform* samLimbXf =
+					SAMRaces::limbXformFor(stats[PLAYER_NUM]->playerRace, samLimbForPart[bodypart]);
+				// Scale is ASSIGNED every frame, including back to 1.0 when the race declares
+				// none. The first draft only wrote it when it differed from 1.0, so a scale
+				// set while the player was in one form leaked into every later form -- the
+				// limb entity is reused and nothing else resets it.
+				const real_t samSc = samLimbXf ? (real_t)samLimbXf->scale : (real_t)1.0;
+				entity->scalex = samSc;
+				entity->scaley = samSc;
+				entity->scalez = samSc;
+				if ( samLimbXf )
+				{
+					// Focal, not x/y/z: focal is applied after the rotation, so it moves the
+					// limb in its own frame and stays correct as the limb swings. Safe to add
+					// to, because the switch above ASSIGNS focal fresh every frame.
+					entity->focalx += samLimbXf->offX;
+					entity->focaly += samLimbXf->offY;
+					entity->focalz += samLimbXf->offZ;
+					// pitch and roll are NOT assigned fresh for every limb every frame -- the
+					// animation carries them forward -- so `+=` compounded the offset until the
+					// limb spun. Assign from the value the animation just left, once.
+					entity->pitch = (real_t)(entity->pitch + samLimbXf->pitch);
+					entity->roll  = (real_t)(entity->roll  + samLimbXf->roll);
 				}
 			}
 		}
@@ -15118,6 +15670,15 @@ void Entity::playerLevelEntrySpeechSecond()
 
 bool Entity::isPlayerHeadSprite(const int sprite)
 {
+	// S.A.M: a class can force a custom head, whose model index is nowhere in the
+	// hardcoded list below. Answering false for it breaks the client's player-entity
+	// binding (net.cpp uses this to decide whether an entity IS a player's head), so a
+	// custom head has to be recognised here or it is broken in multiplayer.
+	if ( SAMClasses::isCustomHeadSprite(sprite) ) { return true; }
+	// Same reasoning for a race head. Note this catches VANILLA indices too: Gharbad's
+	// head is a monster limb, not one of the player heads listed below, so pointing a
+	// race at it without this would break exactly as a custom .vox would.
+	if ( SAMRaces::isRaceHeadSprite(sprite) ) { return true; }
 	switch ( sprite )
 	{
 		case 113:
@@ -15265,6 +15826,13 @@ Monster getMonsterFromPlayerRace(int playerRace)
 			return GNOME;
 			break;
 		default:
+			// S.A.M custom races (ids 200-255) ride an existing monster body. The
+			// registry is empty in vanilla, so a non-SAM id or a race with no mod
+			// loaded returns HUMAN — identical to the old default (graceful degrade).
+			if ( playerRace >= SAM_RACE_ID_BASE )
+			{
+				return static_cast<Monster>(SAMRaces::hostMonsterForRace(playerRace));
+			}
 			return HUMAN;
 			break;
 	}
@@ -15287,6 +15855,30 @@ void Entity::setDefaultPlayerModel(int playernum, Monster playerRace, int limbTy
 	if ( players[playernum] && players[playernum]->entity && players[playernum]->entity->effectPolymorph > NUMMONSTERS )
 	{
 		playerAppearance = players[playernum]->entity->effectPolymorph - 100;
+	}
+
+	// S.A.M: a custom race can supply its own model for this limb.
+	//
+	// Placed at the top because everything below is the host body's answer, and this is a
+	// race that has a different one. Reaching this function at all already means the
+	// matching armour slot is EMPTY -- the callers check -- so a custom torso behaves like
+	// any other race's bare chest and a breastplate still covers it. That is the whole
+	// reason the override lives here rather than at the draw site.
+	//
+	// playerRace is the body being DRAWN, so requiring it to equal the race's own host
+	// body means a polymorphed or shapeshifted player keeps the shape they were turned
+	// into. Unreachable in vanilla: playerRace(id) is 0-17, never >= 200.
+	// stat_appearance is deliberately NOT consulted: "disable monster abilities" keeps the
+	// look and drops the abilities, as it does for every vanilla monster race.
+	if ( stats[playernum]->playerRace >= SAM_RACE_ID_BASE
+		&& (int)playerRace == SAMRaces::hostMonsterForRace(stats[playernum]->playerRace) )
+	{
+		const int samLimb = SAMRaces::limbModelFor(stats[playernum]->playerRace, limbType);
+		if ( samLimb >= 0 )
+		{
+			this->sprite = samLimb;
+			return;
+		}
 	}
 
 	if ( limbType == LIMB_HUMANOID_TORSO )
@@ -15813,7 +16405,15 @@ bool playerRequiresBloodToSustain(int player)
 	{
 		return true;
 	}
-	
+	// S.A.M: a custom class or custom race may declare "blood_diet": true. Both are additive
+	// `return true` arms next to the vanilla ones above, so this cannot change any vanilla
+	// answer (both accessors return false for a vanilla/unregistered id).
+	if ( SAMClasses::requiresBloodDiet(client_classes[player])
+		|| (stats[player]->stat_appearance == 0 && SAMRaces::requiresBloodDiet(stats[player]->playerRace)) )
+	{
+		return true;
+	}
+
 	return false;
 }
 

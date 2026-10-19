@@ -14,6 +14,10 @@
 #include "stat.hpp"
 #include "monster.hpp"
 #include "entity.hpp"
+#ifndef EDITOR
+#include "sam_bodies.hpp" // custom creature body models
+#include "sam_logger.hpp"
+#endif
 #include "net.hpp"
 #include "collision.hpp"
 #include "player.hpp"
@@ -1049,6 +1053,41 @@ Entity* spawnGib(Entity* parentent, int customGibSprite)
 	}
 
 	entity = newEntity(gibsprite, 1, map.entities, nullptr); //Gib entity.
+#ifndef EDITOR
+	// S.A.M: carry a custom body model onto the death "poof" gib, so a custom-bodied creature
+	// does not flicker back to its base model as it dies.
+	//
+	// Stored ON THE ENTITY, never in a uid map: a gib abandons the uid it was born with a few
+	// lines below (`entity_uids--` then `setUID(-3)`), so every gib shares uid -3 AND the uid
+	// it gave up goes straight to the next entity created. A uid-keyed tag therefore never
+	// matched the gib and was inherited by an unrelated entity. skill[57]/[58] are unused by
+	// every act* behaviour (only the map editor names slots this high), and skill[] is
+	// zero-initialised, so 0 reliably means "untagged".
+	//
+	// Both are stored +1 so that 0 stays the "none" sentinel. The sprite is recorded because
+	// the 13 vanilla *Die functions stamp `gib->sprite = my->sprite` on the body gib AFTER
+	// this returns, while the blood gibs keep sprite 5/211 -- comparing at draw time is what
+	// tells them apart, since at this moment they are identical.
+	if ( entity && parentent )
+	{
+		// A body may declare its own `death` model; this falls back to the living model when it
+		// does not, so the value is unchanged for every body that says nothing.
+		const int samParentBody = SAMBodies::deathModelForEntity(parentent);
+		if ( samParentBody >= 0 )
+		{
+			entity->skill[57] = samParentBody + 1;
+			entity->skill[58] = parentent->sprite + 1;
+			// Carry the yaw correction across too, packed into the HIGH bits of skill[57]
+			// rather than a slot of its own. skill[59] looked spare and is not: it is
+			// entityShowOnMap (entity.hpp:69), a live engine field. A model index is far
+			// below 65536 (the whole table is ~2400), so the low half is all it needs.
+			// Yaw is tenths of a degree biased by 3600, so 0 stays the "none" sentinel.
+			const double samYaw = SAMBodies::yawOffsetForEntity(parentent);
+			const int samYawPacked = ( samYaw != 0.0 ) ? ((int)(samYaw * 10.0) + 3600) : 0;
+			entity->skill[57] = ((samParentBody + 1) & 0xFFFF) | (samYawPacked << 16);
+		}
+	}
+#endif
 	if ( !entity )
 	{
 		return nullptr;

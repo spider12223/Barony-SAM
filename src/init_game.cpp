@@ -13,6 +13,11 @@
 #include "main.hpp"
 #include "draw.hpp"
 #include "files.hpp"
+// <windows.h> (via GL/glew.h in main.hpp) #defines a GetObject macro that mangles
+// rapidjson's Value::GetObject() used later in this file. Undo it for this TU.
+#ifdef GetObject
+#undef GetObject
+#endif
 #include "game.hpp"
 #include "stat.hpp"
 #include "interface/interface.hpp"
@@ -37,6 +42,9 @@
 #include "cppfuncs.hpp"
 #include "Directory.hpp"
 #include "mod_tools.hpp"
+#include "sam_items.hpp"       // S.A.M: re-inject custom item tooltips after vanilla reload
+#include "sam_workbench.hpp" // built-in Hunter's Workbench
+#include "sam_effects.hpp"     // S.A.M: re-inject custom status-effect HUD entries after reload
 #include "ui/LoadingScreen.hpp"
 #include "ui/GameUI.hpp"
 #include "ui/Text.hpp"
@@ -64,6 +72,20 @@ void initGameDatafiles(bool moddedReload)
 	ItemTooltips.readTooltipsFromFile();
 	ItemTooltips.readItemLocalizationsFromFile();
 	ItemTooltips.readBookLocalizationsFromFile();
+	// S.A.M: the reads above rewrite the built-in item range and CLEAR the tooltip map,
+	// wiping the "tooltip_sam_*" entries we injected for custom items. Re-stamp our
+	// reserved slots + re-inject their tooltips so custom items keep their ATK / weight /
+	// value rows and real hover text. No-op when no custom items are registered.
+	SAMItems::reapplyAfterDataReload();
+	// S.A.M: the framework's built-in Hunter's Workbench. Installed HERE, not from the mod
+	// loader, because the loader only runs when the player actually loads mods -- and the
+	// bench is meant to exist whenever the framework is installed, with or without any mod,
+	// so a modder can put it in a class and a player needs nothing but the framework.
+	// This is the one deliberate departure from "no mods loaded == untouched vanilla": it
+	// registers one item in the framework's reserved id band and writes its art out once.
+	// Nothing gives the item to a player on its own, and the vanilla tinkering kit keeps
+	// its own recipes, prices and art.
+	SAMWorkbench::install();
 	for ( int i = 0; i < MAXPLAYERS; ++i )
 	{
 		// set these to something silly clear the tooltip cache match
@@ -75,6 +97,7 @@ void initGameDatafiles(bool moddedReload)
 	Player::SkillSheet_t::loadSkillSheetJSON();
 	Player::CharacterSheet_t::loadCharacterSheetJSON();
 	StatusEffectQueue_t::loadStatusEffectsJSON();
+	SAMEffects::reapplyDisplayEntries(); // custom effects re-add their HUD entries (the load above cleared the map)
 	FollowerRadialMenu::loadFollowerJSON();
 	CalloutRadialMenu::loadCalloutJSON();
 	MonsterData_t::loadMonsterDataJSON();

@@ -548,6 +548,22 @@ typedef enum ItemType
 	ITEM_ENUM_MAX
 } ItemType;
 const int NUMITEMS = ITEM_ENUM_MAX;
+// S.A.M Framework: custom items are registered at ids >= 5000 (SAM_ITEM_ID_BASE).
+// The items[] array is sized to NUM_ITEM_SLOTS so items[5000+] can be indexed
+// directly, while NUMITEMS itself stays == ITEM_ENUM_MAX. That keeps every
+// `for (i < NUMITEMS)` loop and every `bool[NUMITEMS]` stack array (random item
+// generation) covering ONLY the built-in items — custom items are reached solely
+// by direct id, never by those loops, so they never spawn as random loot and the
+// stack arrays don't grow. Bump this if more than ~1000 custom item slots are ever
+// needed.
+//
+// The range is split in two. Mods allocate [5000, 6000) in load order. The FRAMEWORK
+// owns [6000, NUM_ITEM_SLOTS) for its own built-in items, which sit at fixed numbers
+// that never move: item ids are persisted into save files raw, so an id that shifted
+// with the user's mod list would silently change what a saved item is. Keeping the
+// built-ins above the old bound also means no save written by an older build can
+// already contain one -- those clamp an out-of-range type to GEM_ROCK on load.
+const int NUM_ITEM_SLOTS = 6064;
 
 typedef enum Category
 {
@@ -753,12 +769,36 @@ public:
 	bool unableToEquipDueToSwapWeaponTimer(const int player) const;
 	bool tinkeringBotIsMaxHealth() const;
 	bool isTinkeringItemWithThrownLimit() const;
-	static void onItemIdentified(int player, Item* tempItem);
+	// S.A.M: samReport=false skips player.on_item_identified for a caller whose identification
+	// was already reported (see actchest.cpp); the stacking work below it always runs.
+	static void onItemIdentified(int player, Item* tempItem, bool samReport = true);
 	static void itemFindUniqueAppearance(Item* tempItem, std::unordered_set<Uint32>& appearancesOfSimilarItems);
 };
 extern Uint32 itemuids;
 
 // item generic
+// S.A.M item traits: one bit per "closed list" question the engine asks about an item.
+// Set from a mod's item JSON "traits" array; every vanilla item leaves them all zero.
+namespace SAMItemTrait
+{
+	static const Uint64 RANGED           = 1ULL << 0;  // fires like a bow
+	static const Uint64 QUIVER           = 1ULL << 1;  // holds ammo
+	static const Uint64 FOCI             = 1ULL << 2;  // spell focus
+	static const Uint64 INSTRUMENT       = 1ULL << 3;  // playable instrument
+	static const Uint64 THROWN_BALL      = 1ULL << 4;  // dust/grease/slop-style ball
+	static const Uint64 SHIELD_SLOT      = 1ULL << 5;  // goes in the shield hand
+	static const Uint64 POTION_BAD       = 1ULL << 6;  // harmful potion
+	static const Uint64 AUTOMATON_FOOD   = 1ULL << 7;  // an automaton can eat it
+	static const Uint64 TINKER_THROWABLE = 1ULL << 8;  // bomb / trap / deployable
+	static const Uint64 USABLE           = 1ULL << 9;  // offers a "use" option in the inventory
+	static const Uint64 BEATITUDE_AC     = 1ULL << 10; // blessing/cursing it changes its AC (masks)
+}
+
+// True iff `type` is a real slot whose mod-declared traits include `trait`. Safe for any
+// int: an out-of-range or unregistered type answers false, so a vanilla-only game never
+// sees a different result from any predicate that calls this.
+inline bool samItemHasTrait(int type, Uint64 trait);
+
 class ItemGeneric
 {
 	std::string item_name_identified;      // identified item name
@@ -778,6 +818,14 @@ public:
 	ItemEquippableSlot item_slot = ItemEquippableSlot::NO_EQUIP;
 	std::map<std::string, Sint32> attributes;
 	std::string tooltip = "tooltip_default";
+
+	// S.A.M: mod-declared traits. Barony answers questions like "is this a bow?" or "can
+	// this hold arrows?" from closed lists of vanilla item types, so a custom item is
+	// permanently outside every one of them. Those predicates now also consult this
+	// bitmask, letting a mod opt its item into the behaviour instead of needing a
+	// hand-written engine arm per capability. Zero for every vanilla item -- the lists
+	// still decide every vanilla case exactly as before -- so a modless game is unchanged.
+	Uint64 samTraits = 0;
 
 	const char* getIdentifiedName() const { return item_name_identified.c_str(); }
 	const char* getUnidentifiedName() const { return item_name_unidentified.c_str(); }
@@ -799,7 +847,12 @@ public:
 		}
 	}
 };
-extern ItemGeneric items[NUMITEMS];
+extern ItemGeneric items[NUM_ITEM_SLOTS];
+
+inline bool samItemHasTrait(int type, Uint64 trait)
+{
+	return type >= 0 && type < NUM_ITEM_SLOTS && (items[type].samTraits & trait) != 0;
+}
 
 //----------Item usage functions----------
 bool item_PotionWater(Item*& item, Entity* entity, Entity* usedBy);
@@ -862,6 +915,7 @@ bool itemLevelCurvePostProcess(Entity* my, Item* item, BaronyRNG& rng,
 ItemType itemLevelCurve(Category cat, int minLevel, int maxLevel, BaronyRNG& rng);
 Item* newItemFromEntity(const Entity* entity, bool discardUid = false); //Make sure to call free(item). discardUid will free the new items uid if this is for temp purposes
 Entity* dropItemMonster(Item* item, Entity* monster, Stat* monsterStats, Sint16 count = 1);
+Entity* spawnGroundItem(ItemType type, Status status, Sint16 beatitude, Sint16 count, int tx, int ty); // S.A.M: spawn a ground item at map tile (tx,ty)
 Item** itemSlot(Stat* myStats, Item* item);
 
 enum Category itemCategory(const Item* item);
@@ -871,7 +925,13 @@ void consumeItem(Item*& item, int player); //NOTE: Items have to be unequipped b
 bool dropItem(Item* item, int player, const bool notifyMessage = true, const bool dropAll = false); // return true on free'd item
 bool playerGreasyDropItem(const int player, Item* const item);
 bool playerThrowDuck(const int player, Item* const item, int charge);
-void useItem(Item* item, int player, Entity* usedBy = nullptr, bool unequipForDropping = false, bool serverCheckUse = false);
+// S.A.M: samDeliberateUse marks "the player explicitly chose Use on this item", as
+// opposed to the equip path that also routes through here. Only a deliberate use may
+// be vetoed by a mod, so a script cannot accidentally block equipping.
+void useItem(Item* item, int player, Entity* usedBy = nullptr, bool unequipForDropping = false, bool serverCheckUse = false, bool samDeliberateUse = false, bool samPlayerEquip = false);
+// S.A.M: samPlayerEquip marks "the player explicitly chose to wear/wield this", the only
+// case a mod may refuse an equip. Defaults false so starting gear, shop purchases and
+// every internal grant equip exactly as vanilla and can never be blocked by a script.
 enum EquipItemResult : int
 {
 	EQUIP_ITEM_FAIL_CANT_UNEQUIP,
@@ -892,7 +952,9 @@ enum EquipItemSendToServerSlot : int
 	EQUIP_ITEM_SLOT_AMULET,
 	EQUIP_ITEM_SLOT_RING
 };
-void playerTryEquipItemAndUpdateServer(const int player, Item* item, bool checkInventorySpaceForPaperDoll);
+// S.A.M: samPlayerEquip, as for useItem -- true only where the player chose to wield it, the
+// one case player.on_before_equip may refuse. Every other caller equips exactly as vanilla.
+void playerTryEquipItemAndUpdateServer(const int player, Item* item, bool checkInventorySpaceForPaperDoll, bool samPlayerEquip = false);
 void clientSendEquipUpdateToServer(EquipItemSendToServerSlot slot, EquipItemResult equipType, int player,
 	ItemType type, Status status, Sint16 beatitude, int count, Uint32 appearance, bool identified);
 void clientUnequipSlotAndUpdateServer(const int player, EquipItemSendToServerSlot slot, Item* item);
@@ -918,7 +980,13 @@ ItemStackResult getItemStackingBehavior(const int player, Item* itemToCheck, Ite
 // checks chest inventory order for dropping all items into (the first item in the list that is stackable will be returned)
 ItemStackResult getItemStackingBehaviorIntoChest(const int player, Item* itemToCheck, Item* itemDestinationStack, int& newQtyForCheckedItem, int& newQtyForDestItem);
 void getItemEmptySlotStackingBehavior(const int player, Item& itemToCheck, int& newQtyForCheckedItem, int& newQtyForDestItem);
-Item* itemPickup(int player, Item* item, Item* addToSpecificInventoryItem = nullptr, bool forceNewStack = false);
+// S.A.M: samAllowVeto marks a call site as a genuine player-initiated world pickup,
+// the only kind a mod may refuse. It defaults to FALSE so every other caller --
+// starting gear, shop purchases, quest grants, anything internal -- keeps vanilla
+// behaviour and can never receive the null that a veto returns. Several callers
+// dereference the result without checking (charclass.cpp:792 is one), so a veto on
+// those paths is a crash, not a refusal.
+Item* itemPickup(int player, Item* item, Item* addToSpecificInventoryItem = nullptr, bool forceNewStack = false, bool samAllowVeto = false);
 bool itemIsEquipped(const Item* item, int player);
 bool shouldInvertEquipmentBeatitude(const Stat* wielder);
 bool isItemEquippableInShieldSlot(const Item* item);

@@ -3745,7 +3745,21 @@ int physfsLoadMapFile(int levelToLoad, Uint32 seed, bool useRandSeed, int* check
 	std::string line = "";
 	if ( loadCustomNextMap.compare("") != 0 )
 	{
-		line = "map: " + loadCustomNextMap;
+		// S.A.M: honour a "gen:" tag so a portal can reach a GENERATED branch, not only a
+		// fixed map. This was the single place a map name from outside levels.txt could enter
+		// the loader, and it could only ever express "map:", which meant a mod shipping a
+		// procedural levelset got its bare arena loaded as a static empty room.
+		//
+		// The tag is set by customPortalLookForMapWithName (actladder.cpp), which decides by
+		// probing for <set>00.lmp. Both keywords are already understood by the parser below.
+		if ( loadCustomNextMap.compare(0, 4, "gen:") == 0 )
+		{
+			line = "gen: " + loadCustomNextMap.substr(4);
+		}
+		else
+		{
+			line = "map: " + loadCustomNextMap;
+		}
 		loadCustomNextMap = "";
 	}
 	else
@@ -5400,7 +5414,12 @@ void physfsReloadSounds(bool reloadAll)
 #endif
 	}
 
-	for ( int c = 0; !fp->eof(); c++ )
+	// S.A.M: bound this loop. It walks the mod-visible text list and writes sounds[c]
+	// with NO check against numsounds -- the counting pass that would have supplied the
+	// bound is commented out just above. A mod shipping its own list with more lines than
+	// the vanilla one therefore writes past the end of a heap array. Stop at the table size
+	// and say so, rather than corrupting memory.
+	for ( int c = 0; !fp->eof() && c < (int)numsounds; c++ )
 	{
 		fp->gets2(name, PATH_MAX);
 		bool soundHasBeenModified = false;
@@ -5523,7 +5542,12 @@ void physfsReloadSprites(bool reloadAll) //TODO: NX PORT: Any changes needed her
 		}
 	}*/
 
-	for ( int c = 0; !fp->eof(); ++c )
+	// S.A.M: bound this loop. It walks the mod-visible text list and writes sprites[c]
+	// with NO check against numsprites -- the counting pass that would have supplied the
+	// bound is commented out just above. A mod shipping its own list with more lines than
+	// the vanilla one therefore writes past the end of a heap array. Stop at the table size
+	// and say so, rather than corrupting memory.
+	for ( int c = 0; !fp->eof() && c < (int)numsprites; ++c )
 	{
 		fp->gets2(name, PATH_MAX);
 		if ( PHYSFS_getRealDir(name) != nullptr )
@@ -5606,7 +5630,12 @@ void physfsReloadTiles(bool reloadAll)
         if (!fp) {
             printlog("error: could not open file: %s", "images/tiles.txt");
         } else {
-            for ( int c = 0; !fp->eof(); c++ )
+            // S.A.M: bound this loop. It walks the mod-visible text list and writes tiles/animatedtiles/lavatiles/swimmingtiles[c]
+            // with NO check against numtiles -- the counting pass that would have supplied the
+            // bound is commented out just above. A mod shipping its own list with more lines than
+            // the vanilla one therefore writes past the end of a heap array. Stop at the table size
+            // and say so, rather than corrupting memory.
+            for ( int c = 0; !fp->eof() && c < (int)numtiles; c++ )
             {
 				if (Mods::isLoading) {
 					doLoadingScreen();

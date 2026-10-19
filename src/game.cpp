@@ -41,6 +41,21 @@
 #include "paths.hpp"
 #include "player.hpp"
 #include "mod_tools.hpp"
+#include "sam_camera.hpp"
+#include "sam_rules.hpp"  // script control of the player camera
+#include "sam_music.hpp"
+#include "sam_net.hpp"   // S.A.M: multiplayer channels (tick / clear)
+#include "sam_mp_input.hpp" // S.A.M: revive answers on the level change, leave events, input polling
+#include "sam_mp_entities.hpp" // S.A.M: per-floor replication tables for script-made entities
+#include "sam_lua_runtime.hpp"
+#include "sam_items.hpp"       // SAMItems::drainDestroyQueue (deferred item destruction)
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
+#include "sam_hud.hpp"   // S.A.M: repaint the script HUD after an engine UI reset
+#include "sam_ui.hpp"    // S.A.M: repaint mod panels after an engine UI reset
+#include "sam_images.hpp" // S.A.M: mod-supplied pictures drawn over the HUD (sam_show_image)
+#include "sam_js_runtime.hpp"
+#include "sam_test.hpp"  // S.A.M: -samtest, the unattended test run
+#include "sam_speed.hpp" // S.A.M: the simulation speed multiplier (the accumulator and the catch-up cap)
 #include "lobbies.hpp"
 #include "interface/ui.hpp"
 #include "ui/GameUI.hpp"
@@ -1722,7 +1737,10 @@ void gameLogic(void)
 					}
 					if ( entity->behavior != nullptr )
 					{
-						if ( gameloopFreezeEntities 
+						// S.A.M sam_hitstop() ORs a brief freeze into vanilla's own freeze path.
+						// hitstopActive() is false in vanilla / when no script triggered it, so
+						// this is exactly the vanilla condition until a mod calls sam_hitstop.
+						if ( (gameloopFreezeEntities || SAMLua::hitstopActive())
 							&& entity->behavior != &actPlayer
 							&& entity->behavior != &actPlayerLimb
 							&& entity->behavior != &actDeathGhost
@@ -1855,7 +1873,7 @@ void gameLogic(void)
 						else if ( entity->behavior == &actItem )
 						{
 							totalFloorItems++;
-							tmpItem.type = (entity->skill[10] >= 0 && entity->skill[10] < NUMITEMS) ? (ItemType)entity->skill[10] : ItemType::GEM_ROCK;
+							tmpItem.type = (entity->skill[10] >= 0 && entity->skill[10] < NUM_ITEM_SLOTS) ? (ItemType)entity->skill[10] : ItemType::GEM_ROCK;
 							tmpItem.status = (int)entity->skill[11] < Status::BROKEN ?
 								Status::BROKEN : ((int)entity->skill[11] > EXCELLENT ? EXCELLENT : (Status)entity->skill[11]);
 							tmpItem.beatitude = std::min(std::max((Sint16)-100, (Sint16)entity->skill[12]), (Sint16)100);
@@ -2142,6 +2160,11 @@ void gameLogic(void)
 						}
 					}
 
+					// S.A.M: player.on_before_revive, asked ONCE here on the main thread for every dead
+					// player (host and singleplayer), before the level change goes out. The answers ride
+					// on the LVLC/LVLR below, so every machine's assignActions applies the host's one
+					// answer instead of asking its own scripts on the loader thread.
+					SAMMpInput::decideFloorRevives();
 					if ( multiplayer == SERVER && net_packet && net_packet->data )
 					{
 						for ( c = 1; c < MAXPLAYERS; ++c )
@@ -2165,15 +2188,28 @@ void gameLogic(void)
 
 							if ( loadCustomNextMap.compare("") != 0 )
 							{
-								strcpy((char*)(&net_packet->data[14]), loadCustomNextMap.c_str());
-								net_packet->data[14 + loadCustomNextMap.length()] = 0;
-								net_packet->len = 14 + loadCustomNextMap.length() + 1;
+								// S.A.M: bound the copy. The map name is mod-controlled (a mod can ship
+								// maps/<anything>.lmp and reach this through a custom portal), and BOTH
+								// ends of this were unchecked: the client receives it into a char[128]
+								// in changeLevel() with its own bare strcpy, so a name longer than 127
+								// characters overran a remote player's stack. 127 here is not arbitrary,
+								// it is that buffer minus its terminator.
+								const size_t samMaxMapName = 127;
+								size_t samLen = loadCustomNextMap.length();
+								if ( samLen > samMaxMapName ) { samLen = samMaxMapName; }
+								memcpy(&net_packet->data[14], loadCustomNextMap.c_str(), samLen);
+								net_packet->data[14 + samLen] = 0;
+								net_packet->len = 14 + samLen + 1;
 							}
 							else
 							{
 								net_packet->data[14] = 0;
 								net_packet->len = 15;
 							}
+							// S.A.M: the revive answers after the map name's NUL ([0xA5][mask]); nothing is
+							// appended when nobody was refused, so the packet is byte-identical to vanilla, and
+							// a stock client stops reading at the NUL either way.
+							net_packet->len = SAMMpInput::appendReviveVerdict(net_packet->data, net_packet->len);
 							net_packet->address.host = net_clients[c - 1].host;
 							net_packet->address.port = net_clients[c - 1].port;
 							sendPacketSafe(net_sock, -1, net_packet, c - 1);
@@ -2197,6 +2233,19 @@ void gameLogic(void)
 							Compendium_t::Events_t::eventUpdateWorld(i, Compendium_t::ITEM_VALUE_LEFT_BEHIND, "merchants guild", totalFloorItemValue[i]);
 						}
 					}
+
+					// S.A.M: clears script-declared damage immunity, pending entity removals and
+					// every per-creature rule. Entity uids are not per-level, but the engine rolls the
+					// uid counter back for throwaway particles, so a uid a script remembered can come
+					// to name something else. Done BEFORE the load: followers are re-summoned during
+					// it and fire world.on_monster_spawned, and a clear afterwards wiped whatever a
+					// handler had just given them.
+					SAMLua::clearDamageImmune();
+					SAMRules::clearMonsterModifiersForNewFloor();
+					// S.A.M: every entity a spawner registered, every pinned transform and pushed
+					// item, and this floor's terrain log belong to the map being thrown away.
+					// Empty containers without a mod, so this costs nothing in vanilla.
+					SAMMpEntities::onFloorChange();
 
                     // load map file
 					loading = true;
@@ -2599,9 +2648,29 @@ void gameLogic(void)
 						list_FreeAll(&tempFollowers[c]);
 					}
 
+					// Re-send the player totals and the XP curve: a client that joined mid-run has
+					// never seen them, and this runs on every floor entry, the first one included.
+					SAMRules::syncAllPlayersToClients();
+					SAMMusic::syncToClients();   // and a forced music track, for anyone who joined since
+
+					// S.A.M: player.on_player_revived for everyone this floor load stood back up, on the
+					// main thread, before game.on_level_entered (assignActions only noted them).
+					SAMMpInput::fireFloorRevives();
 					for ( c = 0; c < MAXPLAYERS; c++ )
 					{
 						Compendium_t::Events_t::onLevelChangeEvent(c, Compendium_t::Events_t::previousCurrentLevel, Compendium_t::Events_t::previousSecretlevel, prevmapname, playerDied[c]);
+
+						if ( !client_disconnected[c] )
+						{
+							{
+								SamEvent samEv;
+								samEv.setName("game.on_level_entered");
+								samEv.i("player", (long long)c);
+								samEv.i("floor", (long long)currentlevel);
+								samEv.s("level_name", std::string(map.name));
+								samEv.fire();
+							}
+						}
 						players[c]->compendiumProgress.playerAliveTimeTotal = 0;
 						players[c]->compendiumProgress.playerGameTimeTotal = 0;
 
@@ -2726,7 +2795,15 @@ void gameLogic(void)
 			if ( multiplayer == SERVER )
 			{
 				// periodically remind clients of the current level
-				if ( ticks % (TICKS_PER_SECOND * 3) == 0 )
+				//
+				// S.A.M: not while a level change is pending. sam_travel_to_level sets secretlevel at
+				// once and loadnextlevel for the block above to consume on the NEXT frame -- and a
+				// script can call it from inside that block (game.on_level_entered, on_before_revive),
+				// after it has already run. A reminder sent in between paired the NEW secret flag with
+				// the floor just loaded, and a client loaded that wrong map before the real move
+				// arrived. A ladder sets and consumes the flag in one frame, so vanilla never reaches
+				// this with it set; gated on scripts anyway, so a vanilla game is byte-identical.
+				if ( ticks % (TICKS_PER_SECOND * 3) == 0 && !(loadnextlevel && SamEvent::anyScripts()) )
 				{
 					for ( c = 1; c < MAXPLAYERS; c++ )
 					{
@@ -2744,6 +2821,7 @@ void gameLogic(void)
 							net_packet->address.host = net_clients[c - 1].host;
 							net_packet->address.port = net_clients[c - 1].port;
 							net_packet->len = 15;
+							net_packet->len = SAMMpInput::appendReviveVerdict(net_packet->data, net_packet->len);   // S.A.M: see the level change
 							sendPacketSafe(net_sock, -1, net_packet, c - 1);
 						}
 					}
@@ -2844,6 +2922,13 @@ void gameLogic(void)
 							net_packet->len = 4;
 							sendPacketSafe(net_sock, -1, net_packet, c - 1);
 							client_disconnected[c] = true;
+
+							// S.A.M: player.on_player_left, once per stay however many paths notice the same
+							// departure, and tell every OTHER client (vanilla DISC, which a stock client
+							// handles) -- only the dropped player was told, so the others went on counting
+							// them in sam_player_count. Both do nothing while no script is loaded.
+							SAMMpInput::firePlayerLeft(c);
+							SAMMpInput::relayPlayerGone(c);
 						}
 					}
 					PingNetworkStatus_t::update();
@@ -3402,7 +3487,10 @@ void gameLogic(void)
 					}
 					if ( entity->behavior != nullptr )
 					{
-						if ( gameloopFreezeEntities
+						// S.A.M sam_hitstop() — mirror of the freeze OR above (this is the
+						// second copy of the freeze condition). hitstopActive() only returns
+						// true after a script triggers it, so vanilla behaviour is unchanged.
+						if ( (gameloopFreezeEntities || SAMLua::hitstopActive())
 							&& entity->behavior != &actPlayer
 							&& entity->behavior != &actDeathGhost
 							&& entity->behavior != &actPlayerLimb
@@ -4125,7 +4213,11 @@ bool handleEvents(void)
 
 	// do timer
 	int numframes = 0;
-	time_diff += timesync;
+	// S.A.M: game speed (sam_set_game_speed). This is the one place real time enters the
+	// simulation, so scaling it here runs the whole world at Nx while everything on a wall
+	// clock (rendering, UI) carries on. Gated: with no speed set the vanilla expression runs,
+	// and while paused too, because the menus still count ticks and must run at 1x.
+	time_diff += SAMSpeed::drivesClock() ? timesync * SAMSpeed::multiplier() : timesync;
 	constexpr real_t frame = (real_t)1000 / (real_t)TICKS_PER_SECOND;
 	while (time_diff >= frame) {
 		time_diff -= frame;
@@ -4133,7 +4225,10 @@ bool handleEvents(void)
 	}
 
 	// drop excessive frames
-	constexpr int max_frames = 5;
+	// S.A.M: the catch-up cap follows the multiplier above 1x. Five ticks a frame is 6x at
+	// 60 fps, so an 8x request (6.67 ticks a frame) would be silently clamped to 6x; at or
+	// below 1x this is the vanilla 5.
+	const int max_frames = SAMSpeed::maxTicksPerFrame(5);
 	if (numframes > max_frames) {
 		//printlog("dropped %d frames", numframes - max_frames);
 		numframes = max_frames;
@@ -5310,14 +5405,56 @@ bool handleEvents(void)
 	{
 		if (!loading && initialized)
 		{
+			// S.A.M: above 1x a frame runs more ticks than 60 fps vanilla ever does, and every
+			// tick re-reads the same mouse delta, so look would turn ticks-per-frame times too
+			// far. From the second tick on the delta is held back, and given back after the
+			// loop for the per-frame UI pass. No-op at or below 1x.
+			if ( runtimes > 0 ) { SAMSpeed::holdLookDelta(); }
 			gameLogic();
 			++ticks;
+			SAMSpeed::tick();   // S.A.M: a temporary speed window (bullet time) counts game ticks
+			// S.A.M: advance mod script timers + fire the on_tick hook once per game tick,
+			// host-authoritative. on_tick only fires during active gameplay (!intro), the
+			// v0.7.0 equivalent of "in GAMEMODE, not a menu".
+			if ( multiplayer != CLIENT )
+			{
+				// Drain BEFORE any script runs this frame. gameLogic() has returned, so no
+				// engine item hook is on the stack holding a pointer we are about to free.
+				// Anything queued by the scripts below waits for the next frame, which is
+				// what keeps this bounded.
+				SAMItems::drainDestroyQueue();
+				SAMLua::drainRemoveQueue();   // entity removals a script asked for, same reasoning
+				SAMLua::tickTimers();
+				SAMJs::tickTimers();
+				if ( !intro )
+				{
+					SAMLua::dispatchTick(ticks);
+					SAMJs::dispatchTick(ticks);
+					SAMLua::pollInput(); // v0.7.0 Feature 3: fire on_key_pressed/on_key_released
+				}
+			}
+			// Bound-action hooks run on EVERY machine, unlike the host-gated block above:
+			// input only exists locally (Input::inputs[] holds live data for local players
+			// only), so a client has to poll its own edges and forward them — otherwise
+			// on_action_pressed would never fire for anyone but the host. The resulting
+			// hooks still fire host-side, so host-only APIs keep working. This reads the
+			// bindings with const calls only and never consumes them, so vanilla's own
+			// input handling (blocking, attacking, hotbar) is untouched.
+			if ( !intro )
+			{
+				SAMLua::pollActions();
+			}
+			// S.A.M: the multiplayer channels, on every machine, after the scripts have run:
+			// apply what arrived (in order), then send what this tick queued. No-op with no
+			// script loaded or outside multiplayer.
+			SAMNet::tick();
 		}
 		else
 		{
 			++loadingticks;
 		}
 	}
+	SAMSpeed::releaseLookDelta();   // S.A.M: the frame's mouse delta goes back to the UI pass
 
 #ifdef DEBUG_EVENT_TIMERS
 	time2 = std::chrono::high_resolution_clock::now();
@@ -5651,6 +5788,18 @@ void ingameHud()
 			}
 		}
 #endif
+		// S.A.M Framework: a mod's text box has the keyboard. Barony feeds the raw keyboard
+		// to gameplay bindings whether or not SDL text input is active, so without this,
+		// typing a search term into a mod panel also walks the player around and fires their
+		// hotbar. Same shape as the ImGui override directly above, and scoped to the player
+		// who actually owns the keyboard so splitscreen partners keep their controls.
+		// Free in vanilla: the first test inside is `no panels open`.
+		// SAMUi picks the keyboard's owner: getPlayerIDAllowedKeyboard() answers 0 in multiplayer,
+		// which on a client is somebody else's slot, so a client's typing still moved them.
+		if ( SAMUi::keyboardCapturedFor(player) )
+		{
+			players[player]->bControlEnabled = false;
+		}
 		bool& bControlEnabled = players[player]->bControlEnabled;
 
 	    Input& input = Input::inputs[player];
@@ -7270,6 +7419,12 @@ int main(int argc, char** argv)
 					{
 						no_sound = true;
 					}
+					// S.A.M: -samtest= and friends, which run a mod's own tests with nobody
+					// at the keyboard. parseArg returns false for anything else, so every
+					// other argument reaches the same place it did before.
+					else if ( SAMTest::parseArg(argv[c]) )
+					{
+					}
 					else
 					{
 #ifdef USE_EOS
@@ -7279,6 +7434,10 @@ int main(int argc, char** argv)
 				}
 			}
 		}
+		// S.A.M: -samtest borrows the engine's own quickstart to skip the menus. Done after
+		// the loop above so the flags may be written in any order.
+		SAMTest::applyToStartup();
+
 		printlog("Data path is %s", datadir);
 		printlog("Output path is %s", outputdir);
         
@@ -7422,6 +7581,9 @@ int main(int argc, char** argv)
 				}
 			}
 #endif
+
+			// S.A.M: the unattended test run's watchdog. One bool outside test mode.
+			SAMTest::tick();
 
 			doConsoleCommands();
 
@@ -7634,10 +7796,28 @@ int main(int argc, char** argv)
 						}
 
 						// generate unique game key
-						local_rng.seedTime();
+						// S.A.M: a test run seeds from its -samtestseed instead of the clock,
+						// so the same command twice walks the same dungeon and a failure can
+						// be looked at again. Zero means no seed was asked for.
+						if ( SAMTest::active() && SAMTest::seed() != 0 )
+						{
+							const unsigned int testSeed = SAMTest::seed();
+							local_rng.seedBytes(&testSeed, sizeof(testSeed));
+						}
+						else
+						{
+							local_rng.seedTime();
+						}
 						local_rng.getSeed(&uniqueGameKey, sizeof(uniqueGameKey));
 						uniqueLobbyKey = local_rng.getU32();
 						net_rng.seedBytes(&uniqueGameKey, sizeof(uniqueGameKey));
+						// S.A.M: mount and load the mods -samtest named. The Mods menu is what
+						// normally does this, and the quickstart path is exactly the thing that
+						// skips the menu, so without this a test run starts with no mod loaded.
+						if ( SAMTest::active() && !SAMTest::loadMods() )
+						{
+							break;   // loadMods already stopped the loop and set the exit code
+						}
 						doNewGame(false);
 					}
 					else
@@ -7922,6 +8102,30 @@ int main(int argc, char** argv)
 					auto& cvars = cameravars[c];
 					TimerExperiments::renderCameras(camera, c);
 
+					// S.A.M: a script may own this camera. HERE and nowhere else, because this
+					// is the one point that runs once per RENDERED frame, per viewport, after
+					// both of the engine's own writers -- actPlayer on the game tick and
+					// renderCameras just above -- and before the screen shake below, so a
+					// modded camera still shakes when the player is hit.
+					//
+					// Both of those writers SKIP a player whose skill[3] is set, which is the
+					// state /thirdperson leaves them in: nothing then moves the camera at all
+					// and it stops where it was. That is the bug this exists to fix, so the
+					// override computes its position from the player entity rather than
+					// adjusting whatever happens to be in the camera already.
+					//
+					// SAMCamera::any() is one bool test against false in a game with no mod.
+					if ( SAMCamera::any() )
+					{
+						double samCx = camera.x, samCy = camera.y, samCz = camera.z;
+						double samAng = camera.ang, samVang = camera.vang;
+						if ( SAMCamera::apply(c, &samCx, &samCy, &samCz, &samAng, &samVang) )
+						{
+							camera.x = samCx; camera.y = samCy; camera.z = samCz;
+							camera.ang = samAng; camera.vang = samVang;
+						}
+					}
+
 					real_t mult = 1.0;
 					if ( !intro && stats[c]->getEffectActive(EFF_DELAY_PAIN) )
 					{
@@ -8079,6 +8283,102 @@ int main(int argc, char** argv)
 					}
 				}
 #endif
+			}
+
+			// S.A.M Framework: per-player "impact frame" flash (e.g. on a shield block).
+			// Drawn over the world AND the HUD for each local player's viewport, so it reads
+			// as a full-screen pop that fades out. Inert in vanilla — screenFlashState returns
+			// false for every player until a script calls sam_screen_flash / sam_impact_frame.
+			// style 0 = a plain colour fill; style 1 = the manga "impact burst": a colour pop
+			// plus radial speed lines converging on centre plus a bright core flare.
+			for ( int samC = 0; samC < MAXPLAYERS; ++samC )
+			{
+				if ( client_disconnected[samC] || !players[samC] || !players[samC]->isLocalPlayer() ) { continue; }
+				int samFR = 0, samFG = 0, samFB = 0, samFA = 0, samStyle = 0, samLines = 0;
+				double samProg = 0.0;
+				if ( !SAMLua::screenFlashState(samC, samFR, samFG, samFB, samFA, samStyle, samLines, samProg) ) { continue; }
+				const Uint8 samFAb = (Uint8)(samFA < 0 ? 0 : (samFA > 255 ? 255 : samFA));
+				SDL_Rect samFlashRect { cameras[samC].winx, cameras[samC].winy, cameras[samC].winw, cameras[samC].winh };
+
+				if ( samStyle != 1 || samLines <= 0 )
+				{
+					// plain flash: a single colour fill.
+					drawRect(&samFlashRect, makeColor(samFR, samFG, samFB, 255), samFAb);
+					continue;
+				}
+
+				// ---- manga "impact burst" ----------------------------------------------
+				const double SAM_TAU = 6.283185307179586;
+				const int    scx  = cameras[samC].winx + cameras[samC].winw / 2;
+				const int    scy  = cameras[samC].winy + cameras[samC].winh / 2;
+				const double halfW = cameras[samC].winw * 0.5;
+				const double halfH = cameras[samC].winh * 0.5;
+				const double maxR  = sqrt(halfW * halfW + halfH * halfH) * 1.06; // reach past corners
+				// deterministic per-ray hash — same geometry every frame (no strobing flicker).
+				auto samHash = [](unsigned n) -> double {
+					n = (n ^ 0x9e3779b9u) * 2654435761u; n ^= (n >> 15);
+					n *= 2246822519u; n ^= (n >> 13);
+					return (double)(n & 0xffffffu) / 16777216.0;
+				};
+				// 1) colour pop under the lines (a touch under full so the world returns as it fades).
+				drawRect(&samFlashRect, makeColor(samFR, samFG, samFB, 255), (Uint8)((samFAb * 78) / 100));
+				// 2) speed lines: near-black rays from a clear bright core out past the edges.
+				const Uint32 samLineCol = makeColor(samFR / 6, samFG / 6, samFB / 6, 255);
+				const double coreGap = maxR * 0.14;
+				const int    samN = samLines;
+				for ( int i = 0; i < samN; ++i )
+				{
+					const double ang = SAM_TAU * (double)i / (double)samN
+						+ (samHash(i * 2u + 1u) - 0.5) * (SAM_TAU / (double)samN) * 1.3;
+					const double ca = cos(ang), sa = sin(ang);
+					const double r0 = coreGap * (0.85 + 0.5 * samHash(i * 7u + 3u));
+					const double lenK = 0.55 + 0.65 * samHash(i * 13u + 5u); // spiky: some short, some long
+					const double grow = 0.75 + 0.25 * samProg;               // rush outward as it fades
+					double r1 = maxR * lenK * grow;
+					if ( r1 < r0 + 4.0 ) { r1 = r0 + 4.0; }
+					const int x0 = scx + (int)(ca * r0), y0 = scy + (int)(sa * r0);
+					const int x1 = scx + (int)(ca * r1), y1 = scy + (int)(sa * r1);
+					drawLine(x0, y0, x1, y1, samLineCol, samFAb);
+					if ( samHash(i * 17u + 9u) < 0.28 ) // ~1/4 rays are bold (3px)
+					{
+						const int px = (int)(-sa), py = (int)(ca);
+						drawLine(x0 + px, y0 + py, x1 + px, y1 + py, samLineCol, samFAb);
+						drawLine(x0 - px, y0 - py, x1 - px, y1 - py, samLineCol, samFAb);
+					}
+				}
+				// 3) bright core flare — an 8-point star that shrinks as it fades, plus a solid core.
+				const Uint32 samCoreCol = makeColor(255, 255, 255, 255);
+				const double flareR = maxR * (0.30 + 0.10 * (1.0 - samProg));
+				for ( int k = 0; k < 8; ++k )
+				{
+					const double a = (SAM_TAU / 8.0) * (double)k;
+					const double fr = (k % 2 == 0) ? flareR : flareR * 0.6;
+					drawLine(scx, scy, scx + (int)(cos(a) * fr), scy + (int)(sin(a) * fr), samCoreCol, samFAb);
+				}
+				SDL_Rect samCoreRect { scx - 6, scy - 6, 12, 12 };
+				drawRect(&samCoreRect, samCoreCol, samFAb);
+			}
+
+			// S.A.M Framework: repaint the script HUD if the engine threw the UI away. Every
+			// floor change calls Frame::guiDestroy + guiInit, which deletes the mod's HUD
+			// container silently -- so a widget the docs promise "stays until you clear it"
+			// vanished at the first ladder. Free in vanilla: no widgets recorded, one test.
+			SAMHud::ensure();
+			// Same for interactive mod panels: a floor change deletes the widget tree, and a
+			// panel that silently vanished at a ladder would be indistinguishable from a bug in
+			// the mod. Free in vanilla -- no panels open, one empty() test.
+			SAMUi::ensure();
+
+			// S.A.M Framework: a picture the MOD supplied, over the world, the HUD and the
+			// impact flash -- the jumpscare / title-card layer (sam_show_image). Drawn last
+			// of the three so a script can flash the screen and then land the image on top.
+			// Inert in vanilla: no player has an overlay, so this returns on its first
+			// branch without loading or decoding anything.
+			for ( int samC = 0; samC < MAXPLAYERS; ++samC )
+			{
+				if ( client_disconnected[samC] || !players[samC] || !players[samC]->isLocalPlayer() ) { continue; }
+				SAMImages::drawOverlay(samC, cameras[samC].winx, cameras[samC].winy,
+					cameras[samC].winw, cameras[samC].winh);
 			}
 
 			// fade in/out effect
@@ -8258,7 +8558,9 @@ int main(int argc, char** argv)
 
 		// deinit
 		deinitGame();
-		return deinitApp();
+		// S.A.M: a test run answers with what the test found; every other run answers with
+		// whatever the engine was going to say.
+		return SAMTest::overrideExitCode(deinitApp());
 	}
 #ifndef NINTENDO
 	catch (const std::exception &exc)

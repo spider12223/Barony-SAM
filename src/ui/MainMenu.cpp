@@ -1,4 +1,7 @@
 #include "../main.hpp"
+#include "sam_logger.hpp" // SAM_FRAMEWORK_VERSION for the main-menu framework badge
+#include "sam_event.hpp" // player.on_game_over
+#include "sam_menu_badge.h" // embedded S.A.M badge icon PNG (extracted at runtime)
 #include <algorithm>
 #include "MainMenu.hpp"
 #include "Frame.hpp"
@@ -17,7 +20,10 @@
 #include "../scores.hpp"
 #include "../mod_tools.hpp"
 #include "sam_classes.hpp" // S.A.M Framework custom classes
+#include "sam_races.hpp" // S.A.M Framework custom playable races
 #include "sam_sync.hpp" // S.A.M Framework multiplayer mod-fingerprint sync
+#include "sam_mp_input.hpp" // S.A.M: player.on_player_left for lobby leaves and kicks
+#include "sam_settings.hpp" // S.A.M: mod actions in the Bindings page, mod settings in the General tab
 #include "../interface/interface.hpp"
 #include "../draw.hpp"
 #include "../engine/audio/sound.hpp"
@@ -54,7 +60,24 @@
 #endif
 
 namespace MainMenu {
-    int pause_menu_owner = 0;
+
+	// Extract the embedded S.A.M badge PNG once. Barony redirects the write dir to <outputdir>/mods,
+	// so PHYSFS_openWrite("sam_badge.png") lands at <outputdir>/mods/sam_badge.png -> PhysFS path
+	// "mods/sam_badge.png" (what the Image below loads). outputdir is mounted, so Image::get finds it.
+	static void samEnsureBadgeImage()
+	{
+		static bool tried = false;
+		if ( tried ) { return; }
+		tried = true;
+		if ( PHYSFS_isInit() )
+		{
+			if ( PHYSFS_File* f = PHYSFS_openWrite("sam_badge.png") )
+			{
+				PHYSFS_writeBytes(f, SAM_BADGE_PNG, SAM_BADGE_PNG_LEN);
+				PHYSFS_close(f);
+			}
+		}
+	}    int pause_menu_owner = 0;
 	bool cursor_delete_mode = false;
 	Frame* main_menu_frame = nullptr;
 
@@ -381,6 +404,38 @@ namespace MainMenu {
             }
         }
         return defaultBindings[0].bindings; // Should be "Standard"
+    }
+
+    // S.A.M: mod actions (sam_register_action) live in SAMSettings, not in the table above:
+    // BindingLayout::bindings is const. They are seeded into the maps the Settings window edits
+    // with emplace, never assign, so a value config.json already holds -- the player's own
+    // rebinding, kept there across runs and across the mod being unloaded -- beats the default.
+    static void samSeedModBindings(
+        std::unordered_map<std::string, std::string>& kb,
+        std::unordered_map<std::string, std::string>& pad,
+        std::unordered_map<std::string, std::string>& joy) {
+        for (auto& m : SAMSettings::actions()) {
+            kb.emplace(m.name, m.keyboard);
+            pad.emplace(m.name, m.gamepad);
+            joy.emplace(m.name, emptyBinding);
+        }
+    }
+
+    // S.A.M: a mod action's name at an address that outlives the registry. A binding button
+    // keeps a raw pointer to its name in its user data (settingsAddBinding) for as long as
+    // the Bindings window lives; the vanilla names it points at sit in the static
+    // defaultBindings table, but a mod action's name lives in SAMSettings, which every
+    // reload empties. /sam_reload is refused while the window is open, and the pointer
+    // still should not depend on that. Append-only, one entry per distinct name, so the same
+    // name always comes back at the same address: a few dozen bytes per mod action for the
+    // life of the process.
+    static const char* samModRowName(const std::string& name) {
+        static std::deque<std::string> names;
+        for (auto& n : names) {
+            if (n == name) { return n.c_str(); }
+        }
+        names.push_back(name);
+        return names.back().c_str();
     }
 
 	static int main_menu_buttons_height = 0;
@@ -2566,6 +2621,7 @@ namespace MainMenu {
 			    bindings.gamepad_bindings[c].emplace(binding.action, binding.gamepad);
 			    bindings.joystick_bindings[c].emplace(binding.action, binding.joystick);
 			}
+			samSeedModBindings(bindings.kb_mouse_bindings[c], bindings.gamepad_bindings[c], bindings.joystick_bindings[c]); // S.A.M: the mod rows, after the vanilla ones
 		}
 		return bindings;
 	}
@@ -2600,6 +2656,12 @@ namespace MainMenu {
                         case 2: bindings[binding.action] = binding.joystick; break;
                         default: break;
                         }
+                    }
+
+                    // S.A.M: the mod rows too, so a file written after Restore Defaults keeps them; an
+                    // entry the file has for one still wins, in the loop below.
+                    for (auto& m : SAMSettings::actions()) {
+                        bindings.emplace(m.name, j == 0 ? m.keyboard : j == 1 ? m.gamepad : std::string(emptyBinding));
                     }
 					for (Uint32 index = 0; index < count; ++index) {
 						file->beginObject();
@@ -2887,6 +2949,37 @@ namespace MainMenu {
 
 	static AllSettings allSettings;
 
+	// S.A.M: a mod action (sam_register_action) is registered long after config.json was read
+	// and applied -- mods load on Play, from the Mods menu and on /sam_reload -- so the moment
+	// it is registered it is written into every seat's maps here AND bound in the live Input
+	// table, the way Input::refresh would bind it, one entry at a time so nothing else's
+	// `consumed` state moves. emplace, never assign: a value the file already holds -- the
+	// player's own rebinding -- wins over the mod's default. Installed into SAMSettings below.
+	static void samSeedModAction(const SAMSettings::Action& a) {
+		for (int c = 0; c < MAX_SPLITSCREEN; ++c) {
+			allSettings.bindings.kb_mouse_bindings[c].emplace(a.name, a.keyboard);
+			allSettings.bindings.gamepad_bindings[c].emplace(a.name, a.gamepad);
+			allSettings.bindings.joystick_bindings[c].emplace(a.name, emptyBinding);
+			Input& input = Input::inputs[c];
+			auto kb = input.getKeyboardBindings().emplace(a.name, a.keyboard).first;
+			auto pad = input.getGamepadBindings().emplace(a.name, a.gamepad).first;
+			input.getJoystickBindings().emplace(a.name, emptyBinding);
+			switch (input.getPlayerControlType()) {
+			case Input::playerControlType_t::PLAYER_CONTROLLED_BY_KEYBOARD:
+				input.bind(a.name.c_str(), kb->second.c_str());
+				break;
+			case Input::playerControlType_t::PLAYER_CONTROLLED_BY_CONTROLLER:
+				input.bind(a.name.c_str(), (std::string("Pad") + std::to_string(c) + pad->second).c_str());
+				break;
+			default:
+				break; // a joystick seat gets no default; the Bindings page can still give it one
+			}
+		}
+	}
+	static struct SamSeedModActionInstaller {
+		SamSeedModActionInstaller() { SAMSettings::setSeedAction(&samSeedModAction); }
+	} samSeedModActionInstaller;
+
 	inline int AllSettings::save() {
         int result = VideoRefresh::None;
 		Mods::mountedFilepathsSaved = mods;
@@ -3033,10 +3126,20 @@ namespace MainMenu {
 	    return result;
     }
 
+	// S.A.M: the crossplay_enabled value as it exists in the user's config.json, captured
+	// on read so a non-EOS build can hand it back unchanged instead of clobbering it.
+	static bool s_samCrossplayOnDisk = false;
+
 	inline AllSettings AllSettings::load(bool video) {
 		AllSettings settings;
 		settings.mods = Mods::mountedFilepathsSaved;
+#if defined(USE_EOS) && defined(STEAMWORKS)
 		settings.crossplay_enabled = LobbyHandler.crossplayEnabled;
+#else
+		// S.A.M: no EOS in this build, so LobbyHandler cannot answer for this setting.
+		// Pass the user's own stored value straight through -- see serialize().
+		settings.crossplay_enabled = s_samCrossplayOnDisk;
+#endif
 		settings.fast_restart = *cvar_fastRestart;
 		settings.world_tooltip_scale = *cvar_worldtooltip_scale;
 		settings.world_tooltip_scale_splitscreen = *cvar_worldtooltip_scale_splitscreen;
@@ -3141,6 +3244,13 @@ namespace MainMenu {
 	    file->property("version", version);
 	    file->property("mods", mods);
 		file->property("crossplay_enabled", crossplay_enabled);
+		// S.A.M: remember the on-disk value. This build is compiled WITHOUT EOS, so
+		// LobbyHandler.crossplayEnabled is permanently false here -- and AllSettings::load()
+		// used to copy that false straight back into the setting, which serialize() then wrote
+		// to config.json. The result was that merely running the S.A.M exe erased the user's
+		// crossplay preference for good, so restoring barony_vanilla.exe still came back with
+		// crossplay off. A build that cannot own a setting must not overwrite it.
+		if ( file->isReading() ) { s_samCrossplayOnDisk = crossplay_enabled; }
 		file->propertyVersion("fast_restart", version >= 2, fast_restart);
 		file->property("add_items_to_hotbar_enabled", add_items_to_hotbar_enabled);
 		if ( version < 9 )
@@ -4840,6 +4950,7 @@ namespace MainMenu {
 	static bool bind_mode = false;
  
     static const char* translateBinding(const char* binding) {
+        if (const char* label = SAMSettings::actionLabel(binding)) { return label; } // S.A.M: a mod action's own label; the counter below would hand an unknown name a neighbouring language line
         int c = 5970;
 		if ( !strcmp(binding, "Call Out") )
 		{
@@ -6103,7 +6214,24 @@ namespace MainMenu {
             }
         }
 
+        // S.A.M: the mod rows after the vanilla ones, grouped by mod. Each name goes through
+        // samModRowName: the button made for it keeps a raw pointer to the name in its user
+        // data for as long as the window lives, and SAMSettings' registry does not.
+        for (const std::string& ns : SAMSettings::actionNamespaces()) {
+            for (auto& m : SAMSettings::actions()) {
+                if (m.ns == ns) { bindings.push_back({Setting::Type::Binding, samModRowName(m.name)}); }
+            }
+        }
+
 		for (auto& binding : bindings) {
+
+			// S.A.M: the mod's name above the first of its rows
+			{
+				const std::string header = SAMSettings::modHeaderForAction(binding.name);
+				if (!header.empty()) {
+					y += settingsAddSubHeader(*subwindow, y, (std::string("sam_") + binding.name).c_str(), header.c_str(), true);
+				}
+			}
 			char tip[256];
 			if (inputs.hasController(getMenuOwner())) {
 #ifdef NINTENDO
@@ -6269,6 +6397,144 @@ bind_failed:
 			});
 	}
 
+
+	// S.A.M: the MOD SETTINGS section of the General tab (sam_register_setting). General is the
+	// one tab that exists in both the main menu and the pause menu, which is why the rows live
+	// here rather than on a tab of their own or inside the Bindings window. Every widget below
+	// carries the setting it belongs to in its NAME, "setting_sam:<ns>:<id>_<kind>": the
+	// callbacks are plain function pointers with nothing to close over, the same reason the
+	// slider text and the binding buttons above read their setting back out of a name. Values
+	// go to SAMSettings' staged copy; Confirm commits it and Discard forgets it, exactly as
+	// allSettings is handled.
+	static bool samSettingFromWidget(const char* widgetName, const char* suffix, std::string& ns, std::string& id) {
+		static const std::string prefix = "setting_sam:";
+		const std::string n = widgetName ? widgetName : "";
+		const size_t suf = strlen(suffix);
+		if (n.size() <= prefix.size() + suf || n.compare(0, prefix.size(), prefix) != 0) { return false; }
+		if (n.compare(n.size() - suf, suf, suffix) != 0) { return false; }
+		const std::string body = n.substr(prefix.size(), n.size() - prefix.size() - suf);
+		const size_t colon = body.find(':');
+		if (colon == std::string::npos) { return false; }
+		ns = body.substr(0, colon);
+		id = body.substr(colon + 1);
+		return true;
+	}
+	// A mod slider is built in STEP units, positions 0..SAMSettings::sliderSteps, not over the
+	// mod's own range: Slider::control moves a selected handle by exactly 1.0 per key or stick
+	// repeat, so over 0.1..8 step 0.1 a keyboard could reach 0.1, 1.1, 2.1... and never the 0.5
+	// default, and a 0..1 slider was a two-position switch. The vanilla sliders dodge the same
+	// thing the same way, whole units scaled in the formatter (volumes 0..100, decibels shown
+	// as v/4). The two callbacks below convert at the edges.
+	static void samSettingSlider(Slider& slider) {
+		soundSliderSetting(slider, true);
+		std::string ns, id;
+		if (!samSettingFromWidget(slider.getName(), "_slider", ns, id)) { return; }
+		const SAMSettings::Setting* s = SAMSettings::find(ns, id);
+		if (!s) { return; }
+		// The value at the nearest whole position, and the handle put back on it, so the
+		// handle, the number beside it and what Confirm stores agree.
+		const double v = SAMSettings::sliderValue(*s, slider.getValue());
+		slider.setValue((float)SAMSettings::sliderPosition(*s, v));
+		SAMSettings::stageNumber(ns, id, v);
+	}
+	// The number beside the handle, in the mod's units. settingsAddSlider's own text callback
+	// hands its formatter nothing but the float position, so a mod slider's text field gets
+	// this one in its place; it finds the setting through the field's name.
+	static void samSliderText(Widget& widget) {
+		auto field = static_cast<Field*>(&widget);
+		auto frame = static_cast<Frame*>(widget.getParent());
+		std::string ns, id;
+		if (!frame || !samSettingFromWidget(widget.getName(), "_text", ns, id)) { return; }
+		auto slider = frame->findSlider(("setting_sam:" + ns + ":" + id + "_slider").c_str());
+		const SAMSettings::Setting* s = SAMSettings::find(ns, id);
+		if (!slider || !s) { return; }
+		field->setText(SAMSettings::sliderText(*s, slider->getValue()).c_str());
+	}
+	static void samSettingToggle(Button& button) {
+		soundToggleSetting(button);
+		std::string ns, id;
+		if (!samSettingFromWidget(button.getName(), "_button", ns, id)) { return; }
+		SAMSettings::stageFlag(ns, id, button.isPressed());
+	}
+	static std::string samOpenDropdown; // "sam:<ns>:<id>" of the dropdown being chosen from
+	static void samSettingDropdown(Button& button) {
+		soundActivate();
+		std::string ns, id;
+		if (!samSettingFromWidget(button.getName(), "_dropdown_button", ns, id)) { return; }
+		samOpenDropdown = "sam:" + ns + ":" + id;
+		settingsOpenDropdown(button, samOpenDropdown.c_str(), DropdownType::Short, [](Frame::entry_t& entry){
+			soundActivate();
+			std::string ns, id;
+			if (samSettingFromWidget(("setting_" + samOpenDropdown).c_str(), "", ns, id)) {
+				SAMSettings::stageText(ns, id, entry.text);
+			}
+			auto settings = main_menu_frame->findFrame("settings"); assert(settings);
+			auto settings_subwindow = settings->findFrame("settings_subwindow"); assert(settings_subwindow);
+			auto button = settings_subwindow->findButton(("setting_" + samOpenDropdown + "_dropdown_button").c_str()); assert(button);
+			auto dropdown = settings_subwindow->findFrame(("setting_" + samOpenDropdown + "_dropdown").c_str()); assert(dropdown);
+			button->setText(entry.text.c_str());
+			dropdown->removeSelf();
+			button->select();
+			});
+	}
+	static void samSettingField(Field& field) {
+		std::string ns, id;
+		if (!samSettingFromWidget(field.getName(), "_text_field", ns, id)) { return; }
+		// Runs every tick (settingsAddField's tick callback calls it), so only a text that parses
+		// to a DIFFERENT value counts as an edit and marks the window modified.
+		if (SAMSettings::stageFromText(ns, id, field.getText())) {
+			if (auto parent = field.getParent()) {
+				if (auto window = parent->getParent()) { window->setUserData((void*)(intptr_t)SETTING_MODIFIED); }
+			}
+		}
+	}
+	static int samAppendModSettings(Frame& frame, int y, std::vector<Setting>& hooks) {
+		if (!SAMSettings::anySettings()) { return 0; } // no loaded mod has a setting: the tab is exactly vanilla
+		const int y0 = y;
+		y += settingsAddSubHeader(frame, y, "sam_mod_settings", "MOD SETTINGS");
+		for (const std::string& ns : SAMSettings::settingNamespaces()) {
+			y += settingsAddSubHeader(frame, y, ("sam_" + ns).c_str(), SAMSettings::displayName(ns).c_str());
+			for (auto& s : SAMSettings::settings()) {
+				if (s.ns != ns) { continue; }
+				const SAMSettings::Value& v = SAMSettings::staged(s);
+				const char* name = s.widgetName.c_str();
+				switch (s.type) {
+				case SAMSettings::Type::Slider: {
+					// In step units (see samSettingSlider). No formatter: the text field gets
+					// samSliderText in place of the callback settingsAddSlider gave it.
+					y += settingsAddSlider(frame, y, name, s.label.c_str(), s.tooltip.c_str(),
+						(float)SAMSettings::sliderPosition(s, v.number), 0.f, (float)SAMSettings::sliderSteps(s),
+						nullptr, samSettingSlider);
+					if (auto text = frame.findField((std::string("setting_") + name + "_text").c_str())) { text->setTickCallback(samSliderText); }
+					hooks.push_back({Setting::Type::Slider, name});
+					break;
+				}
+				case SAMSettings::Type::Toggle:
+					y += settingsAddBooleanOption(frame, y, name, s.label.c_str(), s.tooltip.c_str(), v.flag, samSettingToggle);
+					hooks.push_back({Setting::Type::Boolean, name});
+					break;
+				case SAMSettings::Type::Dropdown: {
+					std::vector<const char*> items;
+					for (auto& o : s.options) { items.push_back(o.c_str()); }
+					y += settingsAddDropdown(frame, y, name, s.label.c_str(), s.tooltip.c_str(), false, items, v.text.c_str(), samSettingDropdown);
+					hooks.push_back({Setting::Type::Dropdown, name});
+					break;
+				}
+				case SAMSettings::Type::Number:
+				case SAMSettings::Type::Text: {
+					const std::string shown = SAMSettings::valueText(s, v);
+					y += settingsAddField(frame, y, name, s.label.c_str(), s.tooltip.c_str(), shown.c_str(), samSettingField);
+					// samSettingField runs every tick and must not take the text the row was
+					// built with for an edit: it stays the baseline until the player types.
+					SAMSettings::showText(s.ns, s.id, shown);
+					hooks.push_back({Setting::Type::Field, name});
+					break;
+				}
+				}
+			}
+		}
+		return y - y0;
+	}
 	static void settingsGeneral(Button& button) {
 		Frame* settings_subwindow;
 		if ((settings_subwindow = settingsSubwindowSetup(button.getName(), false)) == nullptr) {
@@ -6358,8 +6624,8 @@ bind_failed:
 #endif
 
 #ifndef NINTENDO
-		hookSettings(*settings_subwindow,
-			{{Setting::Type::Boolean, "fast_restart"},
+		std::vector<Setting> hooks = { // S.A.M: a local rather than a literal, so the mod rows can go on the end
+			{Setting::Type::Boolean, "fast_restart"},
 
 			// inventory options
 			{Setting::Type::Boolean, "add_items_to_hotbar"},
@@ -6389,10 +6655,10 @@ bind_failed:
 			{Setting::Type::Boolean, "light_flicker"},
 			{Setting::Type::Boolean, "hold_to_activate"},
 			//{Setting::Type::Boolean, "show_hud"},
-        });
+        };
 #else
-		hookSettings(*settings_subwindow,
-			{{Setting::Type::Boolean, "fast_restart"},
+		std::vector<Setting> hooks = { // S.A.M: a local rather than a literal, so the mod rows can go on the end
+			{Setting::Type::Boolean, "fast_restart"},
 			// inventory options
 			{Setting::Type::Boolean, "add_items_to_hotbar"},
 			{Setting::Type::Customize, "inventory_sorting"},
@@ -6417,8 +6683,10 @@ bind_failed:
 			{Setting::Type::Boolean, "bobbing"},
 			{Setting::Type::Boolean, "light_flicker"},
 			{Setting::Type::Boolean, "hold_to_activate"},
-        });
+        };
 #endif
+		y += samAppendModSettings(*settings_subwindow, y, hooks); // S.A.M: the MOD SETTINGS section; adds nothing while no loaded mod has a setting
+		hookSettings(*settings_subwindow, hooks);
 
 		settingsSubwindowFinalize(*settings_subwindow, y, {Setting::Type::Boolean, "fast_restart"});
 		settingsSelect(*settings_subwindow, {Setting::Type::Boolean, "fast_restart"});
@@ -7344,6 +7612,7 @@ bind_failed:
                         allSettings.bindings.gamepad_bindings[bound_player].emplace(binding.action, binding.gamepad);
                         allSettings.bindings.joystick_bindings[bound_player].emplace(binding.action, binding.joystick);
                     }
+                    samSeedModBindings(allSettings.bindings.kb_mouse_bindings[bound_player], allSettings.bindings.gamepad_bindings[bound_player], allSettings.bindings.joystick_bindings[bound_player]); // S.A.M: a profile switch keeps the mod rows
                     
                     // using the "Minimal" layout causes facehotbar / "Modern" hotbar from working at all.
                     // so make sure to disable that when Minimal is selected.
@@ -8647,6 +8916,53 @@ bind_failed:
 		return 5369;
 	}
 
+	// ---- S.A.M custom races appended to the character-select race picker -------
+	// The vanilla picker has `num_races` (14) UI slots. Custom races are appended
+	// after them: a UI index c >= num_races addresses SAM race (c - num_races).
+	// These helpers keep the picker build loop and the click handler in lock-step;
+	// with no race mod loaded SAMRaces::count()==0 and everything below is inert.
+	int samTotalRaces() { return num_races + (int)SAMRaces::count(); }
+	// Button identity string (the strcmp key) for UI index c: the language name for
+	// a vanilla race, the unique "ns:race" id for a SAM race (so it can never collide
+	// with another race's display name).
+	std::string samRaceButtonName(int c)
+	{
+		if ( c >= num_races )
+		{
+			const SAMRaceDef* d = SAMRaces::get(SAMRaces::raceIdAtIndex(c - num_races));
+			return d ? d->id : std::string("sam:race");
+		}
+		return Language::get(getLangEntryForMainMenuRaceName(c));
+	}
+	// Visible label text for UI index c.
+	std::string samRaceLabel(int c)
+	{
+		if ( c >= num_races )
+		{
+			const SAMRaceDef* d = SAMRaces::get(SAMRaces::raceIdAtIndex(c - num_races));
+			return d ? d->name : std::string("Race");
+		}
+		return Language::get(getLangEntryForMainMenuRaceName(c));
+	}
+	// The playerRace id for UI index c (vanilla +4 monster-only skip, then SAM ids).
+	int samRaceIdForIndex(int c)
+	{
+		if ( c >= num_races ) { return SAMRaces::raceIdAtIndex(c - num_races); }
+		int pickedRace = RACE_HUMAN + c;
+		if ( pickedRace > RACE_INSECTOID ) { pickedRace += 4; }
+		return pickedRace;
+	}
+	// Name shown on the CLOSED race button + scoreboards for a race id.
+	std::string samClosedRaceName(int race)
+	{
+		if ( race >= SAM_RACE_ID_BASE )
+		{
+			std::string n = SAMRaces::displayName(race);
+			return n.empty() ? std::string("Race") : n;
+		}
+		return Language::get(getLangEntryForPlayerRaceName(race));
+	}
+
     static void createLeaderboards(std::string leaderboard_type) {
         assert(main_menu_frame);
 
@@ -9440,7 +9756,7 @@ bind_failed:
             assert(character_title);
             snprintf(buf, sizeof(buf), Language::get(5298),
                 score->stats->LVL,
-                Language::get(getLangEntryForPlayerRaceName(score->stats->playerRace)),
+                samClosedRaceName(score->stats->playerRace).c_str(),
                 playerClassLangEntry(score->classnum, 0));
             character_title->setText(buf);
 
@@ -11204,6 +11520,9 @@ bind_failed:
 				if (*cvar_enableKeepAlives) {
 					if (clientHasLostP2P || (ticks - client_keepalive[i] > TICKS_PER_SECOND * TIMEOUT_TIME)) {
 						client_disconnected[i] = true;
+						// S.A.M: player.on_player_joined fired when they joined this lobby, so their
+						// leave fires too (before anything reuses the slot).
+						SAMMpInput::firePlayerLeft(i);
 						strncpy((char*)(net_packet->data), "DISC", 4);
 						net_packet->data[4] = i;
 						net_packet->len = 5;
@@ -11372,8 +11691,20 @@ bind_failed:
                 (stats[player]->playerRace & 0xff);
             SDLNet_Write32(raceAndAppearance, &net_packet->data[45]);
 
+            // S.A.M: the race byte above is this machine's own load-order number and means
+            // nothing anywhere else. Append the stable key so every receiver -- including the
+            // peers the host relays this packet to VERBATIM, before it parses it -- can look
+            // the race up in its own registry. Appended, not widened: a peer on an older build
+            // reads len 49, never sees it, and behaves exactly as it does today. Written only
+            // when a race mod is loaded, so a vanilla lobby's packets do not change at all.
+
             // send packet
             net_packet->len = 49;
+            if ( SAMRaces::any() )
+            {
+                SDLNet_Write32(SAMRaces::raceKeyFor(stats[player]->playerRace), &net_packet->data[49]);
+                net_packet->len = 53;
+            }
 	        if (multiplayer == SERVER) {
 		        for (int i = 1; i < MAXPLAYERS; i++ ) {
 			        if ( client_disconnected[i] ) {
@@ -11404,6 +11735,7 @@ bind_failed:
 			addLobbyChatMessage(uint32ColorRed, buf);
 
 			client_disconnected[index] = true;
+			SAMMpInput::firePlayerLeft(index);   // S.A.M: a kick is a leave, for player.on_player_left
 
 #ifdef STEAMWORKS
             if (steamIDRemote[index - 1]) {
@@ -11809,6 +12141,15 @@ bind_failed:
 	        stats[player]->stat_appearance = std::min<Uint32>((Uint32)((raceAndAppearance & 0xFF00) >> 8), (Uint32)(NUMAPPEARANCES - 1));
 	        stats[player]->playerRace = (raceAndAppearance & 0xFF);
 
+	        // S.A.M: prefer the appended stable race key over the raw byte, which is only the
+	        // sender's own load-order number. -1 means we do not have that race, and then the
+	        // byte is left alone so the existing degrade path still applies.
+	        if ( net_packet->len >= 53 )
+	        {
+	            const int samLocal = SAMRaces::raceIdForKey(SDLNet_Read32(&net_packet->data[49]));
+	            if ( samLocal >= 0 ) { stats[player]->playerRace = samLocal; }
+	        }
+
 			if (!loadingsavegame) {
 				initClass(player);
 			}
@@ -11898,6 +12239,12 @@ bind_failed:
 				sendPacketSafe(net_sock, -1, net_packet, c - 1);
 			}
 
+			// S.A.M: the lobby leave fired no event while player.on_player_joined had fired for them,
+			// so a mod pairing the two (per-slot setup and teardown) was left unbalanced. Fired only
+			// AFTER the forward above: that loop re-sends net_packet as it stands, and a handler that
+			// sends anything (a message, a packet) writes into that same buffer.
+			SAMMpInput::firePlayerLeft(player);
+
 			char buf[1024];
 			snprintf(buf, sizeof(buf), Language::get(5333), players[player]->getAccountName());
 			addLobbyChatMessage(uint32ColorYellow, buf);
@@ -11921,7 +12268,14 @@ bind_failed:
 		// request only sends a benign, receiver-deduped packet — no OOB, no info leak.
 		{ 'SAMF', []() {
 			if ( net_packet->len < 5 ) { return; }
-			SAMSync::sendFingerprint(net_packet->data[4]);
+			// Six bytes means "I got it and I am running S.A.M", five means "please re-send".
+			// An older client only ever sends five, so it keeps getting the fingerprint.
+			if ( net_packet->len >= 6 && net_packet->data[5] != 0 )
+			{
+				SAMSync::noteClientAck(net_packet->data[4]);
+				return;
+			}
+			SAMSync::sendFingerprint(net_packet->data[4], true); // solicited: answer even with no mods
 		} },
 
 		// client requesting new svFlags
@@ -12238,6 +12592,12 @@ bind_failed:
                 // S.A.M: clamp — raw network byte, never validated.
                 stats[player]->stat_appearance = std::min<Uint32>((Uint32)((raceAndAppearance & 0xFF00) >> 8), (Uint32)(NUMAPPEARANCES - 1));
                 stats[player]->playerRace = (raceAndAppearance & 0xFF);
+                // S.A.M: prefer the appended stable race key; see the host handler above.
+                if ( net_packet->len >= 53 )
+                {
+                    const int samLocal = SAMRaces::raceIdForKey(SDLNet_Read32(&net_packet->data[49]));
+                    if ( samLocal >= 0 ) { stats[player]->playerRace = samLocal; }
+                }
 				if (!loadingsavegame) {
 					initClass(player);
 				}
@@ -12326,6 +12686,9 @@ bind_failed:
 			{
 				return; // more chunks pending
 			}
+			// Answer regardless of whether it matched: the host is asking "are you running
+			// S.A.M at all", and a mismatch still means yes.
+			SAMSync::acknowledgeFingerprint();
 			if ( !SAMSync::hasMismatch() )
 			{
 				return; // fingerprints match — logged, nothing to show
@@ -12645,6 +13008,19 @@ bind_failed:
 						// S.A.M: clamp — raw network byte, never validated.
 						stats[c]->stat_appearance = std::min<Uint32>((Uint32)net_packet->data[8 + c * chunk_size + 4], (Uint32)(NUMAPPEARANCES - 1)); // appearance
 						stats[c]->playerRace = net_packet->data[8 + c * chunk_size + 5]; // player race
+						// S.A.M: and prefer the stable race key from the tail that sits behind
+						// the class tail, because the byte above is the HOST's load-order
+						// number. A host on an older build, or a lobby with no race mods, sends
+						// no race tail and the length check leaves the byte alone.
+						{
+							const int samRaceTail = 8 + MAXPLAYERS * chunk_size + MAXPLAYERS * 4;
+							if ( (int)net_packet->len >= samRaceTail + MAXPLAYERS * 4 )
+							{
+								const int samLocal = SAMRaces::raceIdForKey(
+									SDLNet_Read32(&net_packet->data[samRaceTail + c * 4]));
+								if ( samLocal >= 0 ) { stats[c]->playerRace = samLocal; }
+							}
+						}
 						stringCopy(stats[c]->name, (char*)(net_packet->data + 8 + c * chunk_size + 6), sizeof(Stat::name), 32); // name
 
 						if (loadingsavegame) {
@@ -13631,6 +14007,29 @@ failed:
 		return result;
 	}
 
+	// S.A.M #50: the random-class pool as IDS, so a custom class (id >= SAM_CLASS_ID_BASE) can
+	// be rolled. The vanilla half is built in the SAME order/count as reducedClassList(), then
+	// custom classes are appended — so with no mod loaded (SAMClasses::count()==0) the pool and
+	// the RNG draw are byte-identical to before. Returns ids, not names, which is what avoids
+	// the classes_in_order[] out-of-bounds when a custom id gets picked.
+	std::vector<int> reducedClassIdList(int index) {
+		std::vector<int> result;
+		result.reserve(num_classes + SAMClasses::count());
+		for (int c = CLASS_BARBARIAN; c <= CLASS_PALADIN; ++c) {
+			if (isCharacterValidFromDLC(*stats[index], c) == VALID_OK_CHARACTER) {
+				result.emplace_back(c);
+			}
+		}
+		for (int i = 0; i < SAMClasses::count(); ++i) {
+			const int id = SAMClasses::classIdAtIndex(i);
+			if (id >= SAM_CLASS_ID_BASE
+				&& isCharacterValidFromDLC(*stats[index], id) == VALID_OK_CHARACTER) {
+				result.emplace_back(id);
+			}
+		}
+		return result;
+	}
+
 	void RaceDescriptions::update_details_text(Frame& card, int race, int modified_race)
 	{
 		auto& raceDescriptionData = RaceDescriptions::getMonsterDescriptionData(modified_race);
@@ -13789,6 +14188,47 @@ failed:
 		update_details_text(card, race, modifiedRace);
 	}
 
+	// S.A.M #47: set a stat-rating bar's colour + growth image from a "bad".."good" word.
+	// Factored from the vanilla update_stat_growths body so the custom path and the vanilla
+	// path render identically (same colours, same image files, same disabled logic). Defined
+	// here, above the first user (update_stat_growths), so both it and the character-select
+	// lambdas below can call it.
+	static void samSetStatRatingVisual(Field& field, Frame* parent, int slot, const std::string& rating)
+	{
+		const Uint32 good = makeColorRGB(0,191,255), decent = good,
+			average = makeColorRGB(191,191,191), poor = makeColorRGB(255,64,0), bad = poor;
+		const char* img = "statgrowth_neutral.png"; Uint32 col = average;
+		if      ( rating == "bad" )    { col = bad;    img = "statgrowth_lo2.png"; }
+		else if ( rating == "poor" )   { col = poor;   img = "statgrowth_lo1.png"; }
+		else if ( rating == "decent" ) { col = decent; img = "statgrowth_hi1.png"; }
+		else if ( rating == "good" )   { col = good;   img = "statgrowth_hi2.png"; }
+		field.setColor(col);
+		if ( parent )
+		{
+			char b[32]; snprintf(b, sizeof(b), "stat img bottom %d", slot);
+			if ( auto im = parent->findImage(b) )
+			{
+				im->disabled = false;
+				im->path = std::string("*#images/ui/Main Menus/Play/PlayerCreation/ClassSelection/") + img;
+			}
+		}
+	}
+	// value 1..5 -> difficulty-star colour. line 0 (attack) direct, line 1 (survival) inverted.
+	static Uint32 samDifficultyColor(int value, int line)
+	{
+		const Uint32 good = makeColorRGB(0,191,255), decent = good,
+			average = makeColorRGB(191,191,191), poor = makeColorRGB(255,64,0), bad = poor;
+		switch ( value )
+		{
+			case 1: return line == 0 ? bad    : good;
+			case 2: return line == 0 ? poor   : decent;
+			case 3: return average;
+			case 4: return line == 0 ? decent : poor;
+			case 5: return line == 0 ? good   : bad;
+			default: return average;
+		}
+	}
+
 	void ClassDescriptions::update_stat_growths(Frame& card, int classnum, int shapeshiftedType)
 	{
 		// stats definitions
@@ -13818,6 +14258,25 @@ failed:
 				break;
 			default:
 				break;
+		}
+
+		// S.A.M #47: the in-game class-info panel, same ratings from the registry. Placed AFTER
+		// the shapeshift switch so a shapeshifted custom-class player still shows the monster's
+		// ratings (classnum was remapped to 100..103 above). Returns before the vanilla map read.
+		if ( classnum >= SAM_CLASS_ID_BASE )
+		{
+			const SAMClassDef* d = SAMClasses::getClass(classnum);
+			for ( int c = 0; c < num_class_stats; ++c )
+			{
+				char nm[16]; snprintf(nm, sizeof(nm), "%d", c);
+				if ( auto field = card.findField(nm) )
+				{
+					const std::string r = (d && c < (int)d->statRatings.size())
+						? d->statRatings[c] : std::string("average");
+					samSetStatRatingVisual(*field, &card, c, r);
+				}
+			}
+			return;
 		}
 
 		if ( ClassDescriptions::data.find(classnum) == ClassDescriptions::data.end() )
@@ -13886,6 +14345,35 @@ failed:
 	void RaceDescriptions::update_details_text(Frame& card) {
 		const int index = card.getOwner();
 		const int race = stats[index]->playerRace;
+
+		// S.A.M custom races (ids >= SAM_RACE_ID_BASE): fill the card from the registered def.
+		// getRaceKey()'s switch returns "" for a modded id, i.e. a blank card, so short-circuit
+		// here. Use setColor (reflow-safe), NEVER addColorToLine: a free-form description reflows
+		// to fit and the vanilla per-line color map (keyed to pre-reflow structure) then desyncs
+		// and Text::render() indexes a null color array -> crash. Same lesson as the class arm.
+		if ( race >= SAM_RACE_ID_BASE )
+		{
+			const SAMRaceDef* d = SAMRaces::get(race);
+			if ( auto details_title = card.findField("details_title") ) {
+				details_title->clearLinesToColor();
+				details_title->clearIndividualLinePadding();
+				details_title->setText(d ? d->name.c_str() : "");
+				details_title->setColor(hudColors.characterDLC3ClassText);
+			}
+			if ( auto details_text = card.findField("details") ) {
+				details_text->clearLinesToColor();
+				details_text->clearIndividualLinePadding();
+				details_text->setText(d ? d->description.c_str() : "");
+				details_text->setColor(color_dlc0);
+			}
+			if ( auto details_text_right = card.findField("details_right") ) {
+				details_text_right->clearLinesToColor();
+				details_text_right->clearIndividualLinePadding();
+				details_text_right->setText("");
+				details_text_right->setColor(color_dlc0);
+			}
+			return;
+		}
 
 	    // color title
 	    Uint32 color_race;
@@ -14085,9 +14573,9 @@ failed:
 		bool fixedClass = gameModeManager.currentSession.challengeRun.isActive()
 			&& gameModeManager.currentSession.challengeRun.classnum >= 0 && gameModeManager.currentSession.challengeRun.classnum <= NUMCLASSES;
 
-		for (int c = 0; c < num_races; ++c) {
-			auto race = Language::get(getLangEntryForMainMenuRaceName(c));
-			if (strcmp(button.getName(), race) == 0) {
+		for (int c = 0; c < samTotalRaces(); ++c) {
+			std::string race = samRaceButtonName(c);
+			if (strcmp(button.getName(), race.c_str()) == 0) {
 				if ( fixedRace && !override_dlc && gameModeManager.currentSession.challengeRun.race != c )
 				{
 					// this class is not available to the player
@@ -14119,11 +14607,7 @@ failed:
 				{
                     success = true;
 
-					int pickedRace = RACE_HUMAN + c;
-					if ( pickedRace > RACE_INSECTOID )
-					{
-						pickedRace += 4;
-					}
+					int pickedRace = samRaceIdForIndex(c);
                     if (stats[index]->playerRace != pickedRace ) {
                         stats[index]->playerRace = pickedRace;
                         if (!inputs.hasController(index)) {
@@ -14193,10 +14677,10 @@ failed:
 				break;
 			}
 		}
-		for (int c = 0; c < num_races; ++c) {
+		for (int c = 0; c < samTotalRaces(); ++c) {
 			// clear other buttons
-			auto race = Language::get(getLangEntryForMainMenuRaceName(c));
-			auto other_button = frame->findButton(race);
+			std::string race = samRaceButtonName(c);
+			auto other_button = frame->findButton(race.c_str());
 			if (other_button != &button) {
 				other_button->setPressed(false);
 			}
@@ -15990,7 +16474,7 @@ failed:
 		subframe->setSize(details ?
 		    SDL_Rect{38, 382, 234, 106}:
 		    SDL_Rect{38, 68, 234, 208});
-		subframe->setActualSize(SDL_Rect{0, 0, 234, 36 * num_races});
+		subframe->setActualSize(SDL_Rect{0, 0, 234, 36 * samTotalRaces()});
 		subframe->setBorder(0);
 		subframe->setColor(0);
 		subframe->setTickCallback([](Widget& widget){
@@ -16047,8 +16531,8 @@ failed:
 		    "gradient");
 		gradient->ontop = true;
 
-        for (int c = 0; c < num_races; ++c) {
-		    auto race = subframe->addButton(Language::get(getLangEntryForMainMenuRaceName(c)));
+        for (int c = 0; c < samTotalRaces(); ++c) {
+		    auto race = subframe->addButton(samRaceButtonName(c).c_str());
 		    race->setSize(SDL_Rect{0, c * 36 + 2, 30, 30});
 
 			bool fixedRace = gameModeManager.currentSession.challengeRun.isActive()
@@ -16104,14 +16588,14 @@ failed:
 		    race->addWidgetAction("MenuPageRightAlt", "chat");
 		    race->addWidgetAction("MenuPageLeftAlt", "privacy");
 		    race->setWidgetBack("back_button");
-		    if (c < num_races - 1) {
-		        race->setWidgetDown(Language::get(getLangEntryForMainMenuRaceName(c + 1)));
+		    if (c < samTotalRaces() - 1) {
+		        race->setWidgetDown(samRaceButtonName(c + 1).c_str());
 		    }
 		    /*else {
 		        race->setWidgetDown("disable_abilities");
 		    }*/
 		    if (c > 0) {
-		        race->setWidgetUp(Language::get(getLangEntryForMainMenuRaceName(c - 1)));
+		        race->setWidgetUp(samRaceButtonName(c - 1).c_str());
 		    }
 		    race->setGlyphPosition(Widget::glyph_position_t::CENTERED);
 		    race->addWidgetAction("MenuPageLeft", "male");
@@ -16122,11 +16606,7 @@ failed:
                 race_button_fn(button, false);
                 });
 
-			int pickedRace = RACE_HUMAN + c;
-			if ( pickedRace > RACE_INSECTOID )
-			{
-				pickedRace += 4;
-			}
+			int pickedRace = samRaceIdForIndex(c);
 		    if (stats[index]->playerRace == pickedRace ) {
 			    race->setPressed(true);
 		    }
@@ -16162,7 +16642,7 @@ failed:
                 }
 		        });
 
-		    auto label = subframe->addField((std::string(Language::get(getLangEntryForMainMenuRaceName(c))) + "_label").c_str(), 64);
+		    auto label = subframe->addField((samRaceButtonName(c) + "_label").c_str(), 64);
 		    if (c >= 1 && c <= 4) 
 			{
 		        label->setColor(color_dlc1);
@@ -16179,7 +16659,7 @@ failed:
 			{
 		        label->setColor(color_dlc0);
 		    }
-		    label->setText(Language::get(getLangEntryForMainMenuRaceName(c)));
+		    label->setText(samRaceLabel(c).c_str());
 		    label->setFont(smallfont_outline);
 		    label->setSize(SDL_Rect{32, c * 36, 108, 36});
 		    label->setHJustify(Field::justify_t::LEFT);
@@ -16449,7 +16929,7 @@ failed:
 		disable_abilities->addWidgetAction("MenuPageLeftAlt", "privacy");
 		disable_abilities->setWidgetBack("back_button");
 		disable_abilities->setWidgetDown("show_race_info");
-		disable_abilities->setWidgetUp(Language::get(getLangEntryForMainMenuRaceName(num_races - 1)));
+		disable_abilities->setWidgetUp(samRaceButtonName(samTotalRaces() - 1).c_str());
 		if (stats[index]->playerRace != RACE_HUMAN) {
 			disable_abilities->setPressed(stats[index]->stat_appearance != 0);
 		}
@@ -16783,6 +17263,12 @@ failed:
 			        // indexes a null color array -> crash. setColor is reflow-safe
 			        // and works for any description (empty, short, or wrapping).
 			        field.setColor(color_dlc0);
+			        // S.A.M: drop per-line colouring left behind by a PREVIOUSLY viewed vanilla
+			        // class. addColorToLine writes a map that setColor does not touch, so a DLC
+			        // class's line-0 tint leaks onto the next custom description -- and that map
+			        // is keyed to the OLD text's line structure, which is exactly the reflow
+			        // desync described above. Clearing it is what makes setColor actually safe.
+			        field.clearLinesToColor();
 			        field.clearIndividualLinePadding();
 			        return;
 			    }
@@ -16829,6 +17315,18 @@ failed:
 		    for (int c = 0; c < num_class_stats; ++c) {
 		        static auto class_stat_fn = [](Field& field, int index){
 			        const int s = (int)strtol(field.getName(), nullptr, 10);
+			        // S.A.M #47: a custom class shows its DECLARED stat ratings. Returns before
+			        // the neutral fallback below, so a rated custom class draws real bars; an
+			        // unrated one falls through to the grey/disabled path. First branch => reachable.
+			        if ( client_classes[index] >= SAM_CLASS_ID_BASE )
+			        {
+			            const SAMClassDef* d = SAMClasses::getClass(client_classes[index]);
+			            if ( d && s >= 0 && s < (int)d->statRatings.size() )
+			            {
+			                samSetStatRatingVisual(field, static_cast<Frame*>(field.getParent()), s, d->statRatings[s]);
+			                return;
+			            }
+			        }
 			        // S.A.M FIX: ClassDescriptions::data is a std::map keyed by class enum.
 			        // Custom/S.A.M classes (ids >= SAM_CLASS_ID_BASE) and any id without a
 			        // vanilla description have NO key here. The old code clamped to
@@ -16958,7 +17456,15 @@ failed:
 					// entry every frame for custom/S.A.M classes; show a neutral 20/20.
 					auto descIt = ClassDescriptions::data.find(client_classes[index]);
 					char buf[hpmp_buf_size];
-					if ( descIt != ClassDescriptions::data.end() )
+					if ( client_classes[index] >= SAM_CLASS_ID_BASE )
+					{
+						// S.A.M #47: custom class HP/MP = human baseline + the class's declared
+						// deltas -- the same sum applyStats performs (MAXHP += def->hp).
+						const SAMClassDef* d = SAMClasses::getClass(client_classes[index]);
+						snprintf(buf, sizeof(buf), "%d\n%d",
+							DEFAULT_HP + (d ? d->hp : 0), DEFAULT_MP + (d ? d->mp : 0));
+					}
+					else if ( descIt != ClassDescriptions::data.end() )
 					{
 						snprintf(buf, sizeof(buf), "%d\n%d",
 							descIt->second.hp,
@@ -17006,6 +17512,23 @@ failed:
 		        // have no survivalComplexity entry, so show a neutral difficulty instead of
 		        // dereferencing an empty vector.
 		        auto descIt = ClassDescriptions::data.find(client_classes[index]);
+		        // S.A.M #47: a custom class shows its DECLARED difficulty stars. Returns before
+		        // the neutral fallback; an undeclared custom class still shows neutral "***".
+		        if ( client_classes[index] >= SAM_CLASS_ID_BASE )
+		        {
+		            const SAMClassDef* d = SAMClasses::getClass(client_classes[index]);
+		            if ( d && d->difficultyAttack > 0 && d->difficultySurvival > 0 )
+		            {
+		                field.addColorToLine(0, samDifficultyColor(d->difficultyAttack, 0));
+		                field.addColorToLine(1, samDifficultyColor(d->difficultySurvival, 1));
+		                char sbuf[star_buf_size];
+		                snprintf(sbuf, sizeof(sbuf), "%s\n%s",
+		                    std::string(d->difficultyAttack, '*').c_str(),
+		                    std::string(d->difficultySurvival, '*').c_str());
+		                field.setText(sbuf);
+		                return;
+		            }
+		        }
 		        if ( descIt == ClassDescriptions::data.end()
 		            || descIt->second.survivalComplexity.size() < 2 )
 		        {
@@ -17192,19 +17715,25 @@ failed:
             const int index = button.getOwner();
             soundActivate();
 
-            auto reduced_class_list = reducedClassList(index);
-            auto random_class = reduced_class_list[RNG.uniform(0, (int)reduced_class_list.size() - 1)];
-            for (int c = 0; c < num_classes; ++c) {
-               if (strcmp(random_class, classes_in_order[c]) == 0) {
-                   client_classes[index] = c;
-                   break;
-               }
-            }
+            // S.A.M #50: pick from the ID pool so custom classes (id >= 1000) can be rolled.
+            auto reduced_class_list = reducedClassIdList(index);
+            client_classes[index] = reduced_class_list[RNG.uniform(0, (int)reduced_class_list.size() - 1)];
             if (inputs.hasController(index)) {
                 auto frame = static_cast<Frame*>(button.getParent());
                 auto subframe = frame->findFrame("subframe"); assert(subframe);
+                // The selected button's name is the class-id STRING for a custom class, else the
+                // classes_in_order[] name. NEVER index classes_in_order[] with a raw custom id
+                // (>= 1000) — that array is [num_classes], so it would read out of bounds (crash).
+                const char* sel_name = "";
+                if (client_classes[index] >= SAM_CLASS_ID_BASE) {
+                    const SAMClassDef* samdef = SAMClasses::getClass(client_classes[index]);
+                    sel_name = samdef ? samdef->id.c_str() : "";
+                } else {
+                    const int ci = std::min(std::max(0, client_classes[index]), num_classes - 1);
+                    sel_name = classes_in_order[ci];
+                }
                 for (auto button : subframe->getButtons()) {
-                    if (strcmp(button->getName(), classes_in_order[client_classes[index]]) == 0) {
+                    if (strcmp(button->getName(), sel_name) == 0) {
                         button->select();
                         break;
                     }
@@ -17531,6 +18060,24 @@ failed:
 			}
 			sambutton->setColor(makeColor(255, 255, 255, 255));
 			sambutton->setHighlightColor(makeColor(255, 255, 255, 255));
+			// S.A.M: vanilla classes swap between TWO icon files as selection changes (see the
+			// button_fn above: full_class.image vs image_highlighted). A custom class only ever
+			// had one, assigned once here, so it sat at a single brightness in every state and
+			// looked wrong next to the built-in classes. When the mod supplies portrait_selected,
+			// do exactly what vanilla does, on the same three conditions.
+			if ( samdef && !samdef->portraitSelectedPath.empty() && !samdef->portraitPath.empty() )
+			{
+				sambutton->setTickCallback([](Widget& widget){
+					auto* b = static_cast<Button*>(&widget);
+					const int owner = widget.getOwner();
+					const int id = SAMClasses::classIdForIdString(b->getName());
+					if ( id < 0 ) { return; }
+					const SAMClassDef* d = SAMClasses::getClass(id);
+					if ( !d || d->portraitSelectedPath.empty() || d->portraitPath.empty() ) { return; }
+					const bool on = b->isSelected() || b->isHighlighted() || client_classes[owner] == id;
+					b->setIcon(("*" + (on ? d->portraitSelectedPath : d->portraitPath)).c_str());
+				});
+			}
 			sambutton->setSize(SDL_Rect{ 8 + (pos % 4) * 54, 6 + (pos / 4) * 54, 54, 54 });
 			if ( client_classes[index] == samClassId )
 			{
@@ -17563,6 +18110,52 @@ failed:
 					}
 				}
 			});
+		}
+
+		// S.A.M: fold the custom-class buttons into the gamepad navigation ring.
+		//
+		// The vanilla loop wires every built-in button left/right/up/down to its NEIGHBOUR, and the
+		// last one wraps setWidgetRight back to classes_in_order[0]. That ring is closed, and the
+		// S.A.M buttons were appended after it with only setWidgetSearchParent and one action -- no
+		// directional wiring at all. So on a controller or a Steam Deck the D-pad could never reach
+		// a custom class: the button drew, the mouse could click it, and the log reported a clean
+		// load, but it was unreachable. That is almost certainly the real shape of the "my mod
+		// loads but the class isn't available" report.
+		//
+		// Rewire the whole grid as one ring in display order. Gated on count() > 0, so a game with
+		// no custom classes keeps vanilla's exact wiring untouched.
+		if ( SAMClasses::count() > 0 )
+		{
+			std::vector<std::string> ring;
+			ring.reserve(num_classes + SAMClasses::count());
+			for ( int c = 0; c < num_classes; ++c ) { ring.push_back(classes_in_order[c]); }
+			for ( int i = 0; i < SAMClasses::count(); ++i )
+			{
+				if ( const SAMClassDef* d = SAMClasses::getClass(SAMClasses::classIdAtIndex(i)) )
+				{
+					ring.push_back(d->id);
+				}
+			}
+			const int ringN = (int)ring.size();
+			for ( int i = 0; i < ringN; ++i )
+			{
+				Button* b = subframe->findButton(ring[i].c_str());
+				if ( !b ) { continue; }
+				b->setWidgetLeft (ring[(i - 1 + ringN) % ringN].c_str());
+				b->setWidgetRight(ring[(i + 1) % ringN].c_str());
+				// The grid is 4 wide, so up/down is a column step; modular so the ends wrap.
+				b->setWidgetUp   (ring[(i - 4 + ringN) % ringN].c_str());
+				b->setWidgetDown (ring[(i + 4) % ringN].c_str());
+				b->setWidgetBack("back_button");
+				if ( i >= num_classes )
+				{
+					// Only the S.A.M buttons are missing these; vanilla already has them.
+					b->addWidgetAction("MenuPageRightAlt", "chat");
+					b->addWidgetAction("MenuPageLeftAlt", "privacy");
+					b->addWidgetAction("MenuAlt1", "randomize_class");
+					b->addWidgetAction("MenuAlt2", "class_info");
+				}
+			}
 		}
 
         if (!selected_button) {
@@ -17991,7 +18584,7 @@ failed:
 		race_button->setColor(makeColor(255, 255, 255, 255));
 		race_button->setHighlightColor(makeColor(255, 255, 255, 255));
 		race_button->setSize(SDL_Rect{166, 166, 108, 52});
-		race_button->setText(Language::get(getLangEntryForPlayerRaceName(stats[index]->playerRace)));
+		race_button->setText(samClosedRaceName(stats[index]->playerRace).c_str());
 		race_button->setFont(smallfont_outline);
 		race_button->setBackground("*images/ui/Main Menus/Play/PlayerCreation/Finalize_Button_RaceBase_00.png");
 		race_button->setBackgroundHighlighted("*images/ui/Main Menus/Play/PlayerCreation/Finalize_Button_RaceBaseHigh_00.png");
@@ -18105,7 +18698,7 @@ failed:
 			}
 
 			auto race_button = card->findButton("race");
-			race_button->setText(Language::get(getLangEntryForPlayerRaceName(stats[index]->playerRace)));
+			race_button->setText(samClosedRaceName(stats[index]->playerRace).c_str());
 
 			// choose a random appearance
 			const int appearance_choice = RNG.uniform(0, NUMAPPEARANCES - 1);
@@ -18145,16 +18738,10 @@ failed:
 
 			if ( !forcedClass )
 			{
-				// select a random class
-				const auto reduced_class_list = reducedClassList(index);
+				// select a random class (S.A.M #50: ID pool, so custom classes can be rolled)
+				const auto reduced_class_list = reducedClassIdList(index);
 				const auto class_choice = RNG.uniform(0, (int)reduced_class_list.size() - 1);
-				const auto random_class = reduced_class_list[class_choice];
-				for (int c = 0; c < num_classes; ++c) {
-					if (strcmp(random_class, classes_in_order[c]) == 0) {
-						client_classes[index] = c;
-						break;
-					}
-				}
+				client_classes[index] = reduced_class_list[class_choice];
 			}
 			else
 			{
@@ -18203,6 +18790,27 @@ failed:
 		(*class_text->getTickCallback())(*class_text);
 
 		static auto class_button_tick_fn = [](Button& button, int index) {
+			// S.A.M custom class (id >= SAM_CLASS_ID_BASE): draw its own portrait, exactly
+			// like the selection grid does (see the sambutton block above). The vanilla path
+			// below clamps client_classes to num_classes-1, so a custom id would resolve to the
+			// LAST vanilla class and show that class's icon — the "fallback icon" bug on the
+			// character-creation summary card.
+			if ( client_classes[index] >= SAM_CLASS_ID_BASE )
+			{
+				button.setBackground("*images/ui/Main Menus/Play/PlayerCreation/ClassSelection/ClassSelect_IconBGBase_00.png");
+				button.setBackgroundHighlighted("*images/ui/Main Menus/Play/PlayerCreation/ClassSelection/ClassSelect_IconBGBaseHigh_00.png");
+				button.setBackgroundActivated("*images/ui/Main Menus/Play/PlayerCreation/ClassSelection/ClassSelect_IconBGBasePress_00.png");
+				const SAMClassDef* samdef = SAMClasses::getClass(client_classes[index]);
+				if ( samdef && !samdef->portraitPath.empty() )
+				{
+					button.setIcon(("*" + samdef->portraitPath).c_str());
+				}
+				else
+				{
+					button.setIcon("*images/ui/Main Menus/Play/PlayerCreation/ClassSelection/ClassSelect_Icon_Barbarian_00.png");
+				}
+				return;
+			}
 			int i = std::min(std::max(0, client_classes[index]), num_classes - 1);
 			auto find = classes.find(classes_in_order[i]);
 			if (find != classes.end()) {
@@ -25363,6 +25971,7 @@ failed:
 
 		settings_tab_name = "";
 		settingsMount();
+		SAMSettings::beginEdit(); // S.A.M: mod settings are edited as a copy until Confirm, like everything else in this window
 
 		auto dimmer = main_menu_frame->addFrame("dimmer");
 		dimmer->setSize(SDL_Rect{0, 0, Frame::virtualScreenX, Frame::virtualScreenY});
@@ -25611,6 +26220,7 @@ failed:
 		restore_defaults->setHideKeyboardGlyphs(false);
 		restore_defaults->setCallback([](Button& button){
 			settingsReset();
+			SAMSettings::stageDefaults(); // S.A.M: mod settings go back to their defaults with everything else; Confirm makes it real
 			auto settings = static_cast<Frame*>(button.getParent()); assert(settings);
 			std::vector<const char*> tabs = {
 				"Controls",
@@ -25666,6 +26276,7 @@ failed:
 					setRecordDevice(current_recording_audio_device);
 #endif
 					setGlobalVolume(master_volume, musvolume, sfxvolume, sfxAmbientVolume, sfxEnvironmentVolume, sfxNotificationVolume);
+					SAMSettings::discardEdit(); // S.A.M: the mod settings' edited copy goes with everything else
 					if (main_menu_frame) {
 						auto buttons = main_menu_frame->findFrame("buttons"); assert(buttons);
 						auto settings_button = buttons->findButton("Settings"); assert(settings_button);
@@ -25693,6 +26304,7 @@ failed:
 					setRecordDevice(current_recording_audio_device);
 #endif
 					setGlobalVolume(master_volume, musvolume, sfxvolume, sfxAmbientVolume, sfxEnvironmentVolume, sfxNotificationVolume);
+					SAMSettings::discardEdit(); // S.A.M: the mod settings' edited copy goes with everything else
 					if ( main_menu_frame ) {
 						auto buttons = main_menu_frame->findFrame("buttons"); assert(buttons);
 						auto settings_button = buttons->findButton("Settings"); assert(settings_button);
@@ -25771,6 +26383,7 @@ failed:
 		confirm_and_exit->setCallback([](Button& button){
             settingsApply();
 			(void)settingsSave();
+			SAMSettings::commitEdit(); // S.A.M: mod settings become real here too; mod.on_setting_changed fires for each that changed
 
 			static auto return_to_main_menu = [](Button& button){
 				if (main_menu_frame) {
@@ -26793,6 +27406,25 @@ failed:
 			});
 		version->setColor(0xffffffff);
 
+		auto samBadge = main_menu_frame->addField("sam_framework", 48);
+		samBadge->setFont(smallfont_outline);
+		samBadge->setText("S.A.M Framework");
+		samBadge->setHJustify(Field::justify_t::RIGHT);
+		samBadge->setVJustify(Field::justify_t::BOTTOM);
+		samBadge->setSize(SDL_Rect{ Frame::virtualScreenX - 304, Frame::virtualScreenY - 78, 300, 24 });
+		samBadge->setColor(0xffffffff); // white, matching Barony's version text
+			samEnsureBadgeImage();
+			{
+				// Place the shield just left of the (right-justified) text, using the MEASURED text
+				// width so it hugs the text no matter how long the version string is.
+				int samTextW = 0, samTextH = 0;
+				if ( Font* samF = Font::get(smallfont_outline) ) { samF->sizeText("S.A.M Framework", &samTextW, &samTextH); }
+				const int samIconSz = 26;
+				const int samIconX = (Frame::virtualScreenX - 4) - samTextW - samIconSz; // snug to the text
+				main_menu_frame->addImage(SDL_Rect{ samIconX, Frame::virtualScreenY - 77, samIconSz, samIconSz }, 0xffffffff, "mods/sam_badge.png", "sam_framework_icon");
+			}
+
+
 		auto start = main_menu_frame->addFrame("start");
 		start->setBorder(0);
 		start->setColor(0);
@@ -27708,6 +28340,25 @@ failed:
 				});
 			version->setColor(0xffffffff);
 
+			auto samBadge = main_menu_frame->addField("sam_framework", 48);
+			samBadge->setFont(smallfont_outline);
+			samBadge->setText("S.A.M Framework");
+			samBadge->setHJustify(Field::justify_t::RIGHT);
+			samBadge->setVJustify(Field::justify_t::BOTTOM);
+			samBadge->setSize(SDL_Rect{ Frame::virtualScreenX - 304, Frame::virtualScreenY - 78, 300, 24 });
+			samBadge->setColor(0xffffffff); // white, matching Barony's version text
+			samEnsureBadgeImage();
+			{
+				// Place the shield just left of the (right-justified) text, using the MEASURED text
+				// width so it hugs the text no matter how long the version string is.
+				int samTextW = 0, samTextH = 0;
+				if ( Font* samF = Font::get(smallfont_outline) ) { samF->sizeText("S.A.M Framework", &samTextW, &samTextH); }
+				const int samIconSz = 26;
+				const int samIconX = (Frame::virtualScreenX - 4) - samTextW - samIconSz; // snug to the text
+				main_menu_frame->addImage(SDL_Rect{ samIconX, Frame::virtualScreenY - 77, samIconSz, samIconSz }, 0xffffffff, "mods/sam_badge.png", "sam_framework_icon");
+			}
+
+
 #ifdef STEAMWORKS
 			auto online_players = main_menu_frame->addField("online_players", 32);
 			online_players->setFont(smallfont_outline);
@@ -27854,6 +28505,19 @@ failed:
         }
 	    const bool madetop = placement <= MAXTOPSCORES;
 	    scoreDeconstructor((void*)score);
+
+		// S.A.M: the run is over and the score is settled. Fired before the window is built
+		// so a mod can record the outcome while the numbers are still in scope. Not
+		// cancellable: the run has already ended by the time anything reaches here.
+		{
+			SamEvent samOverEv("player.on_game_over");
+			samOverEv.i("player", (long long)player)
+				.i("tutorial", tutorial ? 1 : 0)
+				.i("survived", survivingPlayer ? 1 : 0)
+				.i("placement", (long long)placement)
+				.i("made_top", madetop ? 1 : 0);
+			samOverEv.fire();
+		}
 
 		// identify all inventory items
 		if (!survivingPlayer) {

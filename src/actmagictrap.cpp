@@ -22,6 +22,8 @@
 #include "magic/magic.hpp"
 #include "prng.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_js_runtime.hpp"
 
 /*-------------------------------------------------------------------------------
 
@@ -298,6 +300,29 @@ void actMagicTrap(Entity* my)
 		if ( !map.tiles[OBSTACLELAYER + v * MAPLAYERS + u * MAPLAYERS * map.height] )
 		{
 			Entity* entity = castSpell(my->getUID(), getSpellFromID(MAGICTRAP_SPELL), false, true);
+
+			// NOTE: fires ~once per second per active magic trap while powered; mods should throttle.
+			if ( multiplayer != CLIENT )
+			{
+				SAMLua::Event ev;
+				ev.setName("world.on_trap_triggered");
+				ev.s("trap_type", std::string("magic"));
+				ev.i("player", (long long)(-1));
+				ev.i("floor_x", (long long)(my->x / 16));
+				ev.i("floor_y", (long long)(my->y / 16));
+				ev.i("spell", (long long)MAGICTRAP_SPELL);
+				SAMLua::dispatchEvent(ev);
+
+				SAMJs::Event jsev;
+				jsev.setName("world.on_trap_triggered");
+				jsev.s("trap_type", std::string("magic"));
+				jsev.i("player", (long long)(-1));
+				jsev.i("floor_x", (long long)(my->x / 16));
+				jsev.i("floor_y", (long long)(my->y / 16));
+				jsev.i("spell", (long long)MAGICTRAP_SPELL);
+				SAMJs::dispatchEvent(jsev);
+			}
+
 			entity->x = my->x + x;
 			entity->y = my->y + y;
 			entity->z = my->z;

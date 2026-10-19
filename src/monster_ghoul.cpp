@@ -21,6 +21,7 @@
 #include "player.hpp"
 #include "prng.hpp"
 #include "scores.hpp"
+#include "sam_loot.hpp"   // S.A.M: world.on_loot_rolled for the tool a ghoul may carry
 
 void initGhoul(Entity* my, Stat* myStats)
 {
@@ -169,7 +170,10 @@ void initGhoul(Entity* my, Stat* myStats)
 				case 2:
 					if ( rng.rand() % 10 == 0 )
 					{
-						newItem(itemLevelCurve(TOOL, 0, currentlevel, rng), DECREPIT, 1, 1, rng.rand(), false, &myStats->inventory);
+						Item* samTool = newItem(itemLevelCurve(TOOL, 0, currentlevel, rng), DECREPIT, 1, 1, rng.rand(), false, &myStats->inventory);
+						// S.A.M: world.on_loot_rolled once the item exists (vanilla runs no
+						// itemLevelCurvePostProcess here, and adding one would change what it makes).
+						if ( samTool ) { SAMLoot::afterRoll(nullptr, samTool, (int)samTool->type, false); }
 					}
 				case 1:
 					if ( rng.rand() % 4 == 0 )

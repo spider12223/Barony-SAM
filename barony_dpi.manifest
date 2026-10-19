@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  S.A.M: the official Barony build embeds a manifest declaring DPI awareness; a plain
+  MSVC build does not, so our replacement exe was reported as blurry or wrongly scaled
+  on Windows 10 displays above 100%. Without this the OS bitmap stretches the window.
+
+  This is a MERGE input (/MANIFESTINPUT), so it carries only the part the auto generated
+  manifest is missing. The linker keeps its own trustInfo / asInvoker block, and the
+  result matches the official exe.
+
+  Deliberately dpiAware=true (system aware) rather than PerMonitorV2: this exe is a drop
+  in replacement for the shipped one and should scale exactly the way it does.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+    </windowsSettings>
+  </application>
+</assembly>

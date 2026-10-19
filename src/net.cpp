@@ -14,6 +14,14 @@
 #include "game.hpp"
 #include "stat.hpp"
 #include "net.hpp"
+#ifndef EDITOR
+#include "sam_races.hpp"   // isRaceHeadOnMonster (ally-colour propagation)
+static bool samRaceHeadOnMonster(const Entity* e) { return SAMRaces::isRaceHeadOnMonster(e); }
+#else
+static bool samRaceHeadOnMonster(const Entity*) { return false; }
+#endif
+#include <algorithm>
+#include "classdescriptions.hpp" // NUMAPPEARANCES — clamping the network appearance byte
 #include "messages.hpp"
 #include "entity.hpp"
 #include "files.hpp"
@@ -35,6 +43,19 @@
 #include "scores.hpp"
 #include "colors.hpp"
 #include "mod_tools.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
+#include "sam_images.hpp" // S.A.M: mod-supplied pictures (the 'SAMI' overlay packet)
+#include "sam_bodies.hpp" // S.A.M: the 'SAMB' custom-body announcement
+#include "sam_rules.hpp" // S.A.M: the 'SAMM' stat-modifier totals
+#include "sam_net.hpp" // S.A.M: the ordered 'SAMC' / 'SAMQ' channels every multiplayer script call rides
+#include "sam_mp_input.hpp" // S.A.M: revive answers, ghost respawn and leave events, older clients' 'SAMA'
+#include "sam_mp_entities.hpp" // S.A.M: script-made entities on the ENTU tail, NOUP, the client bind
+#include "sam_world.hpp"       // S.A.M: terrain the host changed, and stale client path maps
+#include "sam_sounds.hpp"
+#include "sam_music.hpp"
+#include "sam_logger.hpp" // SAM_WARN for the player-bind fallback notice
+#include "sam_js_runtime.hpp"
 #include "lobbies.hpp"
 #include "ui/MainMenu.hpp"
 #include "ui/LoadingScreen.hpp"
@@ -490,10 +511,73 @@ void sendEntityUDP(Entity* entity, int c, bool guarantee)
 		return;
 	}
 
+	// S.A.M: what head a custom-race player wears ON THE WIRE.
+	//
+	// A client decides an entity is a player by testing its head sprite (net.cpp's default arm
+	// calls Entity::isPlayerHeadSprite). That test knows the vanilla player heads, plus any
+	// race head THIS machine has registered -- so it says false on a peer that does not have
+	// the mod. An unrecognised head means the client never binds actPlayer, and an unbound
+	// player entity is pinned where it spawned (the client position block is gated on
+	// behavior != nullptr), never builds its limbs (they are created inside actPlayer) and is
+	// effectively invisible. Reported from the field as "simply standing there" and "im
+	// invisible to them", with the death gibs looking correct -- gibs bind through skill[2]
+	// == -6, which the recovery switch below DOES handle.
+	//
+	// The peer cannot be fixed; it may be a stock 5.0.2 client. So send the host body's
+	// ordinary player head instead. Every client then binds, animates and collides correctly.
+	// Nothing is lost for someone who owns the mod: a S.A.M client re-applies the real race
+	// head every frame in actPlayer, which runs after packet handling. A peer without the mod
+	// sees a plain goatman that MOVES, which is the right answer for content they do not have.
+	//
+	// Wire only. entity->sprite is untouched, so the host's own rendering and every gameplay
+	// predicate that reads sprite are unaffected.
+	// A custom race's head is replaced with the HOST BODY's head for the wire, because a peer
+	// without the mod cannot recognise a custom head: isPlayerHeadSprite() would be false there,
+	// the entity would never be treated as a player, and the character would arrive frozen and
+	// limbless. That is v2.6.1's fix and it stays.
+	//
+	// But the substitution cannot be aimed. It tests only the SENDER, and neither it nor the
+	// per-client loop below can ask whether client `c` has the mod -- no per-client mod knowledge
+	// exists, the fingerprint only travels host -> client. So a peer that owns the art was being
+	// handed a goat head too.
+	//
+	// So say BOTH: the stand-in in data[8] for anyone who needs it, and an appended byte saying
+	// "that is a stand-in, resolve the real one yourself" for anyone who can. Exactly what
+	// serverUpdateEntityBodypart already does for this race's LIMBS, for the same reason.
+	Uint16 samWireSprite = (Uint16)entity->sprite;
+	bool samHeadIsStandIn = false;
+	if ( entity->behavior == &actPlayer )
+	{
+		const int samPn = entity->skill[2];
+		if ( samPn >= 0 && samPn < MAXPLAYERS && stats[samPn]
+			&& stats[samPn]->playerRace >= SAM_RACE_ID_BASE
+			&& SAMRaces::isRaceHeadSprite((int)entity->sprite) )
+		{
+			const int samBody = SAMRaces::hostMonsterForRace(stats[samPn]->playerRace);
+			if ( samBody >= 0 )
+			{
+				samWireSprite = (Uint16)playerHeadSprite((Monster)samBody, stats[samPn]->sex,
+					(int)stats[samPn]->stat_appearance, 0, samPn);
+				samHeadIsStandIn = true;
+				// Once per player per session: four rounds of this bug were diagnosed by reading
+				// rather than looking, so each end of the chain now says what it did.
+				static bool samToldHead[MAXPLAYERS] = { false };
+				if ( samPn >= 0 && samPn < MAXPLAYERS && !samToldHead[samPn] )
+				{
+					samToldHead[samPn] = true;
+					SAM_INFO("SYNC", "player " + std::to_string(samPn) + " race head "
+						+ std::to_string((int)entity->sprite) + " sent as stand-in "
+						+ std::to_string((int)samWireSprite) + " + marker; a peer with the mod"
+						" should swap it back.");
+				}
+			}
+		}
+	}
+
 	// send entity data to the client
 	strcpy((char*)net_packet->data, "ENTU");
 	SDLNet_Write32((Uint32)entity->getUID(), &net_packet->data[4]);
-	SDLNet_Write16((Uint16)entity->sprite, &net_packet->data[8]);
+	SDLNet_Write16(samWireSprite, &net_packet->data[8]);
 	SDLNet_Write16((Sint16)(entity->x * 32), &net_packet->data[10]);
 	SDLNet_Write16((Sint16)(entity->y * 32), &net_packet->data[12]);
 	SDLNet_Write16((Sint16)(entity->z * 32), &net_packet->data[14]);
@@ -542,7 +626,34 @@ void sendEntityUDP(Entity* entity, int c, bool guarantee)
 	}
 	net_packet->address.host = net_clients[c - 1].host;
 	net_packet->address.port = net_clients[c - 1].port;
-	net_packet->len = ENTITY_PACKET_LENGTH;
+	// APPENDED, not widened, following the tag byte on ENTB and the class id on JOIN: a peer on an
+	// older build reads ENTITY_PACKET_LENGTH bytes and never looks at this one. With no race mod
+	// loaded samHeadIsStandIn is always false and the packet is byte-identical to vanilla.
+	//
+	// S.A.M: an entity a framework spawner made (sam_spawn_entity, sam_spawn_projectile, a
+	// companion, a decorative portal) carries two more bytes after the race-head byte: what it is
+	// and one parameter (sam_mp_entities.hpp). A S.A.M client binds it from them BEFORE the sprite
+	// switch in clientActions, which would otherwise claim it by its model -- a script is free to
+	// spawn its entity with the torch or the door model -- and a stock client reads none of it.
+	// wireKind is one empty() test when no script has spawned anything.
+	std::uint8_t samOwnedParam = 0;
+	const std::uint8_t samOwnedKind = SAMMpEntities::wireKind(entity, samOwnedParam);
+	if ( samOwnedKind != 0 )
+	{
+		net_packet->data[ENTITY_PACKET_LENGTH] = samHeadIsStandIn ? 1 : 0;
+		net_packet->data[ENTITY_PACKET_LENGTH + 1] = samOwnedKind;
+		net_packet->data[ENTITY_PACKET_LENGTH + 2] = samOwnedParam;
+		net_packet->len = ENTITY_PACKET_LENGTH + 3;
+	}
+	else if ( samHeadIsStandIn )
+	{
+		net_packet->data[ENTITY_PACKET_LENGTH] = 1;
+		net_packet->len = ENTITY_PACKET_LENGTH + 1;
+	}
+	else
+	{
+		net_packet->len = ENTITY_PACKET_LENGTH;
+	}
 
 	// sometimes you want more insurance that the entity update arrives
 	if ( guarantee )
@@ -670,9 +781,52 @@ void serverUpdateEntityBodypart(Entity* entity, int bodypart)
 		SDLNet_Write32(tempEntity->sprite, &net_packet->data[9]);
 		net_packet->data[13] = (tempEntity->flags[INVISIBLE] ? 1 : 0);
 		net_packet->data[13] |= (tempEntity->flags[INVISIBLE_DITHER] ? (1 << 1) : 0);
+
+		// S.A.M: a custom race's limb model is an APPENDED index, and appended indices are
+		// per-machine: it is rebuilt from a pinned base on every mod load, so it depends on
+		// which mods are loaded rather than on what the engine happens to hold. Two machines
+		// with different mod SETS still disagree. Sending the number means the
+		// client draws whatever sits at that slot in ITS table, which is how a modded body
+		// arrives as the wrong pieces. The client already built this limb correctly from its
+		// own registry (actplayer.cpp:7564 -> :15749, which is NOT multiplayer-gated); this
+		// packet was overwriting that right answer with our numbers.
+		//
+		// So say WHICH limb it is and let the client resolve the model itself, exactly as
+		// sam_bodies.hpp requires for monster bodies: "What crosses the wire is the NAME,
+		// never a model index." Armour is untagged and still travels as an index, correctly:
+		// armour models are vanilla and mean the same thing on both machines.
+		//
+		// APPENDED, not widened. data[14] is a new trailing byte, following the same
+		// precedent as the 32-bit class id appended to JOIN in this file: a peer on an older
+		// build reads len 14, never looks at it, and behaves exactly as it does today.
+		int samRaceLimb = 0;   // 0 == ordinary bodypart, nothing new on the wire
+		if ( bodypart >= 1 && bodypart <= 5 && entity->behavior == &actPlayer )
+		{
+			// The bodypart index is NOT the limb type: the switch in actPlayer uses 1..5 for
+			// torso/rightleg/leftleg/rightarm/leftarm while LIMB_HUMANOID_TORSO is 2.
+			const int limbType = bodypart + 1;
+			const int pn = entity->skill[2];
+			if ( pn >= 0 && pn < MAXPLAYERS && stats[pn]
+				&& stats[pn]->playerRace >= SAM_RACE_ID_BASE
+				&& SAMRaces::limbModelFor(stats[pn]->playerRace, limbType) == tempEntity->sprite )
+			{
+				// Reaching here also means the matching armour slot was empty, because that is
+				// the only way setDefaultPlayerModel ran and left the race model in place.
+				samRaceLimb = limbType;
+			}
+		}
+
 		net_packet->address.host = net_clients[c - 1].host;
 		net_packet->address.port = net_clients[c - 1].port;
-		net_packet->len = 14;
+		if ( samRaceLimb != 0 )
+		{
+			net_packet->data[14] = (Uint8)samRaceLimb;
+			net_packet->len = 15;
+		}
+		else
+		{
+			net_packet->len = 14;   // vanilla: byte-identical
+		}
 		sendPacketSafe(net_sock, -1, net_packet, c - 1);
 	}
 	//if ( entity->behavior == &actPlayer )
@@ -1614,13 +1768,68 @@ NetworkingLobbyJoinRequestResult lobbyPlayerJoinRequest(int& outResult, bool loc
 		client_classes[c] = (int)SDLNet_Read32(&net_packet->data[36]);
 		stats[c]->sex = static_cast<sex_t>((int)SDLNet_Read32(&net_packet->data[40]));
 		Uint32 raceAndAppearance = (Uint32)SDLNet_Read32(&net_packet->data[44]);
-		stats[c]->stat_appearance = (raceAndAppearance & 0xFF00) >> 8;
+		// S.A.M: clamp — raw network byte, never validated. Out of range indexes an
+		// arbitrary model as a head (see playerHeadSprite).
+		stats[c]->stat_appearance = std::min<Uint32>((Uint32)((raceAndAppearance & 0xFF00) >> 8), (Uint32)(NUMAPPEARANCES - 1));
 		stats[c]->playerRace = (raceAndAppearance & 0xFF);
 		net_clients[c - 1].host = net_packet->address.host;
 		net_clients[c - 1].port = net_packet->address.port;
 		client_keepalive[c] = ticks;
 
 		printlog("client %d connected.\n", c);
+		SAMMpInput::notePlayerJoined(c);   // S.A.M: a new stay in this slot: its player.on_player_left may fire again
+
+		if ( c >= 0 && multiplayer != CLIENT )
+		{
+			{
+				SamEvent samEv;
+				// S.A.M: a joiner has heard none of the earlier body announcements, so make the
+				// host say all of them again. Cheap: it only clears a set, and the announcements
+				// go out over the following ticks as each monster is next updated.
+				SAMBodies::reannounceAll();
+
+				samEv.setName("player.on_player_joined");
+				// `player` as well as the historical `player_index`, which stays for handlers that
+				// read it: the rule that a screen call with no player shows to the player the event
+				// is about looks for a field named exactly `player`.
+				samEv.i("player", (long long)c);
+				samEv.i("player_index", (long long)c);
+				samEv.s("player_name", std::string(stats[c]->name));
+				samEv.i("class_id", (long long)client_classes[c]);
+				samEv.i("race", (long long)stats[c]->playerRace);
+				samEv.fire();
+			}
+		}
+
+		// S.A.M: append every player's REAL 32-bit class id at `offset`, and extend the
+		// packet to cover it. The lobby chunks carry the class in a single byte, which
+		// truncates every custom class id (they start at 1000 -> 232), so peers drew a
+		// garbage class for anyone playing a modded class. We append rather than widen the
+		// chunk: widening would move `sex`/`appearance`/`race`/`name` and break any peer on
+		// an older build, whereas a peer that doesn't know about the tail just reads the
+		// shorter length and keeps the old truncated byte.
+		// S.A.M: a RACE tail rides immediately behind the class tail, for the same reason and
+		// with the same compatibility story. The in-chunk race byte is the HOST's load-order
+		// number; the key is stable across machines, so a joiner can resolve every player
+		// already in the lobby against its own registry. Written only when a race mod is
+		// actually loaded, so a vanilla lobby's packets are byte-identical.
+		auto samWriteClassTail = [](int offset) {
+			for ( int p = 0; p < MAXPLAYERS; ++p )
+			{
+				SDLNet_Write32((Uint32)client_classes[p], &net_packet->data[offset + p * 4]);
+			}
+			net_packet->len = offset + MAXPLAYERS * 4;
+			if ( SAMRaces::any() )
+			{
+				const int raceTail = offset + MAXPLAYERS * 4;
+				for ( int p = 0; p < MAXPLAYERS; ++p )
+				{
+					SDLNet_Write32(stats[p] ? SAMRaces::raceKeyFor(stats[p]->playerRace) : 0u,
+						&net_packet->data[raceTail + p * 4]);
+				}
+				net_packet->len = raceTail + MAXPLAYERS * 4;
+			}
+		};
 
 		// send existing clients info on new client
 		for ( int x = 1; x < MAXPLAYERS; x++ )
@@ -1631,14 +1840,22 @@ NetworkingLobbyJoinRequestResult lobbyPlayerJoinRequest(int& outResult, bool loc
 			}
 			strcpy((char*)(&net_packet->data[0]), "JOIN");
 			net_packet->data[4] = c; // clientnum
-			net_packet->data[5] = client_classes[c]; // class
+			net_packet->data[5] = client_classes[c]; // class (LOW BYTE ONLY — see the 32-bit copy below)
 			net_packet->data[6] = stats[c]->sex; // sex
 			net_packet->data[7] = (Uint8)stats[c]->stat_appearance; // appearance
 			net_packet->data[8] = (Uint8)stats[c]->playerRace; // player race
 			stringCopy((char*)net_packet->data + 9, stats[c]->name, 32, sizeof(Stat::name)); // name
+			// S.A.M: data[5] is a single byte, so any class id >= 256 truncates — and every
+			// custom class id starts at SAM_CLASS_ID_BASE (1000), which lands on 232. Every
+			// peer therefore saw a garbage class for a modded player. Carry the real id in a
+			// 32-bit tail instead of widening data[5] in place: widening would shift `sex`,
+			// `appearance`, `race` and `name` and break any peer still on an older build,
+			// whereas an appended field is simply ignored by one (it reads len 41 and keeps
+			// the old truncated byte — no worse than today).
+			SDLNet_Write32((Uint32)client_classes[c], &net_packet->data[41]);
 			net_packet->address.host = net_clients[x - 1].host;
 			net_packet->address.port = net_clients[x - 1].port;
-			net_packet->len = 9 + 32;
+			net_packet->len = 9 + 32 + 4;
 			sendPacketSafe(net_sock, -1, net_packet, x - 1);
 		}
 		char shortname[32] = { 0 };
@@ -1690,13 +1907,14 @@ NetworkingLobbyJoinRequestResult lobbyPlayerJoinRequest(int& outResult, bool loc
 				}
 			}
 			net_packet->len = 8 + MAXPLAYERS * chunk_size;
+			samWriteClassTail(8 + MAXPLAYERS * chunk_size); // real 32-bit class ids
 		} else {
 			constexpr int chunk_size = 6 + 32; // 6 bytes for player stats, 32 for name
 			for ( int x = 0; x < MAXPLAYERS; x++ )
 			{
 				net_packet->data[8 + x * chunk_size + 0] = client_disconnected[x]; // connectedness
 				net_packet->data[8 + x * chunk_size + 1] = lockedSlots[x]; // locked state
-				net_packet->data[8 + x * chunk_size + 2] = client_classes[x]; // class
+				net_packet->data[8 + x * chunk_size + 2] = client_classes[x]; // class (LOW BYTE — 32-bit tail appended below)
 				net_packet->data[8 + x * chunk_size + 3] = stats[x]->sex; // sex
 				net_packet->data[8 + x * chunk_size + 4] = (Uint8)stats[x]->stat_appearance; // appearance
 				net_packet->data[8 + x * chunk_size + 5] = (Uint8)stats[x]->playerRace; // player race
@@ -1706,6 +1924,7 @@ NetworkingLobbyJoinRequestResult lobbyPlayerJoinRequest(int& outResult, bool loc
 				memcpy(net_packet->data + 8 + x * chunk_size + 6, shortname, sizeof(shortname)); // name
 			}
 			net_packet->len = 8 + MAXPLAYERS * chunk_size;
+			samWriteClassTail(8 + MAXPLAYERS * chunk_size); // real 32-bit class ids
 		}
 		net_packet->address.host = net_clients[c - 1].host;
 		net_packet->address.port = net_clients[c - 1].port;
@@ -1823,6 +2042,50 @@ Entity* receiveEntity(Entity* entity)
 		}
 	}
 
+	// S.A.M: the host tagged the head above as a STAND-IN -- it is the host body's head, sent so
+	// that a peer without the mod still sees a moving character instead of a frozen one. We may
+	// have the real thing. See the send site in sendEntityUDP.
+	//
+	// A MARKER, not a model index: for this race the head happens to be a vanilla model that means
+	// the same on both machines, but a race with its own .vox head has an APPENDED index that is
+	// rebuilt per machine from whatever mods are loaded. So the packet says "resolve it" and we
+	// resolve it from OUR registry, exactly as the ENTB limb tag does.
+	//
+	// len is checked, not assumed: a host on an older build sends ENTITY_PACKET_LENGTH bytes and
+	// this byte is then whatever the previous packet left in the buffer.
+	//
+	// pn comes from data[30], not entity->skill[2], because skill[2] is not yet assigned here for
+	// an entity this packet just created.
+	if ( net_packet->len > ENTITY_PACKET_LENGTH && net_packet->data[ENTITY_PACKET_LENGTH] != 0 )
+	{
+		const int samPn = (int)SDLNet_Read32(&net_packet->data[30]);
+		if ( samPn >= 0 && samPn < MAXPLAYERS && stats[samPn] )
+		{
+			// -1 means we do not have this race, so we keep the stand-in and the character stays
+			// visible and moving, which is the whole point of the stand-in.
+			const int samRealHead = SAMRaces::headModelFor(stats[samPn]->playerRace);
+			if ( samRealHead >= 0 ) { entity->sprite = samRealHead; }
+
+			// Once per player per session, name which link broke: the marker arrived, so either
+			// we do not know this player's race (the PLYR race key never landed, or we lack the
+			// mod) or we know it and have no head for it.
+			static bool samToldRecvHead[MAXPLAYERS] = { false };
+			if ( !samToldRecvHead[samPn] )
+			{
+				samToldRecvHead[samPn] = true;
+				SAM_INFO("SYNC", "player " + std::to_string(samPn) + " head marker received;"
+					" their race here is " + std::to_string((int)stats[samPn]->playerRace)
+					+ " and its head model is " + std::to_string(samRealHead)
+					+ (samRealHead >= 0 ? " -- using ours." : " -- keeping the stand-in."));
+			}
+		}
+		else
+		{
+			SAM_WARN("SYNC", "a head marker arrived for player slot "
+				+ std::to_string(samPn) + ", which has no stats here.");
+		}
+	}
+
 	if ( entity->behavior == &actItem && entity->itemFollowUID != 0 )
 	{
 		excludeForAnimation = true;
@@ -1899,6 +2162,15 @@ Entity* receiveEntity(Entity* entity)
 void clientActions(Entity* entity)
 {
 	int playernum;
+
+	// S.A.M: an entity a framework spawner made says so in two bytes after the race-head byte of
+	// its ENTU (see sendEntityUDP), and is bound from them first: the sprite switch below would
+	// claim it by whatever model the script gave it, and a behaviour-less entity never moves on
+	// a client. False at once for any packet of vanilla length, so nothing else changes here.
+	if ( SAMMpEntities::clientBind(entity) )
+	{
+		return;
+	}
 
 	// this code assigns behaviors based on the sprite (model) number
 	switch ( entity->sprite )
@@ -2117,6 +2389,43 @@ void clientActions(Entity* entity)
 					entity->behavior = &actPlayer;
 				}
 			}
+			else
+			{
+				// S.A.M: a custom race's head is an APPENDED MODEL INDEX, and indices are
+				// per-machine: it is rebuilt from a pinned base each mod load, so it reflects
+				// which mods are loaded. So the host's head index need not be
+				// ours, isPlayerHeadSprite answers false for a perfectly valid player, and
+				// because net.cpp clears behavior and re-runs this on EVERY update the player
+				// is un-bound continuously: pinned in place (the client position block is
+				// gated on behavior != nullptr) and solid (nothing skips it in collision).
+				//
+				// Recognise the PLAYER instead of the sprite. The client built this player's
+				// entity itself at level load and stored the pointer, so demanding that the
+				// packet's own player slot AND our own pointer both agree is exact: a stray
+				// entity cannot satisfy it, and no vanilla head ever reaches this branch
+				// because isPlayerHeadSprite already claimed it.
+				const Sint32 samPn = (Sint32)SDLNet_Read32(&net_packet->data[30]);
+				if ( samPn >= 0 && samPn < MAXPLAYERS && players[samPn]
+					&& players[samPn]->entity == entity )
+				{
+					entity->skill[2] = samPn;
+					entity->behavior = &actPlayer;   // samPlayerBindFallback
+					// Say so ONCE per player. If this line appears, the two machines disagreed
+					// about the head's model index and this fallback is the only reason that
+					// player moves at all -- which is exactly the evidence needed to tell that
+					// failure apart from any other cause of a motionless player.
+					static bool samToldAbout[MAXPLAYERS] = { false };
+					if ( !samToldAbout[samPn] )
+					{
+						samToldAbout[samPn] = true;
+						SAM_WARN("RACES", "Player " + std::to_string(samPn) + "'s head model (sprite "
+							+ std::to_string((int)entity->sprite) + ") is not a head this machine knows, so "
+							"the usual sprite test could not recognise them as a player. Bound them by "
+							"identity instead. Both machines having the same mods in the same order "
+							"avoids this.");
+					}
+				}
+			}
 			break;
 	}
 
@@ -2256,11 +2565,24 @@ void clientActions(Entity* entity)
 -------------------------------------------------------------------------------*/
 
 static void changeLevel() {
+	// S.A.M: the host's player.on_before_revive answers ride after the map name (SAMMpInput). Read
+	// them before anything below reuses net_packet and before assignActions runs on the loader
+	// thread. A stock host sends none: then everyone is revived, as in vanilla.
+	SAMMpInput::readReviveVerdict(net_packet->data, net_packet->len);
 	if ( net_packet->data[14] != 0 )
 	{
 		// loading a custom map name.
+		//
+		// S.A.M: this is unvalidated data straight off the wire, and the old code was a bare
+		// strcpy into this fixed buffer with no length check -- a map name over 127 characters
+		// (trivially reachable, a mod chooses its own map filenames) overran the stack here.
+		// Bound by BOTH the buffer and the packet, since a hostile or truncated packet need not
+		// contain a terminator at all.
 		char buf[128] = "";
-		strcpy(buf, (char*)&net_packet->data[14]);
+		size_t samAvail = ( net_packet->len > 14 ) ? (size_t)(net_packet->len - 14) : 0;
+		if ( samAvail > sizeof(buf) - 1 ) { samAvail = sizeof(buf) - 1; }
+		memcpy(buf, &net_packet->data[14], samAvail);
+		buf[samAvail] = '\0';
 		loadCustomNextMap = buf;
 	}
 
@@ -2641,6 +2963,24 @@ static void changeLevel() {
 }
 
 static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
+
+	// S.A.M: a mod-defined packet. One generic envelope so mods can send their own data
+	// between machines -- Barony's packet ids are a fixed table, so before this a co-op mod
+	// had no way to tell the other side anything at all.
+	// Payload: [4]=sender player, [5]=tag length, then tag, then opaque bytes.
+	// Every field is bounded against net_packet->len: this is unvalidated data off the wire.
+	{'SAMP', [](){
+		if ( net_packet->len < 6 ) { return; }
+		const int from = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+		const size_t tagLen = (size_t)net_packet->data[5];
+		if ( tagLen == 0 || tagLen > SAMLua::SAM_PACKET_MAX_TAG ) { return; }
+		if ( (size_t)net_packet->len < 6 + tagLen ) { return; }
+		const size_t payLen = (size_t)net_packet->len - 6 - tagLen;
+		if ( payLen > SAMLua::SAM_PACKET_MAX_PAYLOAD ) { return; }
+		const std::string tag((const char*)&net_packet->data[6], tagLen);
+		const std::string payload((const char*)&net_packet->data[6 + tagLen], payLen);
+		SAMLua::dispatchModPacket(from, tag, payload);
+	}},
 	// keep alive
 	{'KPAL', [](){
 		client_keepalive[0] = ticks;
@@ -2752,7 +3092,11 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		Entity* entity = uidToEntity((int)SDLNet_Read32(&net_packet->data[4]));
 		if ( entity )
 		{
-			entity->fskill[net_packet->data[8]] = (SDLNet_Read16(&net_packet->data[9]) / 256.0);
+			// S.A.M: fskill is NUMENTITYFSKILLS (30) wide; the index is a raw wire byte.
+			if ( net_packet->data[8] < NUMENTITYFSKILLS )
+			{
+				entity->fskill[net_packet->data[8]] = (SDLNet_Read16(&net_packet->data[9]) / 256.0);
+			}
 			playSoundEntityLocal(entity, 612 + local_rng.rand() % 3, 64);
 		}
 	}},
@@ -2826,7 +3170,11 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		Entity *entity = uidToEntity((int)SDLNet_Read32(&net_packet->data[4]));
 		if ( entity )
 		{
-			entity->skill[net_packet->data[8]] = SDLNet_Read32(&net_packet->data[9]);
+			// S.A.M: skill is NUMENTITYSKILLS (60) wide; the index is a raw wire byte.
+			if ( net_packet->data[8] < NUMENTITYSKILLS )
+			{
+				entity->skill[net_packet->data[8]] = SDLNet_Read32(&net_packet->data[9]);
+			}
 		}
 	}},
 
@@ -2835,7 +3183,11 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		Entity *entity = uidToEntity((int)SDLNet_Read32(&net_packet->data[4]));
 		if ( entity )
 		{
-			entity->fskill[net_packet->data[8]] = static_cast<Sint16>(SDLNet_Read16(&net_packet->data[9])) / 256.0;
+			// S.A.M: fskill is NUMENTITYFSKILLS (30) wide; the index is a raw wire byte.
+			if ( net_packet->data[8] < NUMENTITYFSKILLS )
+			{
+				entity->fskill[net_packet->data[8]] = static_cast<Sint16>(SDLNet_Read16(&net_packet->data[9])) / 256.0;
+			}
 		}
 	}},
 
@@ -2849,6 +3201,27 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 			{
 				Entity* tempEntity = (Entity*)childNode->element;
 				tempEntity->sprite = SDLNet_Read32(&net_packet->data[9]);
+
+				// S.A.M: the host tagged this as a custom race's OWN limb rather than a piece
+				// of armour, which means the number above is an appended model index from the
+				// host's table and is meaningless here. Resolve it from our own registry.
+				// See the send site in serverUpdateEntityBodypart for why.
+				//
+				// len is checked, not assumed: a host on an older build sends 14 bytes and
+				// data[14] is then whatever the previous packet left in the buffer.
+				if ( net_packet->len >= 15 && net_packet->data[14] != 0 )
+				{
+					const int pn = tempEntity->skill[2];
+					if ( pn >= 0 && pn < MAXPLAYERS && stats[pn] )
+					{
+						const int local = SAMRaces::limbModelFor(stats[pn]->playerRace,
+							(int)net_packet->data[14]);
+						// -1 means we do not have this race, so keep the host's number: it is
+						// wrong either way and this is not the place to start guessing.
+						if ( local >= 0 ) { tempEntity->sprite = local; }
+					}
+				}
+
 				tempEntity->skill[7] = tempEntity->sprite;
 				tempEntity->flags[INVISIBLE] = (net_packet->data[13] & (1 << 0)) > 0 ? true : false;
 				tempEntity->flags[INVISIBLE_DITHER] = (net_packet->data[13] & (1 << 1)) > 0 ? true : false;
@@ -2901,11 +3274,15 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		Entity *entity = uidToEntity((int)SDLNet_Read32(&net_packet->data[4]));
 		if ( entity )
 		{
+			// S.A.M: flags is bool[24] and is followed immediately by `char* string`,
+			// `light_t* light` and `list_t children` (entity.hpp:171-176) -- so an index of
+			// 24..255 from the wire wrote a bool over live pointers. Worst of this set.
+			if ( net_packet->data[8] >= 24 ) { return; }
 			entity->flags[net_packet->data[8]] = net_packet->data[9];
 			if ( entity->behavior == &actMonster && net_packet->data[8] == USERFLAG2 )
 			{
 				// we should update the flags for all bodyparts (except for human and automaton heads, don't update the other bodyparts).
-				if ( !(entity->isPlayerHeadSprite() || entity->sprite == 467 || !monsterChangesColorWhenAlly(nullptr, entity)) )
+				if ( !((entity->isPlayerHeadSprite() && !samRaceHeadOnMonster(entity)) || entity->sprite == 467 || !monsterChangesColorWhenAlly(nullptr, entity)) )
 				{
 					int bodypart = 0;
 					for ( node_t* node = entity->children.first; node != nullptr; node = node->next )
@@ -4500,6 +4877,9 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 
 		// play sound position
 	{'SNDP', [](){
+		// S.A.M: a mod's sound by NAME after the fixed 15 bytes (sam_sounds.hpp, "multiplayer"). A stock
+		// host never sends the tail, and a stock client never reads past byte 14.
+		if ( SAMSounds::playNetTail(true) ) { return; }
 		playSoundPos(
 		    SDLNet_Read32(&net_packet->data[4]),
 		    SDLNet_Read32(&net_packet->data[8]),
@@ -4509,6 +4889,8 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 
 		// play sound global
 	{'SNDG', [](){
+		// S.A.M: as SNDP, after the fixed 7 bytes.
+		if ( SAMSounds::playNetTail(false) ) { return; }
 		playSound(
 		    SDLNet_Read16(&net_packet->data[4]),
 		    (Uint8)net_packet->data[6]);
@@ -4613,6 +4995,7 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		if ( x >= 0 && x < map.width && y >= 0 && y < map.height )
 		{
 			map.tiles[OBSTACLELAYER + y * MAPLAYERS + x * MAPLAYERS * map.height] = map.tiles[y * MAPLAYERS + x * MAPLAYERS * map.height];
+			SAMWorld::markPathMapsDirty(); // S.A.M: sam_tiles_connected on this client rebuilds before it answers
 		}
 
 		const real_t effectOffset = 2.0;
@@ -4629,6 +5012,7 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		if ( x >= 0 && x < map.width && y >= 0 && y < map.height )
 		{
 			map.tiles[OBSTACLELAYER + y * MAPLAYERS + x * MAPLAYERS * map.height] = 0;
+			SAMWorld::markPathMapsDirty(); // S.A.M: sam_tiles_connected on this client rebuilds before it answers
 		}
 	}},
 
@@ -4640,6 +5024,7 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		{
 			map.tiles[OBSTACLELAYER + y * MAPLAYERS + x * MAPLAYERS * map.height] = 0;
 			map.tiles[(MAPLAYERS - 1) + y * MAPLAYERS + x * MAPLAYERS * map.height] = 0;
+			SAMWorld::markPathMapsDirty(); // S.A.M: sam_tiles_connected on this client rebuilds before it answers
 		}
 	}},
 
@@ -5136,7 +5521,11 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		{
 			if ( entity->getStats() )
 			{
-				entity->getStats()->MISC_FLAGS[net_packet->data[8]] = SDLNet_Read32(&net_packet->data[9]);
+				// S.A.M: MISC_FLAGS is Sint32[32] (stat.hpp:364); the index is a raw wire byte.
+				if ( net_packet->data[8] < 32 )
+				{
+					entity->getStats()->MISC_FLAGS[net_packet->data[8]] = SDLNet_Read32(&net_packet->data[9]);
+				}
 			}
 		}
 	}},
@@ -5155,6 +5544,174 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		stats[clientnum]->MAXHP = (Sint16)SDLNet_Read16(&net_packet->data[15]);
 		stats[clientnum]->MP = (Sint16)SDLNet_Read16(&net_packet->data[17]);
 		stats[clientnum]->MAXMP = (Sint16)SDLNet_Read16(&net_packet->data[19]);
+	}},
+
+	// S.A.M: this player's script-set move-speed multiplier (sam_set_move_speed).
+	// Movement is computed by the machine that OWNS the player, so a multiplier the host
+	// sets for a remote player has to arrive here or it does nothing at all.
+	// Payload: [4]=player, [5..8]=multiplier as Sint32 fixed point (x1000).
+	// Host->client only; the host never accepts one from a client (that would let any
+	// client hand itself a speed boost and have the host believe it).
+	{'SAMS', [](){
+		// 4 tag + 1 player + 4 multiplier. Short-packet guard: this reads 4 bytes at [5],
+		// and a truncated datagram would read past the buffer.
+		if ( net_packet->len < 9 ) { return; }
+		const int player = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+		SAMLua::applyMoveSpeedMult(player, (double)(Sint32)SDLNet_Read32(&net_packet->data[5]) / 1000.0);
+	}},
+
+	// S.A.M: the totals of a player's stat modifiers (sam_add_stat_modifier).
+	//
+	// It has to cross because statGetSTR and the movement code run HERE as well as on the host:
+	// without it this machine would draw its own character sheet and walk at one speed while the
+	// host resolved damage at another. Totals rather than named modifiers, because a client
+	// never edits the table -- it only needs what they came to.
+	// Payload: [4]=player, then 9 pairs of (Sint32 add x100, Uint32 multiply x1000). The host
+	// rounds and clamps its own totals to exactly this, so both machines compute one number.
+	// Host->client only: the host never accepts one, so no client can buff anybody.
+	{'SAMM', [](){
+		const int kCount = 9;
+		if ( net_packet->len < 5 + kCount * 8 ) { return; }
+		const int player = (int)net_packet->data[4];
+		if ( player < 0 || player >= MAXPLAYERS ) { return; }
+		double add[9], mult[9];
+		int off = 5;
+		for ( int i = 0; i < kCount; ++i )
+		{
+			add[i] = (double)(Sint32)SDLNet_Read32(&net_packet->data[off]) / 100.0; off += 4;
+			mult[i] = (double)(Uint32)SDLNet_Read32(&net_packet->data[off]) / 1000.0; off += 4;
+		}
+		SAMRules::applyNetSummary(player, add, mult, kCount);
+	}},
+
+	// S.A.M: the XP curve in force (sam_set_xp_curve), for this machine's XP bar. The level-up
+	// itself only runs on the host; a client draws EXP against the threshold, and without this
+	// its bar read as vanilla's 100 whatever the curve said.
+	// Payload: [4..5]=count, then per entry (Sint16 level, Uint32 threshold). Host->client only.
+	{'SAMX', [](){
+		if ( net_packet->len < 6 ) { return; }
+		int count = (int)SDLNet_Read16(&net_packet->data[4]);
+		const int room = (net_packet->len - 6) / 6;
+		if ( count > room ) { count = room; }
+		if ( count > 128 ) { count = 128; }
+		int levels[128], thresholds[128];
+		int off = 6;
+		for ( int i = 0; i < count; ++i )
+		{
+			levels[i] = (int)(Sint16)SDLNet_Read16(&net_packet->data[off]); off += 2;
+			thresholds[i] = (int)(Uint32)SDLNet_Read32(&net_packet->data[off]); off += 4;
+		}
+		SAMRules::applyNetXpCurve(levels, thresholds, count);
+	}},
+
+	// S.A.M: a map tile the host changed (sam_set_tile). Barony has no general tile-sync
+	// packet -- 'MAPT' carries tile ATTRIBUTES, not ids -- so this mirrors what the wall
+	// buster does for its own hole ('WACD'). Without it a script that digs a passage opens
+	// it on the host alone and every client still collides with solid rock.
+	// Payload: [4..5]=x, [6..7]=y, [8]=layer, [9..10]=tile id. Host->client only.
+	// S.A.M: the host forced a music track (sam_play_music, or a monster's theme), or let it go.
+	// Music is chosen on every machine separately, so this is the one thing that has to cross --
+	// by NAME, so it means the same track whatever order the mods loaded in.
+	// Payload: [4]=on, [5]=loop, [6..7]=fade centiseconds, [8..]=track id, null-terminated.
+	{'SAMU', [](){
+		if ( net_packet->len < 9 ) { return; }
+		const bool on = net_packet->data[4] != 0;
+		const bool loop = net_packet->data[5] != 0;
+		const double fade = (double)SDLNet_Read16(&net_packet->data[6]) / 100.0;
+		const int maxLen = std::min(net_packet->len - 8, 200);
+		std::string id((const char*)&net_packet->data[8], strnlen((const char*)&net_packet->data[8], (size_t)maxLen));
+		SAMMusic::applyNet(on, id, fade, loop);
+	}},
+
+	// S.A.M: the host stopped a script's sound (sam_stop_sound). Payload: [4..]=sound id.
+	{'SAMN', [](){
+		if ( net_packet->len < 5 ) { return; }
+		const int maxLen = std::min(net_packet->len - 4, 200);
+		std::string id((const char*)&net_packet->data[4], strnlen((const char*)&net_packet->data[4], (size_t)maxLen));
+		SAMSounds::stopById(id);
+	}},
+
+	// S.A.M: the ordered host->client channel. Script calls the host carries to this machine
+	// (a HUD line, a panel, a change to this player's own items) and module ops. Frames are
+	// sequenced and applied in order from SAMNet::tick, never from inside this handler.
+	{'SAMC', [](){
+		SAMNet::receiveOnClient();
+	}},
+
+	// S.A.M: one terrain edit, for a client that has not said HELLO yet (a client that has gets
+	// the ordered, floor-keyed terrain op from sam_mp_entities.cpp instead). Written through
+	// SAMWorld::applyRemoteTile: the same bounds checks as the host's setTile, because this is
+	// data off the wire and map.tiles is a flat heap array, and it marks this machine's path
+	// maps stale, which writing the tile here never did.
+	{'SAMT', [](){
+		if ( net_packet->len < 11 ) { return; }
+		const int x = (int)SDLNet_Read16(&net_packet->data[4]);
+		const int y = (int)SDLNet_Read16(&net_packet->data[6]);
+		const int layer = (int)net_packet->data[8];
+		const int tileId = (int)SDLNet_Read16(&net_packet->data[9]);
+		SAMWorld::applyRemoteTile(x, y, layer, tileId);
+	}},
+
+	// S.A.M: show/hide a picture the mod supplied on THIS client's screen (sam_show_image).
+	// Scripts run on the host, but the picture has to land on the screen of the player it is
+	// aimed at, so the host forwards the NAME -- never the pixels, which would not fit in a
+	// datagram anyway. The client resolves it against its own copy of the mod, so a client
+	// missing that mod just draws nothing.
+	// Payload: [4]=player, [5]=0 show/1 hide, [6..7]=duration ms, [8]=alpha, [9]=fit,
+	//          [10..17]=x/y/w/h as Sint16, [18]=ns length, [19]=name length, then the strings.
+	// Host->client only, like 'SAMS': the host never accepts one, so no client can put a
+	// full-screen picture on anybody else's display.
+	{'SAMI', [](){
+		if ( net_packet->len < 20 ) { return; }
+		const int player = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+		const bool showIt = ( net_packet->data[5] == 0 );
+		const int durMs = (int)SDLNet_Read16(&net_packet->data[6]);
+		const int alpha = (int)net_packet->data[8];
+		const int fit = (int)net_packet->data[9];
+		const int x = (Sint16)SDLNet_Read16(&net_packet->data[10]);
+		const int y = (Sint16)SDLNet_Read16(&net_packet->data[12]);
+		const int w = (Sint16)SDLNet_Read16(&net_packet->data[14]);
+		const int h = (Sint16)SDLNet_Read16(&net_packet->data[16]);
+		const size_t nsLen = (size_t)net_packet->data[18];
+		const size_t nameLen = (size_t)net_packet->data[19];
+		// Every length is bounded against the real packet length: this is unvalidated data
+		// off the wire, and a lying length byte here would read past the buffer.
+		if ( nsLen > SAMImages::SAM_IMAGE_MAX_NS ) { return; }
+		if ( nameLen > SAMImages::SAM_IMAGE_MAX_NAME ) { return; }
+		if ( (size_t)net_packet->len < 20 + nsLen + nameLen ) { return; }
+		const std::string ns((const char*)&net_packet->data[20], nsLen);
+		const std::string name((const char*)&net_packet->data[20 + nsLen], nameLen);
+		SAMImages::applyRemote(player, showIt, ns, name, durMs, alpha, fit, x, y, w, h);
+	}},
+
+	// S.A.M: the host telling this client what a monster actually looks like.
+	//
+	// A client cannot work this out alone. An ordinary monster on a client carries two empty
+	// children nodes and no clientStats, so Entity::getStats() is null and the variant name a
+	// custom body is keyed on simply is not there -- which is why custom bodies used to be
+	// visible to the host and to nobody else.
+	//
+	// What crosses the wire is the NAME, never a model index. A name re-resolves against this
+	// machine's own model registry, so two players whose mod lists sort differently still see
+	// the same creature; an index would mean whatever that slot happened to hold here.
+	// Payload: [4..7]=entity uid, [8]=name length, [9..]=name bytes, then (a newer host) one
+	// kind byte: 1 = a model id a script set, which belongs to the script layer and draws on any
+	// entity; 0 or absent = a JSON body name. A host that has heard this client's HELLO sends the
+	// same thing on the ordered channel instead (sam_bodies.cpp).
+	// Host->client only, like 'SAMI' and 'SAMS': the host never accepts one, so no client can
+	// tell anybody else what a monster looks like.
+	{'SAMB', [](){
+		if ( net_packet->len < 9 ) { return; }
+		const Uint32 uid = SDLNet_Read32(&net_packet->data[4]);
+		const size_t nameLen = (size_t)net_packet->data[8];
+		// Bound the length against the real packet before reading: this is unvalidated data
+		// off the wire and a lying length byte would read past the buffer.
+		if ( nameLen > SAMBodies::SAM_BODY_MAX_NAME ) { return; }
+		if ( (size_t)net_packet->len < 9 + nameLen ) { return; }
+		// The kind byte only when the packet really carries it: an older host sends exactly
+		// 9 + nameLen bytes, and the byte after them is whatever the last packet left behind.
+		const bool samScriptModel = (size_t)net_packet->len > 9 + nameLen && net_packet->data[9 + nameLen] == 1;
+		SAMBodies::applyRemote(uid, std::string((const char*)&net_packet->data[9], nameLen), samScriptModel);
 	}},
 
 	// level up icon timers, sets second row of icons if double stat gain is rolled.
@@ -6490,7 +7047,10 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 	if ( player >= 0 && player < MAXPLAYERS )
 	{
 		auto& gui = GenericGUI[player].assistShrineGUI;
-		gui.savedClass = (Sint8)net_packet->data[4];
+		// S.A.M: full 32-bit class id from the tail if present; else vanilla signed low byte.
+		gui.savedClass = ( net_packet->len >= 13 )
+			? (Sint32)SDLNet_Read32(&net_packet->data[9])
+			: (Sint8)net_packet->data[4];
 		gui.savedRace = (Sint8)net_packet->data[5];
 		gui.savedSex = (Sint8)net_packet->data[6];
 		gui.savedAppearance = (Sint8)net_packet->data[7];
@@ -6885,6 +7445,7 @@ void clientHandleMessages(Uint32 framerateBreakInterval)
 			memcpy(net_packet->data, packet->data(), packet->len());
 			net_packet->len = packet->len();
 
+			SAMNet::noteDatagramSource(false, 0, 0);   // S.A.M: Steam/EOS give no source address
 			clientHandlePacket(); //Uses net_packet.
 
 			if ( logCheckMainLoopTimers )
@@ -6922,6 +7483,8 @@ void clientHandleMessages(Uint32 framerateBreakInterval)
 				continue;
 			}
 
+			// S.A.M: see the twin in serverHandleMessages.
+			SAMNet::noteDatagramSource(true, net_packet->address.host, net_packet->address.port);
 			clientHandlePacket();
 		}
 	}
@@ -6977,15 +7540,18 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 
 	// pause game
 	{'PAUS', [](){
-		messagePlayer(clientnum, MESSAGE_MISC, Language::get(1118), stats[net_packet->data[4]]->name);
+		// S.A.M: the clamp below already existed -- but the stats[] dereference was ABOVE it,
+		// so the unclamped index was used first.
 		const int j = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+		messagePlayer(clientnum, MESSAGE_MISC, Language::get(1118), stats[j]->name);
 		pauseGame(2, j);
 	}},
 
 	// unpause game
 	{'UNPS', [](){
-		messagePlayer(clientnum, MESSAGE_MISC, Language::get(1119), stats[net_packet->data[4]]->name);
+		// S.A.M: same as 'PAUS' -- the dereference preceded the clamp.
 		const int j = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+		messagePlayer(clientnum, MESSAGE_MISC, Language::get(1119), stats[j]->name);
 		pauseGame(1, j);
 	}},
 
@@ -7038,10 +7604,17 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 			statusBeatitudeQuantityAppearance |= ((static_cast<Uint8>(entity->skill[11]) & 0xFF) << 24); // status
 			statusBeatitudeQuantityAppearance |= ((static_cast<Sint8>(entity->skill[12]) & 0xFF) << 16); // beatitude
 			statusBeatitudeQuantityAppearance |= ((static_cast<Uint8>(entity->skill[13]) & 0xFF) << 8); // quantity
-			Uint8 appearance = entity->skill[14] % items[entity->skill[10]].variations;
+			// S.A.M: skill[10] is the ground item's type, straight off the entity, so a save
+			// carrying a custom item whose mod has been removed lands on an unregistered
+			// slot with variations == 0. Clients auto-request this sync every few seconds
+			// with no player input, so an unguarded divide here kills the HOST and takes
+			// the whole session down.
+			const int samVariations = ( entity->skill[10] >= 0 && entity->skill[10] < NUM_ITEM_SLOTS )
+				? items[entity->skill[10]].variations : 0;
+			Uint8 appearance = ( samVariations > 0 ) ? (Uint8)(entity->skill[14] % samVariations) : 0;
 			if ( entity->skill[10] == TOOL_PLAYER_LOOT_BAG )
 			{
-				appearance = (entity->skill[14] & 0xF) % items[entity->skill[10]].variations;
+				appearance = ( samVariations > 0 ) ? (Uint8)((entity->skill[14] & 0xF) % samVariations) : 0;
 			}
 			else if ( entity->skill[10] == ENCHANTED_FEATHER )
 			{
@@ -7335,6 +7908,8 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		entity->addToCreatureList(map.creatures);
 		players[player]->entity = entity;
 		stats[player]->HP = stats[player]->MAXHP / 2;
+		// S.A.M: last in the handler, so a script that sends anything cannot disturb this packet's reads.
+		SAMMpInput::firePlayerRevived(player, "ghost_respawn");
 	}},
 
 	// player created ghost
@@ -7391,7 +7966,15 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		Entity* entity = uidToEntity(uid);
 		if ( entity )
 		{
-			entity->flags[UPDATENEEDED] = false;
+			// S.A.M: one client's NOUP stops the sweep for EVERY client. A stock client that bound a
+			// script-spawned entity to a pinned prop by its model (a torch, say) answers NOUP, and
+			// every S.A.M client -- which bound it to plain interpolation -- would then never see it
+			// move again. So an entity a framework spawner made keeps updating; the stock client
+			// keeps answering NOUP and keeps its own frozen copy, as it would have anyway.
+			if ( !SAMMpEntities::keepsUpdatingDespiteNoup(entity) )
+			{
+				entity->flags[UPDATENEEDED] = false;
+			}
 		}
 	}},
 
@@ -7567,8 +8150,12 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		Entity* entity = uidToEntity(uid);
 		if ( entity )
 		{
-			client_selected[net_packet->data[4]] = entity;
-			inrange[net_packet->data[4]] = false;
+			// S.A.M: clamp the player index exactly as the neighbouring 'RATF' handler does
+			// (net.cpp ~7706). This arrives from a CLIENT, so the value is untrusted; both
+			// arrays are MAXPLAYERS wide and this is a WRITE.
+			const int ckorPlayer = std::min((int)net_packet->data[4], MAXPLAYERS - 1);
+			client_selected[ckorPlayer] = entity;
+			inrange[ckorPlayer] = false;
 		}
 	}},
 
@@ -7583,6 +8170,11 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 	    }
 		stringCopy(shortname, stats[playerDisconnected]->name, sizeof(shortname), sizeof(Stat::name));
 		client_disconnected[playerDisconnected] = true;
+
+		// S.A.M: player.on_player_left, once per stay in the slot (SAMMpInput latches it). The relay
+		// loop below rebuilds the DISC it sends, so a handler that sends something is harmless here.
+		SAMMpInput::firePlayerLeft(playerDisconnected);
+
 		for ( int c = 1; c < MAXPLAYERS; c++ )
 		{
 			if ( client_disconnected[c] == true )
@@ -7848,6 +8440,48 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		//}
 	}},
 
+	// S.A.M: a mod-defined packet. One generic envelope so mods can send their own data
+	// between machines -- Barony's packet ids are a fixed table, so before this a co-op mod
+	// had no way to tell the other side anything at all.
+	// Payload: [4]=sender player, [5]=tag length, then tag, then opaque bytes.
+	// Every field is bounded against net_packet->len: this is unvalidated data off the wire.
+	{'SAMP', [](){
+		if ( net_packet->len < 6 ) { return; }
+		const int from = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+		// S.A.M: only a connected client sends this. Slot 0 is the host itself and an empty slot has
+		// nobody in it; the index is otherwise the sender's own claim, as for every vanilla packet.
+		if ( from <= 0 || client_disconnected[from] ) { return; }
+		const size_t tagLen = (size_t)net_packet->data[5];
+		if ( tagLen == 0 || tagLen > SAMLua::SAM_PACKET_MAX_TAG ) { return; }
+		if ( (size_t)net_packet->len < 6 + tagLen ) { return; }
+		const size_t payLen = (size_t)net_packet->len - 6 - tagLen;
+		if ( payLen > SAMLua::SAM_PACKET_MAX_PAYLOAD ) { return; }
+		const std::string tag((const char*)&net_packet->data[6], tagLen);
+		const std::string payload((const char*)&net_packet->data[6 + tagLen], payLen);
+		SAMLua::dispatchModPacket(from, tag, payload);
+	}},
+
+	// S.A.M: the ordered client->host channel (HELLO, events a client raises, module reports).
+	{'SAMQ', [](){
+		SAMNet::receiveOnHost();
+	}},
+
+	// S.A.M: a client's bound-action edge (on_action_pressed / on_action_released), as a client
+	// on an OLDER S.A.M build sends it. Input only exists on the machine that owns the player,
+	// but the hooks must fire on the host so host-only script APIs work. This build's clients
+	// report their buttons in order on the SAMNet channel instead (SAMMpInput) and never send it.
+	// Payload: [4]=player, [5]=action index (SAMLua's action table), [6]=pressed.
+	// Not relayed to other clients: the hooks are host-authoritative.
+	{'SAMA', [](){
+		// 4 tag + player + action + pressed. Reads three bytes past the tag, so a truncated
+		// datagram would read past the buffer.
+		if ( net_packet->len < 7 ) { return; }
+		const int player = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+		// S.A.M: from a client on an OLDER S.A.M build only (this build reports buttons in order on
+		// the SAMNet channel). Refuses slot 0, an empty slot, and a client that said HELLO.
+		SAMMpInput::onLegacyAction(player, (int)net_packet->data[5], net_packet->data[6] != 0);
+	}},
+
 	// raise/lower shield
 	{'SHLD', [](){
 		const int player = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
@@ -7926,7 +8560,14 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 			return;
 		}
 		Item* item = newItem(WOODEN_SHIELD, BROKEN, 0, 1, 0, true, nullptr);
-		item->type = static_cast<ItemType>(SDLNet_Read32(&net_packet->data[8]));
+		// S.A.M: clamp the wire value the way newItem does (items.cpp:214). newItem was
+		// called with WOODEN_SHIELD, so its guard validated a constant and this line then
+		// overwrote the result with a raw 32-bit read straight off the network. 330 sites
+		// index items[] by this field against a bound of NUM_ITEM_SLOTS (6064), so a hostile
+		// or corrupt packet reached far outside the array. Inherited from upstream; vanilla
+		// reachable, nothing to do with mods.
+		{ const Sint32 t = SDLNet_Read32(&net_packet->data[8]);
+		  item->type = ( t >= 0 && t < NUM_ITEM_SLOTS ) ? static_cast<ItemType>(t) : ItemType::GEM_ROCK; }
 		item->status = static_cast<Status>(SDLNet_Read32(&net_packet->data[12]));
 		item->beatitude = SDLNet_Read16(&net_packet->data[16]);
 		item->appearance = SDLNet_Read32(&net_packet->data[20]);
@@ -7980,6 +8621,19 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		entitystats->GOLD += buyValue;
 		stats[client]->GOLD -= buyValue;
 		stats[client]->GOLD = std::max(0, stats[client]->GOLD);
+
+		if ( multiplayer != CLIENT )
+		{
+			{
+				SamEvent samEv;
+				samEv.setName("player.on_item_bought");
+				samEv.i("player", (long long)client);
+				samEv.i("item_type", (long long)item->type);
+				samEv.i("gold_spent", (long long)buyValue);
+				samEv.fire();
+			}
+		}
+
 		if ( players[client] && players[client]->entity && !item->playerSoldItemToShop )
 		{
 			bool increaseSkill = false;
@@ -8117,6 +8771,7 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		}
 
 		Sint32 goldValue = item->sellValue(client);
+		const int samSoldType = (int)item->type;
 		int xout = Player::ShopGUI_t::MAX_SHOP_X;
 		int yout = Player::ShopGUI_t::MAX_SHOP_Y;
 		Item* itemToStackInto = nullptr;
@@ -8142,6 +8797,19 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 
 		stats[client]->GOLD += goldValue;
 		entitystats->GOLD -= goldValue;
+
+		if ( multiplayer != CLIENT )
+		{
+			{
+				SamEvent samEv;
+				samEv.setName("player.on_item_sold");
+				samEv.i("player", (long long)client);
+				samEv.i("item_type", (long long)samSoldType);
+				samEv.i("gold_received", (long long)goldValue);
+				samEv.fire();
+			}
+		}
+
 		//if ( players[client] && players[client]->entity )
 		//{
 		//	if ( local_rng.rand() % 2 )
@@ -8173,7 +8841,11 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		    SDLNet_Read32(&net_packet->data[20]),
 		    net_packet->data[24],
 		    &stats[client]->inventory);
-		useItem(item, client, nullptr, false, true);
+		// S.A.M: honour the client's deliberate-use flag (byte 26) so a mod's on_item_use
+		// veto applies to CLIENT players too, not only the host's own. Older clients send a
+		// 26-byte packet; net_packet->len < 27 means "not deliberate", the safe default.
+		const bool samDeliberate = ( net_packet->len >= 27 && net_packet->data[26] != 0 );
+		useItem(item, client, nullptr, false, true, samDeliberate);
 	}},
 
 	// use loot bag
@@ -8665,7 +9337,14 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		}
 
 		Item* newitem = newItem(WOODEN_SHIELD, BROKEN, 0, 1, 0, true, nullptr);
-		newitem->type = static_cast<ItemType>(SDLNet_Read32(&net_packet->data[5]));
+		// S.A.M: clamp the wire value the way newItem does (items.cpp:214). newItem was
+		// called with WOODEN_SHIELD, so its guard validated a constant and this line then
+		// overwrote the result with a raw 32-bit read straight off the network. 330 sites
+		// index items[] by this field against a bound of NUM_ITEM_SLOTS (6064), so a hostile
+		// or corrupt packet reached far outside the array. Inherited from upstream; vanilla
+		// reachable, nothing to do with mods.
+		{ const Sint32 t = SDLNet_Read32(&net_packet->data[5]);
+		  newitem->type = ( t >= 0 && t < NUM_ITEM_SLOTS ) ? static_cast<ItemType>(t) : ItemType::GEM_ROCK; }
 		newitem->status = static_cast<Status>(SDLNet_Read32(&net_packet->data[9]));
 		newitem->beatitude = SDLNet_Read32(&net_packet->data[13]);
 		newitem->count = SDLNet_Read32(&net_packet->data[17]);
@@ -8699,7 +9378,14 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		}
 
 		Item* item = newItem(WOODEN_SHIELD, BROKEN, 0, 1, 0, true, nullptr);
-		item->type = static_cast<ItemType>(SDLNet_Read32(&net_packet->data[5]));
+		// S.A.M: clamp the wire value the way newItem does (items.cpp:214). newItem was
+		// called with WOODEN_SHIELD, so its guard validated a constant and this line then
+		// overwrote the result with a raw 32-bit read straight off the network. 330 sites
+		// index items[] by this field against a bound of NUM_ITEM_SLOTS (6064), so a hostile
+		// or corrupt packet reached far outside the array. Inherited from upstream; vanilla
+		// reachable, nothing to do with mods.
+		{ const Sint32 t = SDLNet_Read32(&net_packet->data[5]);
+		  item->type = ( t >= 0 && t < NUM_ITEM_SLOTS ) ? static_cast<ItemType>(t) : ItemType::GEM_ROCK; }
 		item->status = static_cast<Status>(SDLNet_Read32(&net_packet->data[9]));
 		item->beatitude = SDLNet_Read32(&net_packet->data[13]);
 		item->count = SDLNet_Read32(&net_packet->data[17]);
@@ -9204,7 +9890,11 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		if ( player >= 0 && player < MAXPLAYERS )
 		{
 			auto& gui = GenericGUI[player].assistShrineGUI;
-			gui.savedClass = (Sint8)net_packet->data[4];
+			// S.A.M: read the full 32-bit class id from the tail if present; a pre-patch peer
+			// sends a 9-byte packet, so fall back to the vanilla signed low byte.
+			gui.savedClass = ( net_packet->len >= 13 )
+				? (Sint32)SDLNet_Read32(&net_packet->data[9])
+				: (Sint8)net_packet->data[4];
 			gui.savedRace = (Sint8)net_packet->data[5];
 			gui.savedSex = (Sint8)net_packet->data[6];
 			gui.savedAppearance = (Sint8)net_packet->data[7];
@@ -9236,14 +9926,15 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 			{
 				// confirm receipt of class change to sender
 				strcpy((char*)net_packet->data, "ASSC");
-				net_packet->data[4] = (Sint8)gui.savedClass;
+				net_packet->data[4] = (Sint8)gui.savedClass;   // keep: vanilla low-byte fallback
 				net_packet->data[5] = (Sint8)gui.savedRace;
 				net_packet->data[6] = (Sint8)gui.savedSex;
 				net_packet->data[7] = (Sint8)gui.savedAppearance;
 				net_packet->data[8] = player;
+				SDLNet_Write32((Uint32)gui.savedClass, &net_packet->data[9]); // S.A.M: real 32-bit id tail
 				net_packet->address.host = net_clients[player - 1].host;
 				net_packet->address.port = net_clients[player - 1].port;
-				net_packet->len = 9;
+				net_packet->len = 13;                          // was 9 (+ the 4-byte id tail)
 				sendPacketSafe(net_sock, -1, net_packet, player - 1);
 			}
 		}
@@ -9555,6 +10246,7 @@ void serverHandleMessages(Uint32 framerateBreakInterval)
 			memcpy(net_packet->data, packet->data(), packet->len());
 			net_packet->len = packet->len();
 
+			SAMNet::noteDatagramSource(false, 0, 0);   // S.A.M: Steam/EOS give no source address
 			serverHandlePacket(); //Uses net_packet;
 
 			if ( logCheckMainLoopTimers )
@@ -9591,6 +10283,10 @@ void serverHandleMessages(Uint32 framerateBreakInterval)
 				continue;
 			}
 
+			// S.A.M: the address this datagram really came from. handleSafePacket overwrites
+			// net_packet->address with the acknowledgement's destination before any handler
+			// runs, so a handler cannot ask afterwards.
+			SAMNet::noteDatagramSource(true, net_packet->address.host, net_packet->address.port);
 			serverHandlePacket(); //Uses net_packet.
 		}
 	}

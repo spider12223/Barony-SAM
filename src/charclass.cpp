@@ -20,6 +20,8 @@
 #include "charclass.hpp"
 #include "player.hpp"
 #include "mod_tools.hpp"
+#include "sam_classes.hpp" // S.A.M Framework custom classes
+#include "sam_races.hpp" // S.A.M Framework custom playable races
 
 /*-------------------------------------------------------------------------------
 
@@ -34,8 +36,15 @@ void initClassStats(const int classnum, void* myStats)
 	if ( !myStats ) { return; }
 	Stat* stat = static_cast<Stat*>(myStats);
 	// CLASS LOADOUTS
+	// S.A.M custom classes (runtime ids >= 1000): apply attribute/skill deltas
+	// from the registry, then fall through to the unconditional challenge-run +
+	// HP/MP clamp block below (which must run for every class, custom included).
+	if ( classnum >= SAM_CLASS_ID_BASE )
+	{
+		SAMClasses::applyStats(classnum, stat);
+	}
 	// barbarian
-	if ( classnum == CLASS_BARBARIAN )
+	else if ( classnum == CLASS_BARBARIAN )
 	{
 		// attributes
 		stat->STR += 2;
@@ -683,6 +692,17 @@ void initClassStats(const int classnum, void* myStats)
 			}
 		}
 	}
+	// S.A.M v0.7.0 Feature 5: runtime class-stat overrides + class passives. Applied as
+	// the final ABSOLUTE word — after the vanilla/SAM deltas AND the challenge-run block
+	// (mods intentionally win over challenge runs), but before the HP/MP clamp + OLDHP
+	// recompute below so HP/MAXHP still normalize. No-op unless a script called
+	// sam_patch_class / sam_add_class_passive. Runs for every class (vanilla + custom)
+	// and also drives the character-select stat preview (same funnel).
+	SAMClasses::applyStatOverrides(classnum, stat);
+	SAMClasses::applyPassives(classnum, stat);
+	// S.A.M custom races (ids >= 200): apply the race's attribute/HP/MP deltas on top
+	// of the class, then fall into the same clamp. No-op for vanilla races (< 200).
+	SAMRaces::applyStats(stat->playerRace, stat);
 	stat->HP = std::max(1, stat->HP);
 	stat->MAXHP = std::max(1, stat->MAXHP);
 	stat->MP = std::max(1, stat->MP);
@@ -727,8 +747,21 @@ void initClass(const int player)
 
 
 	// CLASS LOADOUTS
+	// S.A.M custom classes (runtime ids >= 1000): apply stats via initClassStats
+	// (which routes to SAMClasses::applyStats through its own hook), replicate
+	// the vanilla multiplayer guard, then grant the custom starting items.
+	if ( client_classes[player] >= SAM_CLASS_ID_BASE )
+	{
+		initClassStats(client_classes[player], stats[player]);
+
+		if (!isLocalPlayer && multiplayer == CLIENT && intro == false) {
+			// don't do anything crazy with items on players we don't own
+			return;
+		}
+		SAMClasses::applyLoadout(player);
+	}
 	// barbarian
-	if ( client_classes[player] == CLASS_BARBARIAN )
+	else if ( client_classes[player] == CLASS_BARBARIAN )
 	{
 		initClassStats(client_classes[player], stats[player]);
 
@@ -3390,8 +3423,12 @@ void initClass(const int player)
 		//stats[player]->HUNGER = 150;
 	}
 
-	if ( stats[player]->stat_appearance == 0 
-		&& client_classes[player] <= CLASS_MONK 
+	// S.A.M: a custom class id (>= SAM_CLASS_ID_BASE) is neither <= CLASS_MONK nor inside
+	// the DLC range checked below, so without this a custom-class character on a monster
+	// race started with ZERO polymorph potions — the item those races need to enter shops
+	// and trade with NPCs. Treat custom classes like the base classes and grant the same.
+	if ( stats[player]->stat_appearance == 0
+		&& (client_classes[player] <= CLASS_MONK || client_classes[player] >= SAM_CLASS_ID_BASE)
 		&& stats[player]->playerRace != RACE_HUMAN )
 	{
 		if ( isLocalPlayer )
@@ -3481,7 +3518,14 @@ void initClass(const int player)
 	}
 	if ( isLocalPlayer )
 	{
-		if ( stats[player]->playerRace == RACE_VAMPIRE && stats[player]->stat_appearance == 0 )
+		// S.A.M: a custom race grants its declared innate spells. First branch, so it is
+		// reachable; a custom race id (>= SAM_RACE_ID_BASE) matches no vanilla arm below, and
+		// a vanilla race never enters this one, so the vanilla chain is byte-for-byte unchanged.
+		if ( stats[player]->playerRace >= SAM_RACE_ID_BASE && stats[player]->stat_appearance == 0 )
+		{
+			SAMRaces::applySpells(player);
+		}
+		else if ( stats[player]->playerRace == RACE_VAMPIRE && stats[player]->stat_appearance == 0 )
 		{
 			addSpell(SPELL_LEVITATION, player, true);
 			addSpell(SPELL_BLEED, player, true);
@@ -3558,7 +3602,12 @@ void initClass(const int player)
 			}
 		}
 
-		if ( client_classes[player] == CLASS_SHAMAN )
+		// S.A.M custom classes (runtime ids >= 1000): grant their starting spells.
+		if ( client_classes[player] >= SAM_CLASS_ID_BASE )
+		{
+			SAMClasses::applySpells(player);
+		}
+		else if ( client_classes[player] == CLASS_SHAMAN )
 		{
 			addSpell(SPELL_RAT_FORM, player, true);
 			addSpell(SPELL_SPIDER_FORM, player, true);

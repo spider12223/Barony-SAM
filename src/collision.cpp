@@ -21,6 +21,12 @@
 #include "net.hpp"
 #include "paths.hpp"
 #include "collision.hpp"
+#ifndef EDITOR
+#include "sam_races.hpp"   // isRaceHeadOnMonster (client walk-through fix)
+static bool samRaceHeadOnMonster(const Entity* e) { return SAMRaces::isRaceHeadOnMonster(e); }
+#else
+static bool samRaceHeadOnMonster(const Entity*) { return false; }
+#endif
 #include "prng.hpp"
 #include "player.hpp"
 #include "mod_tools.hpp"
@@ -1246,8 +1252,13 @@ int barony_clear(real_t tx, real_t ty, Entity* my)
 					continue;
 				}
 			}
+			// S.A.M: a mod-declared "pass_through" monster has no BODY collision -- you walk
+			// through it -- while staying a real, targetable, killable monster. Added as the
+			// first disjunct of the vanilla revenant-skull list so it inherits that list's
+			// exact carve-outs: a boulder still crushes it, projectiles still hit it.
 			if ( entity->behavior == &actMonster && 
-				(entity->getMonsterTypeFromSprite() == REVENANT_SKULL || entity->getMonsterTypeFromSprite() == MONSTER_ADORCISED_WEAPON
+				(samMonsterHasTrait(entity->getStats(), SAMMonsterTrait::PASS_THROUGH)
+				|| entity->getMonsterTypeFromSprite() == REVENANT_SKULL || entity->getMonsterTypeFromSprite() == MONSTER_ADORCISED_WEAPON
 				|| entity->getMonsterTypeFromSprite() == FLAME_ELEMENTAL || entity->getMonsterTypeFromSprite() == MOTH_SMALL) )
 			{
 				if ( my->behavior == &actBoulder )
@@ -1464,7 +1475,17 @@ int barony_clear(real_t tx, real_t ty, Entity* my)
 			if ( multiplayer == CLIENT )
 			{
 				// fixes bug where clients can't move through humans
-				if ( entity->isPlayerHeadSprite() ||
+				// S.A.M: a race head widens isPlayerHeadSprite so the player wearing it binds
+				// correctly on clients (net.cpp). A MONSTER wearing that same head -- Gharbad
+				// the boss -- must not become walk-through because of it.
+				// S.A.M: `|| behavior == &actPlayer` covers a custom-race player whose head model
+				// index this machine does not share with the host (see the bind fallback in
+				// net.cpp). Without it that player stayed a solid immovable box on every other
+				// screen while vanilla players were correctly walked through. In vanilla the
+				// added set is a subset of what isPlayerHeadSprite already matches, so nothing
+				// changes there.
+				if ( ((entity->isPlayerHeadSprite() || entity->behavior == &actPlayer)
+						&& !samRaceHeadOnMonster(entity)) ||
 					entity->sprite == 217 )   // human heads (217 is shopkeep)
 				{
 					continue;
@@ -2780,8 +2801,11 @@ int checkObstacle(long x, long y, Entity* my, Entity* target, bool useTileEntity
 						{
 							continue;
 						}
+						// S.A.M: same trait, pathing side -- a pass_through monster does not
+						// block a path, matching how the engine treats the incorporeal ones.
 						if ( entity->behavior == &actMonster 
-							&& (entity->getMonsterTypeFromSprite() == BAT_SMALL 
+							&& (samMonsterHasTrait(entity->getStats(), SAMMonsterTrait::PASS_THROUGH)
+								|| entity->getMonsterTypeFromSprite() == BAT_SMALL 
 								|| entity->getMonsterTypeFromSprite() == REVENANT_SKULL
 								|| entity->getMonsterTypeFromSprite() == MONSTER_ADORCISED_WEAPON
 								|| entity->getMonsterTypeFromSprite() == HOLOGRAM

@@ -1164,6 +1164,7 @@ class Item;
 spell_t* getSpellFromItem(const int player, Item* item, bool usePlayerInventory);
 int getSpellIDFromSpellbook(int spellbookType);
 int getSpellIDFromFoci(int fociType);
+int getSpellIDFromMagicstaff(int magicstaffType);   // S.A.M — custom staff casts its declared spell
 int canUseShapeshiftSpellInCurrentForm(const int player, Item& item);
 
 //Spell implementation stuff.

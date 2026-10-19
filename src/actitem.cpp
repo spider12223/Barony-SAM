@@ -84,8 +84,18 @@ bool itemProcessReturnItemEffect(Entity* my, bool fallingIntoVoid)
 				if ( item2 )
 				{
 					int pickedUpCount = item2->count;
-					Item* item = itemPickup(i, item2);
-					if ( item )
+					// S.A.M: a genuine player-initiated world pickup -- the one kind a mod may
+					// refuse. This caller already handles a null result.
+					Item* item = itemPickup(i, item2, nullptr, false, /*samAllowVeto=*/true);
+					if ( !item )
+					{
+						// S.A.M: a script refused the pickup. item2 is a temporary built by
+						// newItemFromEntity above and is freed on every success path below, so
+						// it must be freed here too -- this path can run every frame while the
+						// player stands on the item.
+						free(item2);
+					}
+					else
 					{
 						if ( players[i]->isLocalPlayer() )
 						{
@@ -813,8 +823,13 @@ void actItem(Entity* my)
 						else
 						{
 							int pickedUpCount = item2->count;
-							item = itemPickup(i, item2);
-							if (item)
+							// S.A.M: genuine world pickup; null is already handled below.
+							item = itemPickup(i, item2, nullptr, false, /*samAllowVeto=*/true);
+							if ( !item )
+							{
+								free(item2);   // S.A.M: refused -- free the temporary (see above)
+							}
+							else
 							{
 								// S.A.M scripting hook: a player picked an item up off the ground.
 								// Host-authoritative (inside `multiplayer != CLIENT`). Hooked at the
@@ -824,13 +839,21 @@ void actItem(Entity* my)
 									SAMLua::Event ev;
 									ev.setName("player.on_item_pickup").i("player", i)
 										.i("item_type", (long long)item2->type).i("count", pickedUpCount)
-										.s("item_name", item2->getName());
+										// S.A.M: canonical here too. getName() is what the PLAYER sees, and for an unidentified
+										// item that is the shared alias ("gloves"), which two items answer to.
+										.s("item_name", std::string(( item2->type >= 0 && item2->type < NUMITEMS )
+											? itemNameStrings[item2->type + 2] : ""))
+										.s("item_display_name", item2->getName());
 									SAMLua::dispatchEvent(ev);
 
 									SAMJs::Event jsev;
 									jsev.setName("player.on_item_pickup").i("player", i)
 										.i("item_type", (long long)item2->type).i("count", pickedUpCount)
-										.s("item_name", item2->getName());
+										// S.A.M: canonical here too. getName() is what the PLAYER sees, and for an unidentified
+										// item that is the shared alias ("gloves"), which two items answer to.
+										.s("item_name", std::string(( item2->type >= 0 && item2->type < NUMITEMS )
+											? itemNameStrings[item2->type + 2] : ""))
+										.s("item_display_name", item2->getName());
 									SAMJs::dispatchEvent(jsev);
 								}
 								if (players[i]->isLocalPlayer())

@@ -21,6 +21,9 @@
 #include "mod_tools.hpp"
 #include "player.hpp"
 #include "ui/MainMenu.hpp"
+#ifndef EDITOR
+#include "sam_bodies.hpp" // custom creature body models (draw-site override)
+#endif
 #include "init.hpp"
 #include "ui/Image.hpp"
 
@@ -1313,6 +1316,15 @@ void glDrawVoxel(view_t* camera, Entity* entity, int mode) {
 #ifndef EDITOR
 	static ConsoleVariable<int> cvar_forceModel("/forcemodel", -1, "force all voxel models to use a specific index");
 	modelindex = *cvar_forceModel;
+	if (modelindex < 0) {
+		// S.A.M: a mod-declared custom BODY model, looked up by entity uid. Overridden HERE --
+		// the only place the engine turns an entity into a model -- and deliberately NOT in
+		// entity->sprite, which ~70 gameplay predicates read (monster type, targeting,
+		// tooltips, the client's behavior reconstruction) and which rides on the wire. The
+		// creature stays an ordinary monster to every piece of game logic and only LOOKS
+		// different. The map is empty in vanilla, so this is one integer compare per draw.
+		modelindex = SAMBodies::modelForEntity(entity);
+	}
 #endif
 	if (modelindex < 0) {
 		modelindex = entity->sprite;
@@ -1420,12 +1432,42 @@ void glDrawVoxel(view_t* camera, Entity* entity, int mode) {
     {
         rotx = entity->roll * 180.0 / PI; // roll
         roty = 360.0 - entity->yaw * 180.0 / PI; // yaw
+#ifndef EDITOR
+        // S.A.M: a custom body may have been modelled facing a different direction than
+        // Barony expects, which renders it sideways. One number in the mod's JSON beats
+        // asking the artist to re-export every animation frame. 0 (the default, and every
+        // vanilla entity) changes nothing.
+        roty -= SAMBodies::yawOffsetForEntity(entity);
+#endif
         rotz = 360.0 - entity->pitch * 180.0 / PI; // pitch
         (void)rotate_mat(&m, &t, roty, &i.y); t = m; // yaw
         (void)rotate_mat(&m, &t, rotz, &i.z); t = m; // pitch
         (void)rotate_mat(&m, &t, rotx, &i.x); t = m; // roll
     }
 
+#ifndef EDITOR
+    // S.A.M: slide a custom body along its own facing. The entity origin is where the
+    // engine spawns attacks and measures reach from, and on a long creature that origin
+    // sits mid-body -- so a dragon looks like it bites with its belly. Offsetting the MODEL
+    // backward puts its head on the origin instead. Applied here, after the rotation, so the
+    // offset follows the creature's facing rather than the world axes.
+    {
+        double samFwd = 0.0, samSide = 0.0, samUp = 0.0;
+        if ( SAMBodies::offsetForEntity(entity, samFwd, samSide, samUp) )
+        {
+            // We are inside the frame produced by the rotation above, which INCLUDES the
+            // body's yaw_offset. Left raw, a "forward" offset comes out rotated by that same
+            // correction (at yaw_offset 270 it lands sideways). Undo it here so "forward"
+            // always means the direction the creature actually faces.
+            const double samYawRad = SAMBodies::yawOffsetForEntity(entity) * PI / 180.0;
+            const double samCos = cos(samYawRad), samSin = sin(samYawRad);
+            const double fx = samFwd * samCos - samSide * samSin;
+            const double fy = samFwd * samSin + samSide * samCos;
+            v = vec4((float)(fx * 2.f), (float)(-samUp * 2.f), (float)(fy * 2.f), 0.f);
+            (void)translate_mat(&m, &t, &v); t = m;
+        }
+    }
+#endif
     v = vec4(entity->focalx * 2.f, -entity->focalz * 2.f, entity->focaly * 2.f, 0.f);
     (void)translate_mat(&m, &t, &v); t = m;
     v = vec4(entity->scalex, entity->scaley, entity->scalez, 0.f);

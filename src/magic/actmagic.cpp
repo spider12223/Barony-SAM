@@ -25,6 +25,8 @@
 #include "../prng.hpp"
 #include "magic.hpp"
 #include "../mod_tools.hpp"
+#include "sam_spells.hpp"   // v1.5.0: custom-spell on_hit_effect application
+#include "sam_effects.hpp"  // v1.5.0: default duration for a custom effect slot
 
 static ConsoleVariable<float> cvar_magic_fx_light_bonus("/magic_fx_light_bonus", 0.25f);
 static ConsoleVariable<bool> cvar_magic_fx_use_vismap("/magic_fx_use_vismap", true);
@@ -1376,6 +1378,30 @@ bool magicOnSpellCastEvent(Entity* parent, Entity* projectile, Entity* hitentity
 void magicOnEntityHit(Entity* parent, Entity* particle, Entity* hitentity, Stat* hitstats, Sint32 preResistanceDamage, Sint32 damage, Sint32 oldHP, int spellID, int selfCastUsingItem)
 {
 	if ( !hitentity  ) { return; }
+
+	// v1.5.0 S.A.M custom-spell on_hit_effect: a custom spell applies a status effect (vanilla
+	// or a custom "ns:effect") to whatever it strikes. It lives HERE because this is the one
+	// call every damaging payload makes on impact. It used to sit inside the force-bolt
+	// branch of actMagicMissile alone, so a custom fire/cold/lightning/... spell resolved its
+	// effect, logged it, tagged its tooltip, and never applied it. Pure no-op for vanilla
+	// spells (ID < SAM_SPELL_ID_BASE) and when no custom spell is registered.
+	if ( hitstats && spellID >= SAM_SPELL_ID_BASE && SAMSpells::count() > 0 )
+	{
+		if ( const SAMSpellDef* samsp = SAMSpells::getSpell(spellID) )
+		{
+			if ( samsp->onHitEffectSlot >= 0 )
+			{
+				const int chance = ( samsp->onHitChance <= 0 ) ? 100 : samsp->onHitChance;
+				if ( (int)(local_rng.rand() % 100) < chance )
+				{
+					int dur = samsp->onHitDuration;
+					if ( dur <= 0 ) { dur = SAMEffects::defaultDurationForSlot(samsp->onHitEffectSlot); }
+					if ( dur <= 0 ) { dur = TICKS_PER_SECOND * 5; }
+					hitentity->setEffect(samsp->onHitEffectSlot, true, dur, true);
+				}
+			}
+		}
+	}
 
 	if ( hitstats )
 	{
@@ -3461,6 +3487,8 @@ void actMagicMissile(Entity* my)   //TODO: Verify this function.
 							hit.entity->modHP(-damage);
 							magicOnEntityHit(parent, my, hit.entity, hitstats, preResistanceDamage, damage, oldHP, spell ? spell->ID : SPELL_NONE);
 							magicTrapOnHit(parent, hit.entity, hitstats, oldHP, spell ? spell->ID : SPELL_NONE);
+
+							// (S.A.M on_hit_effect now lives in magicOnEntityHit, so every payload gets it.)
 
 							int numGibs = damage / 2;
 							numGibs = std::min(5, numGibs);

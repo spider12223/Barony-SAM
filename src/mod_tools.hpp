@@ -24,6 +24,7 @@ See LICENSE for details.
 #include "scores.hpp"
 #include "entity.hpp"
 #include "ui/Widget.hpp"
+#include "sam_monsters.hpp" // mod-declared monster traits (SAMMonsters::traitsForName)
 
 #ifdef USE_LIBCURL
 #include <curl/curl.h>
@@ -637,6 +638,26 @@ public:
 			//myStats->clearStats();
 			setStats(myStats);
 			setItems(myStats);
+
+			// S.A.M: stamp this variant's mod-declared traits. setStats has just copied the
+			// variant NAME into myStats->name, and that name is the only thing identifying a
+			// custom monster -- it is a variant of a vanilla Monster type and shares that
+			// type. The bitmask goes into attributes (which already round-trips through
+			// saves for followers, and is already carried by copyStats) as a short hex
+			// string, then the fast-read cache is derived from it.
+			//
+			// traitsForName answers 0 for every vanilla variant, so nothing is written and
+			// no attribute appears without a mod.
+			{
+				const unsigned long long samTr = SAMMonsters::traitsForName(myStats->name);
+				if ( samTr != 0 )
+				{
+					char samHex[24];
+					snprintf(samHex, sizeof(samHex), "%llx", samTr);
+					myStats->attributes["samtr"] = samHex;
+					samRefreshTraits(myStats);
+				}
+			}
 
 			if ( isMonsterNameGeneric )
 			{

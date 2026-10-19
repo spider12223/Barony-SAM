@@ -13,6 +13,10 @@ See LICENSE for details.
 #include "game.hpp"
 #include "stat.hpp"
 #include "entity.hpp"
+#ifndef EDITOR
+#include "sam_bodies.hpp" // custom creature body models
+#endif
+#include "sam_items.hpp" // custom weapon skill (weapon_skill); "worn_like" for hats, masks, gloves, boots
 #include "items.hpp"
 #include "monster.hpp"
 #include "engine/audio/sound.hpp"
@@ -30,6 +34,15 @@ See LICENSE for details.
 #include "scores.hpp"
 #include "menu.hpp"
 #include "mod_tools.hpp"
+#include "sam_classes.hpp" // S.A.M Framework custom classes
+#include "sam_races.hpp"   // S.A.M custom races — declared allegiance overlay
+#include "sam_lua_runtime.hpp"
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
+#include "sam_effects.hpp"     // S.A.M custom status effects — flat attribute modifiers
+#include "sam_combat.hpp"      // S.A.M species damage resistance + the on_damage_multiplier hook
+#include "sam_rules.hpp"       // S.A.M stat modifiers, effect immunity, the XP curve
+#include "sam_js_runtime.hpp"  // S.A.M Framework JavaScript + TypeScript runtime
+#include "sam_loot.hpp"        // S.A.M: the "monster" roll context around createMonsterEquipment
 #include "interface/ui.hpp"
 #ifdef __ARM_NEON__
 #include <arm_neon.h>
@@ -83,6 +96,27 @@ struct ClassBaseGrowths
 	static const std::vector<ClassHPMPValues> classBaseGrowths;
 	static const ClassHPMPValues& getClassBaseGrowths(int classnum)
 	{
+		// S.A.M custom class ids (>= SAM_CLASS_ID_BASE) sit far outside this table, so the
+		// bounds check below silently sent every one of them to the "default" row at index
+		// 0 — meaning every custom class ever published shared identical HP/MP growth and
+		// HP/MP regen no matter what its JSON said. Build the row from the class's own
+		// "growth" block instead. This one lookup feeds all three callers: per-level
+		// growth, health regen, and mana regen.
+		if ( classnum >= SAM_CLASS_ID_BASE )
+		{
+			if ( const SAMClassDef* samDef = SAMClasses::getClass(classnum) )
+			{
+				// Scratch row: every caller binds the reference and reads it immediately,
+				// never holding two at once, so one static is safe here — and unlike a
+				// cache it can never go stale when a mod is reloaded.
+				static ClassHPMPValues samRow;
+				samRow.baseHP      = samDef->growthHP;
+				samRow.baseMP      = samDef->growthMP;
+				samRow.baseRegenHP = samDef->growthRegenHP;
+				samRow.baseRegenMP = samDef->growthRegenMP;
+				return samRow;
+			}
+		}
 		if ( classnum >= 0 && (classnum + 1) < classBaseGrowths.size() )
 		{
 			return classBaseGrowths.at(classnum + 1);
@@ -131,6 +165,12 @@ const std::vector<ClassBaseGrowths::ClassHPMPValues> ClassBaseGrowths::classBase
 
 Entity::~Entity()
 {
+#ifndef EDITOR
+	// S.A.M: drop any custom-body tag for this uid so short-lived entities (death gibs above
+	// all) cannot accumulate entries. Guarded inside by an empty-map check, so vanilla pays
+	// one integer compare per entity destruction.
+	SAMBodies::forget(uid);
+#endif
 	node_t* node;
 	//node_t *node2;
 	int i;
@@ -755,6 +795,44 @@ void sustainedSpellProcess(Entity& entity, Stat& myStats, int effectID, std::map
 			bOutDissipated = false; //Sustained the spell, so do not stop being invisible.
 		}
 	}
+}
+
+// S.A.M: EFF_* id -> stable lowercase name for scripting hooks. The engine has no
+// reverse map for effects, so we own one. Indexed by EFF_ id (contiguous 0..134 in
+// stat.hpp); anything out of range -> "unknown". sizeof-derived bound stays correct
+// even if the enum grows.
+static std::string samEffectName(int e)
+{
+	static const char* const kNames[] = {
+		"asleep","poisoned","stunned","confused","drunk","invisible","blind","greasy",
+		"messy","fast","paralyzed","levitating","telepath","vomiting","bleeding","slow",
+		"magicresist","magicreflect","vampiricaura","shrine_red_buff","shrine_green_buff",
+		"shrine_blue_buff","hp_regen","mp_regen","pacify","polymorph","knockback","withdrawal",
+		"potion_str","shapeshift","webbed","fear","magicamplify","disoriented","shadow_tagged",
+		"trolls_blood","flutter","dash","distracted_cooldown","mimic_locked","rooted",
+		"nausea_protection","con_bonus","pwr","agility","rally","marigold","ensemble_flute",
+		"ensemble_lyre","ensemble_drum","ensemble_lute","ensemble_horn","lift","guard_spirit",
+		"guard_body","divine_guard","nimbleness","greater_might","counsel","sturdiness",
+		"bless_food","pinpoint","penance","sacred_path","detect_enemy","blood_ward","true_blood",
+		"divine_zeal","maximise","minimise","weakness","incoherence","overcharge","envenom_weapon",
+		"magic_grease","command","mimic_void","curse_flesh","numbing_bolt","delay_pain",
+		"seek_creature","taboo","courage","cowardice","spores","abundance","greater_abundance",
+		"preserve","mist_form","force_shield","lighten_load","attract_items","return_item",
+		"demesne_door","reflector_shield","dizzy","spin","critical_spell","magic_well","static",
+		"absorb_magic","flame_cloak","dusted","noise_visibility","ration_spicy","ration_sour",
+		"ration_bitter","ration_hearty","ration_herbal","ration_sweet","growth","thorns",
+		"bladevines","bastion_mushroom","bastion_roots","foci_light_peace","foci_light_justice",
+		"foci_light_providence","foci_light_purity","foci_light_sanctuary","stasis","hp_mp_regen",
+		"disrupted","frost","magicians_armor","project_spirit","defy_flesh","pinpoint_damage",
+		"salamander_heart","divine_fire","healing_word","holy_fire","sigil","sanctuary","ducked"
+	};
+	const int n = (int)(sizeof(kNames) / sizeof(kNames[0]));
+	if ( e >= 0 && e < n ) { return kNames[e]; }
+	// Custom S.A.M effects live in slots >= SAM_EFFECT_SLOT_BASE and have a "ns:effect" id of
+	// their own. Every hook about one of them used to say "unknown", so a script could not
+	// tell two custom effects apart.
+	const std::string custom = SAMEffects::nameForSlot(e);
+	return custom.empty() ? std::string("unknown") : custom;
 }
 
 void Entity::effectTimes()
@@ -1526,6 +1604,48 @@ void Entity::effectTimes()
 		if ( myStats->EFFECTS_TIMERS[c] > 0 )
 		{
 			myStats->EFFECTS_TIMERS[c]--;
+			// S.A.M scripting hook: player.on_status_effect_tick. Host-only, players ONLY
+			// (effectTimes also runs for every monster), throttled to ~1/sec so per-tick
+			// countdowns don't flood scripts. Only copied primitives cross the boundary.
+			if ( player >= 0 && multiplayer != CLIENT && ( myStats->EFFECTS_TIMERS[c] % TICKS_PER_SECOND == 0 ) )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_status_effect_tick");
+					samEv.i("player", player);
+					samEv.i("effect", c);
+					samEv.s("effect_name", samEffectName(c));
+					samEv.i("ticks_remaining", (long long)myStats->EFFECTS_TIMERS[c]);
+					samEv.fire();
+				}
+			}
+#ifndef EDITOR
+			// S.A.M custom status effects: native per-second HP/MP delta (poison / regen).
+			// Host-authoritative, ~1/sec, for any entity carrying a registered SAM effect.
+			// modHP routes damage through the normal death/obituary path. Dead in vanilla.
+			if ( SAMEffects::any() && multiplayer != CLIENT && c >= SAM_EFFECT_SLOT_BASE
+				&& ( myStats->EFFECTS_TIMERS[c] % TICKS_PER_SECOND == 0 ) )
+			{
+				if ( const SAMEffectDef* d = SAMEffects::get(c) )
+				{
+					if ( d->hpPerSecond != 0 ) { modHP(d->hpPerSecond); }
+					if ( d->mpPerSecond != 0 )
+					{
+						myStats->MP += d->mpPerSecond;
+						if ( myStats->MP < 0 ) { myStats->MP = 0; }
+						if ( myStats->MP > myStats->MAXMP ) { myStats->MP = myStats->MAXMP; }
+					}
+					// v1.5.0 grants: keep the granted vanilla flag(s) asserted while this custom effect
+					// is active; they decay ~3s after it ends. Allowlisted flags are all below
+					// SAM_EFFECT_SLOT_BASE, so already processed earlier this tick -> safe to touch here.
+					// Refresh every second (this arm runs ~1/sec) to a window comfortably longer than
+					// that interval, so a granted flag never lapses to 0 while the parent is active
+					// (which would fire a spurious on_effect_removed+applied pair). setEffect on an
+					// already-active flag doesn't re-fire on_effect_applied, so this stays quiet.
+					for ( int gf : d->grants ) { setEffect(gf, true, TICKS_PER_SECOND * 3, true); }
+				}
+			}
+#endif
 			if ( c == EFF_POLYMORPH )
 			{
 				if ( myStats->EFFECTS_TIMERS[c] == TICKS_PER_SECOND * 15 )
@@ -2409,6 +2529,32 @@ void Entity::effectTimes()
 					default:
 						break;
 				}
+				// S.A.M scripting hook: player.on_effect_removed (timer-expiry path). Fires
+				// once, on the tick an effect's timer reaches 0 and it was cleared. The
+				// !getEffectActive guard excludes sustained spells that re-applied themselves
+				// inside the switch above. Host-only, players only.
+				if ( player >= 0 && multiplayer != CLIENT && !myStats->getEffectActive(c) )
+				{
+					{
+						SamEvent samEv;
+						samEv.setName("player.on_effect_removed");
+						samEv.i("player", player);
+						samEv.i("effect", c);
+						samEv.s("effect_name", samEffectName(c));
+						samEv.fire();
+					}
+					
+					// v1.5.0: also fire on_effect_expired for a NATURAL timeout, so a script can tell
+					// "wore off on its own" from "was cured" (on_effect_removed fires for both).
+					{
+						SamEvent samEv;
+						samEv.setName("player.on_effect_expired");
+						samEv.i("player", player);
+						samEv.i("effect", c);
+						samEv.s("effect_name", samEffectName(c));
+						samEv.fire();
+					}
+				}
 				if ( player > 0 && multiplayer == SERVER )
 				{
 					needServerUpdateEffects = true;
@@ -2759,6 +2905,29 @@ bool Entity::increaseSkill(int skill, bool notify)
 		net_packet->address.port = net_clients[player - 1].port;
 		net_packet->len = 21;
 		sendPacketSafe(net_sock, -1, net_packet, player - 1);
+	}
+
+	// S.A.M scripting hook: player.on_proficiency_increased. Fires only on a genuine
+	// +1 skill-up (increased==true) for a player, host-only. No stable English
+	// proficiency-name table exists in the engine, so we carry one inline (PRO_ order).
+	if ( increased && player >= 0 && multiplayer != CLIENT )
+	{
+		static const char* const kProfNames[NUMPROFICIENCIES] = {
+			"lockpicking", "stealth", "trading", "appraisal", "thaumaturgy", "leadership",
+			"mysticism", "sorcery", "ranged", "sword", "mace", "axe", "polearm", "shield",
+			"unarmed", "alchemy"
+		};
+		const char* profName = ( skill >= 0 && skill < NUMPROFICIENCIES ) ? kProfNames[skill] : "unknown";
+		{
+			SamEvent samEv;
+			samEv.setName("player.on_proficiency_increased");
+			samEv.i("player", player);
+			samEv.i("proficiency", skill);
+			samEv.s("proficiency_name", profName);
+			samEv.i("old_rank", (long long)(myStats->getProficiency(skill) - 1));
+			samEv.i("new_rank", (long long)myStats->getProficiency(skill));
+			samEv.fire();
+		}
 	}
 
 	return increased;
@@ -3265,6 +3434,15 @@ void Entity::modHP(int amount)
 		}
 	}
 
+	// S.A.M: a script may declare an entity immune to damage (sam_set_damage_immune). Placed with
+	// the engine's own immunities and written the same way -- godmode, stasis and the salamander
+	// heart all set `amount = 0` and let the rest of the function run, because the tail still has
+	// work to do for a player. The set is empty in a vanilla game, so this is one comparison.
+	if ( amount < 0 && SAMLua::isDamageImmune(getUID()) )
+	{
+		amount = 0;
+	}
+
 	if ( entitystats && entitystats->getEffectActive(EFF_STASIS) )
 	{
 		amount = 0;
@@ -3324,6 +3502,97 @@ void Entity::modHP(int amount)
 		}
 	}
 
+	// S.A.M scripting hook (v0.7.0): on_before_damage — fires just before a player's HP
+	// is reduced, letting a script rewrite the incoming damage via sam_modify_damage
+	// (e.g. a Last-Stand shield or full invincibility). Host-authoritative. The guard
+	// against an already-active window prevents a script that deals damage inside the
+	// callback from recursing. modHP carries no attacker, so source is reported unknown.
+	if ( behavior == &actPlayer && amount < 0 && skill[2] >= 0 && multiplayer != CLIENT
+		&& !SAMLua::beforeDamageActive() )
+	{
+		const int samPlayer      = skill[2];
+		const long long samOrig  = (long long)( -amount );
+		SAMLua::beforeDamageBegin(samPlayer, samOrig);
+
+		SAMLua::Event ev; ev.setName("on_before_damage");
+		ev.i("player", samPlayer); ev.i("damage", samOrig);
+		ev.i("source_uid", 0);     ev.i("source_type", -1);
+		SAMLua::dispatchEvent(ev);
+
+		// Capture Lua's verdict NOW, between the two passes. The runtimes keep separate
+		// latches and the Lua one is reset by every dispatch -- a JS handler that fires a
+		// nested event (sam_fire_hook, sam_apply_effect, ...) re-enters SAMLua::dispatchEvent
+		// and overwrites it with the nested hook's verdict, silently discarding a Lua
+		// handler's `return false`. sam_event.cpp does exactly this for the converted sites.
+		const bool samLuaVeto = SAMLua::lastDispatchCancelled();
+		SAMJs::Event jsev; jsev.setName("on_before_damage");
+		jsev.i("player", samPlayer); jsev.i("damage", samOrig);
+		jsev.i("source_uid", 0);     jsev.i("source_type", -1);
+		SAMJs::dispatchEvent(jsev);
+
+		// Two ways to change this number, and they compose. sam_modify_damage is the original
+		// call-based path; `event.damage = x` is the general write-back every other event
+		// uses. Read the write-back relative to what modify_damage left, so a script using
+		// either one -- or a pair of mods using one each -- all land.
+		long long samFinal = SAMLua::beforeDamageEnd();
+		// Compare against the ORIGINAL, not against samFinal. The write-back store always
+		// holds a "damage" entry -- it is seeded from the event -- so asking for it with a
+		// fallback would never report "untouched", and a script that used only the older
+		// sam_modify_damage would have its result silently overwritten by the unchanged
+		// original. A value that differs from what the engine put in is a real edit.
+		const long long samWritten = SAMLua::lastEventInt("damage", samOrig);
+		if ( samWritten != samOrig ) { samFinal = samWritten; }
+		if ( samFinal < 0 ) { samFinal = 0; }
+		// A handler returning false means "this hit does not happen".
+		// Both runtimes, not just Lua: they keep separate latches, so reading one ignores a
+		// veto written in the other language.
+		if ( samLuaVeto || SAMJs::lastDispatchCancelled() ) { samFinal = 0; }
+		amount = -(int)samFinal; // apply the (possibly rewritten) damage
+		if ( amount == 0 )
+		{
+			// Damage fully negated by a script — nothing to apply, and the vanilla
+			// on_damage_taken hook below won't fire (oldHP == HP).
+			inputs.addRumbleForPlayerHPLoss(skill[2], 0);
+			return;
+		}
+	}
+
+	// S.A.M scripting hook: on_before_monster_damage — the monster-side counterpart of
+	// on_before_damage above. A script rewrites the incoming value with
+	// sam_modify_monster_damage, which is what makes "double damage to undead" or "this
+	// boss ignores fire" expressible without an engine change. Setting it to 0 negates the
+	// hit entirely. Host-authoritative, and guarded against re-entry the same way: a script
+	// that deals damage inside the callback must not recurse.
+	if ( behavior == &actMonster && amount < 0 && multiplayer != CLIENT
+		&& !SAMLua::beforeMonsterDamageActive() )
+	{
+		const long long samOrig = (long long)( -amount );
+		SAMLua::beforeMonsterDamageBegin(samOrig);
+
+		const long long samUid  = (long long)getUID();
+		const long long samType = entitystats ? (long long)entitystats->type : -1;
+
+		SAMLua::Event ev; ev.setName("on_before_monster_damage");
+		ev.i("monster_uid", samUid).i("monster_type", samType).i("damage", samOrig);
+		SAMLua::dispatchEvent(ev);
+
+		const bool samLuaVeto = SAMLua::lastDispatchCancelled();   // see on_before_damage above
+		SAMJs::Event jsev; jsev.setName("on_before_monster_damage");
+		jsev.i("monster_uid", samUid).i("monster_type", samType).i("damage", samOrig);
+		SAMJs::dispatchEvent(jsev);
+
+		long long samMonFinal = SAMLua::beforeMonsterDamageEnd();
+		const long long samMonWritten = SAMLua::lastEventInt("damage", samOrig);
+		if ( samMonWritten != samOrig ) { samMonFinal = samMonWritten; }
+		if ( samMonFinal < 0 ) { samMonFinal = 0; }
+		if ( samLuaVeto || SAMJs::lastDispatchCancelled() ) { samMonFinal = 0; }
+		amount = -(int)samMonFinal;
+		if ( amount == 0 )
+		{
+			return; // fully negated by a script; nothing to apply
+		}
+	}
+
 	Sint32 oldHP = entitystats->HP;
 	this->setHP(entitystats->HP + amount);
 	if ( oldHP > entitystats->HP )
@@ -3332,6 +3601,52 @@ void Entity::modHP(int amount)
 		{
 			Compendium_t::Events_t::eventUpdateCodex(skill[2], Compendium_t::CPDM_HP_LOST_RUN, "hp", oldHP - entitystats->HP);
 			Compendium_t::Events_t::eventUpdateCodex(skill[2], Compendium_t::CPDM_HP_LOST_TOTAL, "hp", oldHP - entitystats->HP);
+
+			// S.A.M scripting hook: this player just took damage (universal HP-loss
+			// funnel). Host-authoritative only. modHP carries no attacker, so the
+			// source is reported unknown (source_uid 0 / source_type -1).
+			if ( skill[2] >= 0 && multiplayer != CLIENT )
+			{
+				const long long samDmg    = (long long)( oldHP - entitystats->HP );
+				const int       samLethal = ( entitystats->HP <= 0 ) ? 1 : 0;
+
+				// One event, fired once, to both runtimes -- see sam_event.hpp. Replaces two
+				// near-identical blocks that each built their own copy of this payload even
+				// when no mod was loaded.
+				SamEvent(  "player.on_damage_taken" )
+					.i("player", skill[2]).i("damage", samDmg)
+					.i("hp", entitystats->HP).i("maxhp", entitystats->MAXHP)
+					.i("source_uid", 0).i("source_type", -1).i("lethal", samLethal)
+					.fire();
+
+				// NOTE: this hook is deliberately read-only. Changing damage belongs in
+				// on_before_damage, which fires ahead of the change instead of refunding HP
+				// afterwards, and which can also negate the hit outright. Two mechanisms for
+				// one number, at different points in the same function, is how a shield mod
+				// and an armour mod end up fighting each other.
+			}
+		}
+		else if ( behavior == &actMonster && multiplayer != CLIENT )
+		{
+			// S.A.M scripting hook (v0.7.0 F4): a monster just took damage (universal
+			// HP-loss funnel). Host-authoritative only. modHP carries no attacker, so the
+			// attacker is reported unknown (attacker_uid 0).
+			const long long samMonUid    = (long long)getUID();
+			const long long samMonType   = (long long)entitystats->type;
+			const long long samMonDmg    = (long long)( oldHP - entitystats->HP );
+			const int       samMonLethal = ( entitystats->HP <= 0 ) ? 1 : 0;
+
+			SAMLua::Event ev;
+			ev.setName("on_monster_damaged").i("monster_uid", samMonUid).i("monster_type", samMonType)
+				.i("damage", samMonDmg).i("hp", entitystats->HP).i("max_hp", entitystats->MAXHP)
+				.i("attacker_uid", 0).i("lethal", samMonLethal);
+			SAMLua::dispatchEvent(ev);
+
+			SAMJs::Event jsev;
+			jsev.setName("on_monster_damaged").i("monster_uid", samMonUid).i("monster_type", samMonType)
+				.i("damage", samMonDmg).i("hp", entitystats->HP).i("max_hp", entitystats->MAXHP)
+				.i("attacker_uid", 0).i("lethal", samMonLethal);
+			SAMJs::dispatchEvent(jsev);
 		}
 	}
 }
@@ -4059,12 +4374,17 @@ void Entity::handleEffects(Stat* myStats)
 		myStats->EXP = 0;
 	}
 
+	// S.A.M: a mod may set its own progression curve. The vanilla scaling is commented out
+	// beside this line, which is why the threshold has always been a flat 100; anyXpCurve() is
+	// one bool test and xpThreshold answers 100 for any level a mod did not name.
 	int expToLevel = 100/* + 10 * ((myStats->LVL) / 10)*/;
+	if ( SAMRules::anyXpCurve() ) { expToLevel = SAMRules::xpThreshold((int)myStats->LVL); }
 
 	// level ups
 	if ( myStats->EXP >= expToLevel )
 	{
 		myStats->EXP -= expToLevel;
+
 		if ( player >= 0 )
 		{
 			if ( myStats->LVL < 255 )
@@ -4569,6 +4889,42 @@ void Entity::handleEffects(Stat* myStats)
 			}
 		}
 
+		// S.A.M scripting hook: notify Lua + JavaScript/TypeScript behavior scripts
+		// that a player just leveled up. Host-authoritative ONLY (never on a remote
+		// client). Only COPIED primitives cross into scripts — never an Entity*/Stat*.
+		if ( player >= 0 && multiplayer != CLIENT )
+		{
+			// Which stats rose this level (names only, a copied string).
+			static const char* const kStatNames[NUMSTATS] = { "STR", "DEX", "CON", "INT", "PER", "CHR" };
+			std::string statsRose;
+			for ( int samStat = 0; samStat < NUMSTATS; ++samStat )
+			{
+				if ( statIncrease[samStat] > 0 )
+				{
+					if ( !statsRose.empty() ) { statsRose += ","; }
+					statsRose += kStatNames[samStat];
+				}
+			}
+
+			// Lua scripts.
+			SAMLua::Event ev;
+			ev.setName("player.on_level_up");
+			ev.i("player", player);
+			ev.i("level", myStats->LVL);
+			ev.i("amount", myStats->LVL); // new level number (scripts read event.amount)
+			ev.s("stats", statsRose);
+			SAMLua::dispatchEvent(ev);
+
+			// JavaScript + TypeScript scripts (identical event + fields).
+			SAMJs::Event jsev;
+			jsev.setName("player.on_level_up");
+			jsev.i("player", player);
+			jsev.i("level", myStats->LVL);
+			jsev.i("amount", myStats->LVL);
+			jsev.s("stats", statsRose);
+			SAMJs::dispatchEvent(jsev);
+		}
+
 		// inform clients of stat changes
 		if ( multiplayer == SERVER )
 		{
@@ -4812,6 +5168,30 @@ void Entity::handleEffects(Stat* myStats)
 							playSoundPlayer(player, 32, 128);
 						}
 						serverUpdateHunger(player);
+					}
+					// S.A.M scripting hook: player.on_hunger_change. Host-only, players only.
+					// Fires only when HUNGER lands on one of the game's own tier edges (the same
+					// moments it shows a status message) so there is no per-tick spam. This is the
+					// downward-decay path only; eating-restore crossings are elsewhere.
+					if ( player >= 0 && multiplayer != CLIENT
+						&& ( myStats->HUNGER == noLongerFull || myStats->HUNGER == youFeelHungry
+							|| myStats->HUNGER == youFeelWeak || myStats->HUNGER == youFeelFaint ) )
+					{
+						auto samHungerTier = [&]( Sint32 h ) -> const char* {
+							return h > noLongerFull ? "oversatiated"
+								: ( h > youFeelHungry ? "content"
+								: ( h > youFeelWeak ? "hungry"
+								: ( h > youFeelFaint ? "weak" : "starving" ) ) );
+						};
+						{
+							SamEvent samEv;
+							samEv.setName("player.on_hunger_change");
+							samEv.i("player", player);
+							samEv.i("hunger", (long long)myStats->HUNGER);
+							samEv.s("hunger_level", samHungerTier(myStats->HUNGER));
+							samEv.s("old_hunger_level", samHungerTier(myStats->HUNGER + 1));
+							samEv.fire();
+						}
 					}
 				}
 			}
@@ -6546,6 +6926,21 @@ void Entity::handleEffects(Stat* myStats)
 				poisonhurt -= local_rng.rand() % (std::max(1, poisonhurt / 4));
 			}
 			this->modHP(-poisonhurt);
+			// S.A.M scripting hook: player.on_poison_tick. Host-only, players only. This
+			// modHP also fires player.on_damage_taken (scripts subscribing to both must not
+			// double-count). "stacks_remaining" is the remaining EFF_POISONED timer (poison
+			// has no real stack concept in Barony).
+			if ( player >= 0 && multiplayer != CLIENT )
+			{
+				{
+					SamEvent samEv;
+					samEv.setName("player.on_poison_tick");
+					samEv.i("player", player);
+					samEv.i("damage", poisonhurt);
+					samEv.i("stacks_remaining", (long long)myStats->EFFECTS_TIMERS[EFF_POISONED]);
+					samEv.fire();
+				}
+			}
 			for ( int tmp = 0; tmp < 3; ++tmp )
 			{
 				Entity* gib = spawnGib(this, 211);
@@ -6673,6 +7068,20 @@ void Entity::handleEffects(Stat* myStats)
 				}
 				bleedhurt = std::max(1, bleedhurt);
 				this->modHP(-bleedhurt);
+				// S.A.M scripting hook: player.on_bleed_tick. Host-only, players only. This
+				// modHP also fires player.on_damage_taken (don't double-count). "stacks_remaining"
+				// is the remaining EFF_BLEEDING timer (bleeding has no real stacks).
+				if ( player >= 0 && multiplayer != CLIENT )
+				{
+					{
+						SamEvent samEv;
+						samEv.setName("player.on_bleed_tick");
+						samEv.i("player", player);
+						samEv.i("damage", bleedhurt);
+						samEv.i("stacks_remaining", (long long)myStats->EFFECTS_TIMERS[EFF_BLEEDING]);
+						samEv.fire();
+					}
+				}
 				this->setObituary(Language::get(1532));
 				myStats->killer = KilledBy::BLEEDING;
 				Entity* gib = spawnGib(this);
@@ -8362,6 +8771,15 @@ Sint32 Entity::getAttack(Entity* my, Stat* myStats, bool isPlayer, int chargeMod
 		attack *= 1.0 - mult;
 	}
 
+	// S.A.M: general attack modifiers. Placed at the END of getAttack rather than inside
+	// Entity::attack, so the number a mod changes is the same one sam_get_attack and
+	// sam_preview_damage report -- a readout that disagreed with the swing would be worse than
+	// no readout.
+	if ( SAMRules::anyStatMod() )
+	{
+		attack = (Sint32)SAMRules::apply(myStats, my, SAMRules::SAM_ST_ATTACK, (double)attack);
+	}
+
 	return attack;
 }
 
@@ -8751,6 +9169,13 @@ Sint32 statGetSTR(Stat* entitystats, Entity* my)
 		}
 	}
 
+#ifndef EDITOR
+	// S.A.M custom status effects: flat STR modifier while an effect in slot 135..159 is active.
+	// Dead when no mod registers an effect (SAMEffects::any() == false).
+	if ( SAMEffects::any() ) { STR += SAMEffects::sumAttrMod(entitystats, SAM_EFF_STR); }
+	// S.A.M: general stat modifiers, beside the custom-effect seam rather than replacing it.
+	if ( SAMRules::anyStatMod() ) { STR = (Sint32)SAMRules::apply(entitystats, my, SAMRules::SAM_ST_STR, (double)STR); }
+#endif
 	return STR;
 }
 
@@ -9071,6 +9496,11 @@ Sint32 statGetDEX(Stat* entitystats, Entity* my)
 			DEX += 3;
 		}
 	}
+#ifndef EDITOR
+	if ( SAMEffects::any() ) { DEX += SAMEffects::sumAttrMod(entitystats, SAM_EFF_DEX); }
+	// S.A.M: general stat modifiers, beside the custom-effect seam rather than replacing it.
+	if ( SAMRules::anyStatMod() ) { DEX = (Sint32)SAMRules::apply(entitystats, my, SAMRules::SAM_ST_DEX, (double)DEX); }
+#endif
 	return DEX;
 }
 
@@ -9256,6 +9686,11 @@ Sint32 statGetCON(Stat* entitystats, Entity* my)
 		}
 	}
 
+#ifndef EDITOR
+	if ( SAMEffects::any() ) { CON += SAMEffects::sumAttrMod(entitystats, SAM_EFF_CON); }
+	// S.A.M: general stat modifiers, beside the custom-effect seam rather than replacing it.
+	if ( SAMRules::anyStatMod() ) { CON = (Sint32)SAMRules::apply(entitystats, my, SAMRules::SAM_ST_CON, (double)CON); }
+#endif
 	return CON;
 }
 
@@ -9375,6 +9810,11 @@ Sint32 statGetINT(Stat* entitystats, Entity* my)
 	{
 		INT -= std::max(8, static_cast<int>(INT * 0.25));
 	}
+#ifndef EDITOR
+	if ( SAMEffects::any() ) { INT += SAMEffects::sumAttrMod(entitystats, SAM_EFF_INT); }
+	// S.A.M: general stat modifiers, beside the custom-effect seam rather than replacing it.
+	if ( SAMRules::anyStatMod() ) { INT = (Sint32)SAMRules::apply(entitystats, my, SAMRules::SAM_ST_INT, (double)INT); }
+#endif
 	return INT;
 }
 
@@ -9552,6 +9992,11 @@ Sint32 statGetPER(Stat* entitystats, Entity* my)
 	{
 		PER = 0;
 	}
+#ifndef EDITOR
+	if ( SAMEffects::any() ) { PER += SAMEffects::sumAttrMod(entitystats, SAM_EFF_PER); }
+	// S.A.M: general stat modifiers, beside the custom-effect seam rather than replacing it.
+	if ( SAMRules::anyStatMod() ) { PER = (Sint32)SAMRules::apply(entitystats, my, SAMRules::SAM_ST_PER, (double)PER); }
+#endif
 	return PER;
 }
 
@@ -9649,6 +10094,11 @@ Sint32 statGetCHR(Stat* entitystats, Entity* my)
 	{
 		CHR += std::max(4, static_cast<int>(CHR * .25));
 	}
+#ifndef EDITOR
+	if ( SAMEffects::any() ) { CHR += SAMEffects::sumAttrMod(entitystats, SAM_EFF_CHR); }
+	// S.A.M: general stat modifiers, beside the custom-effect seam rather than replacing it.
+	if ( SAMRules::anyStatMod() ) { CHR = (Sint32)SAMRules::apply(entitystats, my, SAMRules::SAM_ST_CHR, (double)CHR); }
+#endif
 	return CHR;
 }
 
@@ -9715,6 +10165,12 @@ bool Entity::isWaterWalking() const
 	{
 		if ( Stat* stats = getStats() )
 		{
+			// A mod-declared "water_walking" monster crosses water unharmed, as if it
+			// were wearing the waterwalking boots. No-op for vanilla (mask 0).
+			if ( samMonsterHasTrait(stats, SAMMonsterTrait::WATER_WALKING) )
+			{
+				return true;
+			}
 			if ( stats->shoes && stats->shoes->type == IRON_BOOTS_WATERWALKING )
 			{
 				return true;
@@ -9750,6 +10206,12 @@ bool Entity::isLavaWalking() const
 	{
 		if ( Stat* stats = getStats() )
 		{
+			// A mod-declared "water_walking" monster crosses lava unharmed, as if it
+			// were wearing the waterwalking boots. No-op for vanilla (mask 0).
+			if ( samMonsterHasTrait(stats, SAMMonsterTrait::WATER_WALKING) )
+			{
+				return true;
+			}
 			if ( stats->shoes && stats->shoes->type == IRON_BOOTS_WATERWALKING )
 			{
 				return true;
@@ -10477,6 +10939,20 @@ void Entity::attack(int pose, int charge, Entity* target)
 			playSoundEntity(this, 770 + local_rng.rand() % 4, 108); // whoosh noise
 		}
 
+		// S.A.M scripting hook: player.on_attack_start — a real attack swing was initiated
+		// (any weapon type), BEFORE hit/damage resolution. Host-only, players only. For normal
+		// player attacks `target` is null (the melee target is found later via lineTrace).
+		if ( player >= 0 && multiplayer != CLIENT )
+		{
+			{
+				SamEvent samEv;
+				samEv.setName("player.on_attack_start");
+				samEv.i("player", player);
+				samEv.i("weapon_type", myStats->weapon ? (long long)myStats->weapon->type : -1);
+				samEv.i("target_uid", target ? (long long)target->getUID() : 0);
+				samEv.fire();
+			}
+		}
 		bool magicstaffStrike = false;
 
 		if ( myStats->weapon != nullptr && !(myStats->type == BUGBEAR && pose == MONSTER_POSE_BUGBEAR_SHIELD)
@@ -10562,8 +11038,25 @@ void Entity::attack(int pose, int charge, Entity* target)
 							}
 							break;
 						default:
-							messagePlayer(player, MESSAGE_DEBUG | MESSAGE_MISC, "This is my wish stick! Wishy wishy wish!");
+						{
+							// S.A.M: the cases above are EVERY vanilla MAGICSTAFF item, so this
+							// default is unreachable in an unmodded game. A custom staff (id >=
+							// NUMITEMS) lands here and used to only print the debug line. Resolve
+							// its declared spell from the registry -- the same magicstaff_spell
+							// attribute vanilla already stamps on its own staffs -- and cast it.
+							const int samStaffSpellID = getSpellIDFromMagicstaff(myStats->weapon->type);
+							spell_t* samStaffSpell = ( samStaffSpellID > SPELL_NONE )
+								? getSpellFromID(samStaffSpellID) : nullptr;
+							if ( samStaffSpell )
+							{
+								castSpell(uid, samStaffSpell, true, false);
+							}
+							else
+							{
+								messagePlayer(player, MESSAGE_DEBUG | MESSAGE_MISC, "This is my wish stick! Wishy wishy wish!");
+							}
 							break;
+						}
 					}
 
 					if ( behavior == &actPlayer && !magicstaffStrike )
@@ -11591,6 +12084,21 @@ void Entity::attack(int pose, int charge, Entity* target)
 		else
 		{
 			hit.entity = target;
+		}
+
+		// S.A.M scripting hook: player.on_miss — a melee swing connected with nothing (whiffed
+		// into air, or the target evaded). !guard excludes magician's-armor nullifies. Host-only,
+		// players only; ranged/thrown misses spawn a projectile and are not covered here.
+		if ( player >= 0 && multiplayer != CLIENT && hit.entity == nullptr && !guard )
+		{
+			{
+				SamEvent samEv;
+				samEv.setName("player.on_miss");
+				samEv.i("player", player);
+				samEv.i("target_uid", 0);
+				samEv.i("weapon_type", myStats->weapon ? (long long)myStats->weapon->type : -1);
+				samEv.fire();
+			}
 		}
 
 		if ( hit.entity != nullptr )
@@ -12768,6 +13276,12 @@ void Entity::attack(int pose, int charge, Entity* target)
 					}
 
 					int myAttack = std::max(0, (Entity::getAttack(this, myStats, behavior == &actPlayer, charge) * damagePreMultiplier) + getBonusAttackOnTarget(*hitstats));
+					// v1.5.0 custom-effect damage_mult: scale the wearer's outgoing melee damage (1.0 when none).
+					if ( SAMEffects::any() )
+					{
+						const double samAtkMult = SAMEffects::attackMult(myStats);
+						if ( samAtkMult != 1.0 ) { myAttack = std::max(0, (int)(myAttack * samAtkMult)); }
+					}
 					if ( myStats->type == BUGBEAR && pose == MONSTER_POSE_BUGBEAR_SHIELD )
 					{
 						myAttack += 2 + local_rng.rand() % 3;
@@ -13055,6 +13569,31 @@ void Entity::attack(int pose, int charge, Entity* target)
 							Compendium_t::Events_t::eventUpdate(playerhit, Compendium_t::CPDM_BLOCKED_ATTACKS, hitstats->shield->type, 1);
 							Compendium_t::Events_t::eventUpdate(playerhit, Compendium_t::CPDM_BLOCKED_HIGHEST_DMG, hitstats->shield->type, myAttack);
 						}
+						// S.A.M scripting hook: player.on_block — fires on ANY block while
+						// defending with a shield, not only a full (0-damage) block, so a
+						// "react on block" script is reliable even when the shield only
+						// partially absorbs the hit (custom shields give little base AC, so
+						// full blocks are rare). `full_block` is 1 iff all damage was negated;
+						// `damage_taken` is what leaked through. Host-only; `this` is the
+						// attacker, playerhit the blocking player.
+						if ( hitstats->defending && hitstats->shield && multiplayer != CLIENT )
+						{
+							const long long samFullBlock = ( damage <= 0 ) ? 1 : 0;
+							const long long samDamageTaken = (long long)std::max(0, damage);
+
+							{
+								SamEvent samEv;
+								samEv.setName("player.on_block");
+								samEv.i("player", playerhit);
+								samEv.i("shield_type", (long long)hitstats->shield->type);
+								samEv.i("full_block", samFullBlock);
+								samEv.i("damage_taken", samDamageTaken);
+								samEv.i("attacker_uid", (long long)this->getUID());
+								samEv.i("attacker_type", (long long)myStats->type);
+								samEv.i("damage_blocked", (long long)myAttack);
+								samEv.fire();
+							}
+						}
 
 						if ( hitstats->shield && hitstats->defending )
 						{
@@ -13133,8 +13672,103 @@ void Entity::attack(int pose, int charge, Entity* target)
 						spawnBang(hit.entity->x, hit.entity->y, hit.entity->z);
 					}
 
+					// S.A.M scripting hook: player.on_before_hit -- the swing has connected and the
+					// damage is decided, but not yet applied.
+					//
+					// This is the ONLY point in the engine where the attacker, the crit state and a
+					// writable damage figure are all in scope together. `backstab` and `flanking`
+					// are stack locals declared 300 lines above that nothing ever reads again, and
+					// Entity::modHP takes no attacker at all -- which is why on_before_damage,
+					// player.on_damage_taken and on_monster_damaged all report source_uid 0. They
+					// still do; this hook is where a mod can actually find out who swung.
+					//
+					// Rewrite the number with sam_modify_value or `event.damage = x`; a handler
+					// returning false makes the blow land for nothing.
+					//
+					// How far the swing was wound up, for this hook and player.on_hit below. The
+					// engine's own test for a full charge is charge >= getMaxAttackCharge (30, less
+					// under the Ensemble flute); held that far, chargeMult above doubled the damage,
+					// so `damage` already includes it. Reported clamped to 0..max, because the
+					// scepter passes sentinel charges (99, 100) through this same function.
+					const int samMaxCharge = Stat::getMaxAttackCharge(myStats);
+					const int samCharge = std::max(0, std::min(charge, samMaxCharge));
+					const int samFullCharge = ( charge >= samMaxCharge ) ? 1 : 0;
+					if ( player >= 0 && multiplayer != CLIENT && !SAMLua::hookValueActive()
+						&& SamEvent::anyScripts() )
+					{
+						const long long samBhOrig = (long long)damage;
+						SAMLua::hookValueBegin("player.on_before_hit", samBhOrig);
+
+						SamEvent samBh("player.on_before_hit");
+						samBh.i("player", player)
+							.i("attacker_uid", (long long)getUID())
+							.i("target_uid",   (long long)hit.entity->getUID())
+							.i("target_type",  hitstats ? (long long)hitstats->type : -1)
+							.i("damage",       samBhOrig)
+							.i("backstab",     backstab ? 1 : 0)
+							.i("flanking",     flanking ? 1 : 0)
+							.i("weapon_type",  ( myStats && myStats->weapon ) ? (long long)myStats->weapon->type : -1)
+							.i("charge",        samCharge)
+							.i("max_charge",    samMaxCharge)
+							.i("fully_charged", samFullCharge);
+						const bool samBhAllowed = samBh.fire();
+
+						long long samBhFinal = SAMLua::hookValueEnd();
+						// Compared against the ORIGINAL, not against samBhFinal. The write-back
+						// store always holds this key because we seeded it, so a fallback read
+						// could never tell "untouched" from "set to the same value" -- and a
+						// script using only sam_modify_value would have its result silently
+						// overwritten by the unchanged seed.
+						const long long samBhWritten = samBh.get("damage", samBhOrig);
+						if ( samBhWritten != samBhOrig ) { samBhFinal = samBhWritten; }
+						if ( !samBhAllowed ) { samBhFinal = 0; }
+						if ( samBhFinal < 0 ) { samBhFinal = 0; }
+						if ( samBhFinal > 2147483647LL ) { samBhFinal = 2147483647LL; }
+						damage = (int)samBhFinal;
+					}
+
 					Sint32 oldHP = hitstats->HP;
 					hit.entity->modHP(-damage); // do the damage
+
+					// S.A.M scripting hooks: a player's melee attack connected. Host-
+					// authoritative only; only COPIED primitives cross into scripts.
+					if ( player >= 0 && multiplayer != CLIENT )
+					{
+						const long long samTgtUid  = (long long)hit.entity->getUID();
+						const int       samTgtType = (int)hitstats->type;
+						const int       samWpnType = ( myStats && myStats->weapon ) ? (int)myStats->weapon->type : -1;
+						const int       samLethal  = ( oldHP > 0 && hitstats->HP <= 0 ) ? 1 : 0;
+
+						SAMLua::Event ev;
+						ev.setName("player.on_hit").i("player", player).i("target_uid", samTgtUid)
+							.i("target_type", samTgtType).i("damage", damage)
+							.i("weapon_type", samWpnType).i("lethal", samLethal)
+							.i("charge", samCharge).i("max_charge", samMaxCharge).i("fully_charged", samFullCharge);
+						SAMLua::dispatchEvent(ev);
+
+						SAMJs::Event jsev;
+						jsev.setName("player.on_hit").i("player", player).i("target_uid", samTgtUid)
+							.i("target_type", samTgtType).i("damage", damage)
+							.i("weapon_type", samWpnType).i("lethal", samLethal)
+							.i("charge", samCharge).i("max_charge", samMaxCharge).i("fully_charged", samFullCharge);
+						SAMJs::dispatchEvent(jsev);
+
+						// A lethal blow also fires on_kill (this melee path only).
+						if ( samLethal )
+						{
+							SAMLua::Event kev;
+							kev.setName("player.on_kill").i("player", player).i("target_uid", samTgtUid)
+								.i("target_type", samTgtType).i("was_lethal", 1);
+							SAMLua::dispatchEvent(kev);
+
+							SAMJs::Event jkev;
+							jkev.setName("player.on_kill").i("player", player).i("target_uid", samTgtUid)
+								.i("target_type", samTgtType).i("was_lethal", 1);
+							SAMJs::dispatchEvent(jkev);
+
+							SAMLua::noteKill(player); // Part 5: session kill counter
+						}
+					}
 
 					if ( hitstats )
 					{
@@ -16912,6 +17546,15 @@ Returns armor class value from a Stat instance
 
 -------------------------------------------------------------------------------*/
 
+// S.A.M: general AC modifiers, applied to the FINISHED number at both of AC()'s exits. The seam
+// used to sit after CON and before the gear, which was harmless for an add but made a multiplier
+// scale CON alone: an "AC x2" left the armour, the shield and the parry bonus exactly as they were.
+static int samRulesAC(Stat* stat, int armor)
+{
+	if ( SAMRules::anyStatMod() ) { armor = (int)SAMRules::apply(stat, nullptr, SAMRules::SAM_ST_AC, (double)armor); }
+	return armor;
+}
+
 int AC(Stat* stat)
 {
 	if ( !stat )
@@ -16934,6 +17577,7 @@ int AC(Stat* stat)
 		}
 	}
 	int armor = statGetCON(stat, playerEntity);
+	if ( SAMEffects::any() ) { armor += SAMEffects::sumACMod(stat); } // v1.5.0 custom-effect ac_mod (0 when none)
 	if ( stat->getEffectActive(EFF_FOCI_LIGHT_SANCTUARY) )
 	{
 		armor += getSpellDamageFromID(SPELL_FOCI_LIGHT_SANCTUARY, nullptr, nullptr, nullptr);
@@ -16995,7 +17639,7 @@ int AC(Stat* stat)
 		{
 			if ( stat == stats[i] ) // is a player stat pointer.
 			{
-				return armor; // shapeshifted players do not benefit from shield defense/proficiency.
+				return samRulesAC(stat, armor); // shapeshifted players do not benefit from shield defense/proficiency.
 			}
 		}
 	}
@@ -17040,7 +17684,9 @@ int AC(Stat* stat)
 		armor *= 2;
 	}
 
-	return armor;
+	// AC() is handed no Entity, so the target is resolved from the Stat pointer alone: a player
+	// by slot, a monster by asking each modded creature whether this stat block is its own.
+	return samRulesAC(stat, armor);
 }
 
 /*-------------------------------------------------------------------------------
@@ -18183,6 +18829,29 @@ void Entity::awardXP(Entity* src, bool share, bool root)
 					}
 				}
 			}
+		}
+		// S.A.M scripting hook: player.on_xp_gained — a player recipient is about to gain
+		// kill XP. Fires BEFORE the award (it used to fire after) so a script can rewrite the
+		// amount with sam_modify_value -- custom progression curves, an XP-boost class, a
+		// cursed item that halves gains. awardXP recurses for shared/party XP, but each
+		// player recipient reaches here exactly once per kill. Host-only.
+		if ( behavior == &actPlayer && multiplayer != CLIENT && !SAMLua::hookValueActive() )
+		{
+			SAMLua::hookValueBegin("player.on_xp_gained", (long long)gain);
+
+			SAMLua::Event evPre;
+			evPre.setName("player.on_xp_gained");
+			evPre.i("player", skill[2]).i("amount", (long long)gain).s("source_type", "kill")
+				.i("monster_type", srcStats ? (long long)srcStats->type : -1);
+			SAMLua::dispatchEvent(evPre);
+
+			SAMJs::Event jsevPre;
+			jsevPre.setName("player.on_xp_gained");
+			jsevPre.i("player", skill[2]).i("amount", (long long)gain).s("source_type", "kill")
+				.i("monster_type", srcStats ? (long long)srcStats->type : -1);
+			SAMJs::dispatchEvent(jsevPre);
+
+			gain = (int)SAMLua::hookValueEnd();
 		}
 		destStats->EXP += gain;
 	}
@@ -19344,6 +20013,31 @@ bool Entity::checkEnemy(Entity* your)
 				}
 			}
 
+			// S.A.M: a custom race may declare relations its host body does not have.
+			//
+			// Applied here, at the END of the allegiance chain, so it overrides the host
+			// body's verdict but still leaves masks (below) and confusion (further below)
+			// free to override IT — the same order of precedence a vanilla race gets.
+			//
+			// Unreachable without a race mod: playerRace is 0 for every vanilla race, so
+			// the guard fails before declaredAllegiance is even called. stat_appearance
+			// != 0 means the player ticked "disable monster abilities", and allegiance is
+			// one of those abilities. Shopkeepers are skipped because a declared relation
+			// reaches them through playerRaceCheckHostility instead, where it composes with
+			// the wanted level rather than overwriting it.
+			if ( behavior == &actPlayer && myStats->playerRace >= SAM_RACE_ID_BASE
+				&& myStats->stat_appearance == 0 && yourStats->type != SHOPKEEPER )
+			{
+				const int samRel = SAMRaces::declaredAllegiance(myStats->playerRace, yourStats->type);
+				if ( samRel >= 0 ) { result = (samRel == 0); }
+			}
+			else if ( your->behavior == &actPlayer && yourStats->playerRace >= SAM_RACE_ID_BASE
+				&& yourStats->stat_appearance == 0 && myStats->type != SHOPKEEPER )
+			{
+				const int samRel = SAMRaces::declaredAllegiance(yourStats->playerRace, myStats->type);
+				if ( samRel >= 0 ) { result = (samRel == 0); }
+			}
+
 			if ( result )
 			{
 				if ( !(behavior == &actPlayer && effectShapeshift != NOTHING)
@@ -19927,6 +20621,32 @@ bool Entity::checkFriend(Entity* your)
 					}
 				}
 			}
+
+			// S.A.M: a custom race may declare relations its host body does not have.
+			//
+			// Applied here, at the END of the allegiance chain, so it overrides the host
+			// body's verdict. checkEnemy runs the mirror of this block, in the same spot,
+			// with the sense flipped — the two must agree or a monster will decline to
+			// attack an ally it also refuses to help.
+			//
+			// Unreachable without a race mod: playerRace is 0 for every vanilla race, so
+			// the guard fails before declaredAllegiance is even called. stat_appearance
+			// != 0 means the player ticked "disable monster abilities", and allegiance is
+			// one of those abilities. Shopkeepers are skipped because a declared relation
+			// reaches them through playerRaceCheckHostility instead, where it composes with
+			// the wanted level rather than overwriting it.
+			if ( behavior == &actPlayer && myStats->playerRace >= SAM_RACE_ID_BASE
+				&& myStats->stat_appearance == 0 && yourStats->type != SHOPKEEPER )
+			{
+				const int samRel = SAMRaces::declaredAllegiance(myStats->playerRace, yourStats->type);
+				if ( samRel >= 0 ) { result = (samRel == 1); }
+			}
+			else if ( your->behavior == &actPlayer && yourStats->playerRace >= SAM_RACE_ID_BASE
+				&& yourStats->stat_appearance == 0 && myStats->type != SHOPKEEPER )
+			{
+				const int samRel = SAMRaces::declaredAllegiance(yourStats->playerRace, myStats->type);
+				if ( samRel >= 0 ) { result = (samRel == 1); }
+			}
 		}
 	}
 
@@ -19936,6 +20656,9 @@ bool Entity::checkFriend(Entity* your)
 
 void createMonsterEquipment(Stat* stats, BaronyRNG& rng)
 {
+	// S.A.M: these rolls are a monster's worn gear. The uid comes from actMonster's scope around
+	// the species init when there is one; a scope of the same kind inherits it.
+	SAMLoot::ContextScope samCtx(SAMLoot::Monster, -1, -1, -1, stats ? (int)stats->type : -1);
 	int itemIndex = 0;
 	ItemType itemId;
 	Status itemStatus;
@@ -20085,6 +20808,19 @@ void createMonsterEquipment(Stat* stats, BaronyRNG& rng)
 							break;
 						default:
 							break;
+					}
+					// S.A.M: world.on_loot_rolled for a slot the curve rolled (an editor category, not a
+					// fixed item), once the item exists. itemLevelCurvePostProcess is NOT run here:
+					// vanilla does not, and it would re-roll a spellbook and rewrite a thrown weapon's
+					// status, so the event fires directly instead.
+					if ( category > 0 && stats->EDITOR_ITEMS[itemIndex * ITEM_SLOT_NUMPROPERTIES] == 1 )
+					{
+						Item* const samSlots[10] = { stats->helmet, stats->weapon, stats->shield, stats->breastplate, stats->shoes,
+							stats->ring, stats->amulet, stats->cloak, stats->mask, stats->gloves };
+						if ( itemIndex >= 0 && itemIndex < 10 && samSlots[itemIndex] )
+						{
+							SAMLoot::afterRoll(nullptr, samSlots[itemIndex], (int)itemId, false);
+						}
 					}
 				}
 			}
@@ -20238,6 +20974,24 @@ int checkEquipType(const Item *item)
 	if ( itemTypeIsQuiver(item->type) )
 	{
 		return TYPE_OFFHAND;
+	}
+	if ( item->type >= NUMITEMS && item->type < NUM_ITEM_SLOTS )
+	{
+		// S.A.M custom item: this switch keys on item->type, so a custom id would fall
+		// to default (TYPE_NONE) and drag-to-slot / auto-equip would fail. Map by the
+		// item's declared slot instead. (Weapon/amulet/ring aren't handled here in
+		// vanilla either, so they stay TYPE_NONE.)
+		switch ( items[item->type].item_slot )
+		{
+			case EQUIPPABLE_IN_SLOT_SHIELD:      return TYPE_SHIELD;
+			case EQUIPPABLE_IN_SLOT_HELM:        return TYPE_HELM;
+			case EQUIPPABLE_IN_SLOT_BREASTPLATE: return TYPE_BREASTPIECE;
+			case EQUIPPABLE_IN_SLOT_BOOTS:       return TYPE_BOOTS;
+			case EQUIPPABLE_IN_SLOT_GLOVES:      return TYPE_GLOVES;
+			case EQUIPPABLE_IN_SLOT_CLOAK:       return TYPE_CLOAK;
+			case EQUIPPABLE_IN_SLOT_MASK:        return TYPE_HAT;
+			default:                             return TYPE_NONE;
+		}
 	}
 	switch ( item->type ) {
 
@@ -20406,57 +21160,62 @@ int setGloveSprite(Stat* myStats, Entity* ent, int spriteOffset)
 	{
 		return 0;
 	}
+	// S.A.M: a mod's gloves are drawn as a vanilla pair (its "worn_like", or the pair its
+	// placeholder came from). A custom type matched nothing below and returned 0 without
+	// writing the arm, which kept its old model, and the caller's bent-arm step then added 2 to
+	// that model every tick while a weapon was held. Vanilla gloves come back unchanged.
+	const int samGloveType = SAMItems::wornTypeFor(myStats->gloves->type);
 
-	if ( myStats->gloves->type == GLOVES || myStats->gloves->type == GLOVES_DEXTERITY ) {
+	if ( samGloveType == GLOVES || samGloveType == GLOVES_DEXTERITY ) {
 		ent->sprite = 132 + myStats->sex + spriteOffset;
 	}
-	else if ( myStats->gloves->type == BRACERS || myStats->gloves->type == BRACERS_CONSTITUTION ) {
+	else if ( samGloveType == BRACERS || samGloveType == BRACERS_CONSTITUTION ) {
 		ent->sprite = 323 + myStats->sex + spriteOffset;
 	}
-	else if ( myStats->gloves->type == GAUNTLETS || myStats->gloves->type == GAUNTLETS_STRENGTH ) {
+	else if ( samGloveType == GAUNTLETS || samGloveType == GAUNTLETS_STRENGTH ) {
 		ent->sprite = 140 + myStats->sex + spriteOffset;
 	}
-	else if ( myStats->gloves->type == CRYSTAL_GLOVES )
+	else if ( samGloveType == CRYSTAL_GLOVES )
 	{
 		ent->sprite = 491 + myStats->sex + spriteOffset;
 	}
-	else if ( myStats->gloves->type == ARTIFACT_GLOVES )
+	else if ( samGloveType == ARTIFACT_GLOVES )
 	{
 		ent->sprite = 513 + myStats->sex + spriteOffset;
 	}
-	else if ( myStats->gloves->type == BRASS_KNUCKLES )
+	else if ( samGloveType == BRASS_KNUCKLES )
 	{
 		ent->sprite = 531 + myStats->sex + spriteOffset;
 	}
-	else if ( myStats->gloves->type == IRON_KNUCKLES )
+	else if ( samGloveType == IRON_KNUCKLES )
 	{
 		ent->sprite = 539 + myStats->sex + spriteOffset;
 	}
-	else if ( myStats->gloves->type == SPIKED_GAUNTLETS )
+	else if ( samGloveType == SPIKED_GAUNTLETS )
 	{
 		ent->sprite = 547 + myStats->sex + spriteOffset;
 	}
-	else if ( myStats->gloves->type == SUEDE_GLOVES )
+	else if ( samGloveType == SUEDE_GLOVES )
 	{
 		ent->sprite = 804 + (spriteOffset > 0 ? 1 : 0);
 	}
-	else if ( myStats->gloves->type == BONE_BRACERS )
+	else if ( samGloveType == BONE_BRACERS )
 	{
 		ent->sprite = 2087 + (spriteOffset > 0 ? 1 : 0);
 	}
-	else if ( myStats->gloves->type == BLACKIRON_GAUNTLETS )
+	else if ( samGloveType == BLACKIRON_GAUNTLETS )
 	{
 		ent->sprite = 2091 + (spriteOffset > 0 ? 1 : 0);
 	}
-	else if ( myStats->gloves->type == SILVER_GAUNTLETS )
+	else if ( samGloveType == SILVER_GAUNTLETS )
 	{
 		ent->sprite = 2095 + (spriteOffset > 0 ? 1 : 0);
 	}
-	else if ( myStats->gloves->type == QUILTED_GLOVES )
+	else if ( samGloveType == QUILTED_GLOVES )
 	{
 		ent->sprite = 2099 + (spriteOffset > 0 ? 1 : 0);
 	}
-	else if ( myStats->gloves->type == CHAIN_GLOVES )
+	else if ( samGloveType == CHAIN_GLOVES )
 	{
 		ent->sprite = 2103 + (spriteOffset > 0 ? 1 : 0);
 	}
@@ -20532,6 +21291,10 @@ bool Entity::setBootSprite(Entity* leg, int spriteOffset, bool forceShort)
 	{
 		return false;
 	}
+	// S.A.M: a mod's boots are drawn as a vanilla pair (its "worn_like", or the pair its
+	// placeholder came from). A custom type matched nothing below and returned false, leaving
+	// the leg on whatever model it had before. Vanilla boots come back unchanged.
+	const int samBootType = SAMItems::wornTypeFor(myStats->shoes->type);
 
 	Monster monsterType = myStats->type;
 	if ( behavior == &actPlayer )
@@ -20563,55 +21326,55 @@ bool Entity::setBootSprite(Entity* leg, int spriteOffset, bool forceShort)
 		case HUMAN:
 			if ( !shortSprite )
 			{
-				if ( myStats->shoes->type == LEATHER_BOOTS || myStats->shoes->type == LEATHER_BOOTS_SPEED )
+				if ( samBootType == LEATHER_BOOTS || samBootType == LEATHER_BOOTS_SPEED )
 				{
 					leg->sprite = 148 + myStats->sex + spriteOffset;
 				}
-				else if ( myStats->shoes->type == IRON_BOOTS || myStats->shoes->type == IRON_BOOTS_WATERWALKING )
+				else if ( samBootType == IRON_BOOTS || samBootType == IRON_BOOTS_WATERWALKING )
 				{
 					leg->sprite = 152 + myStats->sex + spriteOffset;
 				}
-				else if ( myStats->shoes->type >= STEEL_BOOTS && myStats->shoes->type <= STEEL_BOOTS_FEATHER )
+				else if ( samBootType >= STEEL_BOOTS && samBootType <= STEEL_BOOTS_FEATHER )
 				{
 					leg->sprite = 156 + myStats->sex + spriteOffset;
 				}
-				else if ( myStats->shoes->type == CRYSTAL_BOOTS )
+				else if ( samBootType == CRYSTAL_BOOTS )
 				{
 					leg->sprite = 499 + myStats->sex + spriteOffset;
 				}
-				else if ( myStats->shoes->type == ARTIFACT_BOOTS )
+				else if ( samBootType == ARTIFACT_BOOTS )
 				{
 					leg->sprite = 521 + myStats->sex + spriteOffset;
 				}
-				else if ( myStats->shoes->type == SUEDE_BOOTS )
+				else if ( samBootType == SUEDE_BOOTS )
 				{
 					leg->sprite = 808 + (spriteOffset > 0 ? 1 : 0);
 				}
-				else if ( myStats->shoes->type == BONE_BOOTS )
+				else if ( samBootType == BONE_BOOTS )
 				{
 					leg->sprite = 2067 + (spriteOffset > 0 ? 1 : 0);
 				}
-				else if ( myStats->shoes->type == BLACKIRON_BOOTS )
+				else if ( samBootType == BLACKIRON_BOOTS )
 				{
 					leg->sprite = 2065 + (spriteOffset > 0 ? 1 : 0);
 				}
-				else if ( myStats->shoes->type == SILVER_BOOTS )
+				else if ( samBootType == SILVER_BOOTS )
 				{
 					leg->sprite = 2069 + (spriteOffset > 0 ? 1 : 0);
 				}
-				else if ( myStats->shoes->type == QUILTED_BOOTS )
+				else if ( samBootType == QUILTED_BOOTS )
 				{
 					leg->sprite = 2073 + (spriteOffset > 0 ? 1 : 0);
 				}
-				else if ( myStats->shoes->type == LOAFERS )
+				else if ( samBootType == LOAFERS )
 				{
 					leg->sprite = 1439 + (spriteOffset > 0 ? -1 : 0);
 				}
-				else if ( myStats->shoes->type == CHAIN_BOOTS )
+				else if ( samBootType == CHAIN_BOOTS )
 				{
 					leg->sprite = 2071 + (spriteOffset > 0 ? 1 : 0);
 				}
-				else if ( myStats->shoes->type == CLEAT_BOOTS )
+				else if ( samBootType == CLEAT_BOOTS )
 				{
 					leg->sprite = 2063 + (spriteOffset > 0 ? 1 : 0);
 				}
@@ -20656,55 +21419,55 @@ bool Entity::setBootSprite(Entity* leg, int spriteOffset, bool forceShort)
 
 	if ( !shortSprite )
 	{
-		if ( myStats->shoes->type == LEATHER_BOOTS || myStats->shoes->type == LEATHER_BOOTS_SPEED )
+		if ( samBootType == LEATHER_BOOTS || samBootType == LEATHER_BOOTS_SPEED )
 		{
 			leg->sprite = 148 + spriteOffset;
 		}
-		else if ( myStats->shoes->type == IRON_BOOTS || myStats->shoes->type == IRON_BOOTS_WATERWALKING )
+		else if ( samBootType == IRON_BOOTS || samBootType == IRON_BOOTS_WATERWALKING )
 		{
 			leg->sprite = 152 + spriteOffset;
 		}
-		else if ( myStats->shoes->type >= STEEL_BOOTS && myStats->shoes->type <= STEEL_BOOTS_FEATHER )
+		else if ( samBootType >= STEEL_BOOTS && samBootType <= STEEL_BOOTS_FEATHER )
 		{
 			leg->sprite = 156 + spriteOffset;
 		}
-		else if ( myStats->shoes->type == CRYSTAL_BOOTS )
+		else if ( samBootType == CRYSTAL_BOOTS )
 		{
 			leg->sprite = 499 + spriteOffset;
 		}
-		else if ( myStats->shoes->type == ARTIFACT_BOOTS )
+		else if ( samBootType == ARTIFACT_BOOTS )
 		{
 			leg->sprite = 521 + spriteOffset;
 		}
-		else if ( myStats->shoes->type == SUEDE_BOOTS )
+		else if ( samBootType == SUEDE_BOOTS )
 		{
 			leg->sprite = 808 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == BONE_BOOTS )
+		else if ( samBootType == BONE_BOOTS )
 		{
 			leg->sprite = 2067 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == BLACKIRON_BOOTS )
+		else if ( samBootType == BLACKIRON_BOOTS )
 		{
 			leg->sprite = 2065 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == SILVER_BOOTS )
+		else if ( samBootType == SILVER_BOOTS )
 		{
 			leg->sprite = 2069 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == QUILTED_BOOTS )
+		else if ( samBootType == QUILTED_BOOTS )
 		{
 			leg->sprite = 2073 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == LOAFERS )
+		else if ( samBootType == LOAFERS )
 		{
 			leg->sprite = 1439 + (spriteOffset > 0 ? -1 : 0);
 		}
-		else if ( myStats->shoes->type == CHAIN_BOOTS )
+		else if ( samBootType == CHAIN_BOOTS )
 		{
 			leg->sprite = 2071 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == CLEAT_BOOTS )
+		else if ( samBootType == CLEAT_BOOTS )
 		{
 			leg->sprite = 2063 + (spriteOffset > 0 ? 1 : 0);
 		}
@@ -20715,55 +21478,55 @@ bool Entity::setBootSprite(Entity* leg, int spriteOffset, bool forceShort)
 	}
 	else
 	{
-		if ( myStats->shoes->type == LEATHER_BOOTS || myStats->shoes->type == LEATHER_BOOTS_SPEED )
+		if ( samBootType == LEATHER_BOOTS || samBootType == LEATHER_BOOTS_SPEED )
 		{
 			leg->sprite = 1463 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == IRON_BOOTS || myStats->shoes->type == IRON_BOOTS_WATERWALKING )
+		else if ( samBootType == IRON_BOOTS || samBootType == IRON_BOOTS_WATERWALKING )
 		{
 			leg->sprite = 1467 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type >= STEEL_BOOTS && myStats->shoes->type <= STEEL_BOOTS_FEATHER )
+		else if ( samBootType >= STEEL_BOOTS && samBootType <= STEEL_BOOTS_FEATHER )
 		{
 			leg->sprite = 1471 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == CRYSTAL_BOOTS )
+		else if ( samBootType == CRYSTAL_BOOTS )
 		{
 			leg->sprite = 1465 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == ARTIFACT_BOOTS )
+		else if ( samBootType == ARTIFACT_BOOTS )
 		{
 			leg->sprite = 1461 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == SUEDE_BOOTS )
+		else if ( samBootType == SUEDE_BOOTS )
 		{
 			leg->sprite = 1473 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == BONE_BOOTS )
+		else if ( samBootType == BONE_BOOTS )
 		{
 			leg->sprite = 2079 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == BLACKIRON_BOOTS )
+		else if ( samBootType == BLACKIRON_BOOTS )
 		{
 			leg->sprite = 2077 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == SILVER_BOOTS )
+		else if ( samBootType == SILVER_BOOTS )
 		{
 			leg->sprite = 2081 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == QUILTED_BOOTS )
+		else if ( samBootType == QUILTED_BOOTS )
 		{
 			leg->sprite = 2085 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == LOAFERS )
+		else if ( samBootType == LOAFERS )
 		{
 			leg->sprite = 1469 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == CHAIN_BOOTS )
+		else if ( samBootType == CHAIN_BOOTS )
 		{
 			leg->sprite = 2083 + (spriteOffset > 0 ? 1 : 0);
 		}
-		else if ( myStats->shoes->type == CLEAT_BOOTS )
+		else if ( samBootType == CLEAT_BOOTS )
 		{
 			leg->sprite = 2075 + (spriteOffset > 0 ? 1 : 0);
 		}
@@ -20935,6 +21698,16 @@ int getWeaponSkill(const Item* weapon)
 	if ( weapon->type == TOOL_WHIP )
 	{
 		return PRO_RANGED;
+	}
+	// S.A.M: every arm above compares against a hardcoded vanilla ItemType, so a custom item
+	// matches none of them and falls out as -1 -- which the engine reads as "no weapon skill":
+	// no skill XP on hit, the UNARMED damage table, no damage variance, no durability scaling
+	// and no stab animation. A mod declares its weapon's skill with "weapon_skill" and this
+	// answers it. Returns -1 for anything not a registered custom item, so vanilla is
+	// unchanged (weaponSkillFor misses the registry and the original -1 is returned).
+	{
+		const int samSkill = SAMItems::weaponSkillFor((int)weapon->type);
+		if ( samSkill >= 0 ) { return samSkill; }
 	}
 	return -1;
 }
@@ -24018,6 +24791,41 @@ bool Entity::setEffect(int effect, std::variant<bool, Uint8> value, int duration
 	}
 
 	Uint8 effectStrength = std::holds_alternative<bool>(value) ? (std::get<bool>(value) ? 1 : 0) : std::get<Uint8>(value);
+	// S.A.M: capture prior active-state so the effect hooks below can distinguish a genuine
+	// false->true (applied) or true->false (removed) transition from a refresh / no-op clear.
+	const bool samWasActive = myStats->getEffectActive(effect) > 0;
+
+	// S.A.M: the effect gate. One site serves a cancellable before-hook AND a real immunity
+	// table, because a veto and an immunity are the same answer reached two ways, and Barony
+	// has no immunity table of its own -- only the hardcoded species switch immediately below.
+	//
+	// Placed BEFORE that switch so a mod's answer is considered first, and only for an effect
+	// being APPLIED: a gate over a removal would trap a creature in whatever it was already
+	// carrying, which is a worse bug than the one it would be preventing.
+	//
+	// It may rewrite strength and duration, so a mod can halve a poison rather than only
+	// refusing it. Both are plain locals here and everything downstream reads them.
+	if ( effectStrength > 0 )
+	{
+		int samStrength = (int)effectStrength;
+		int samDuration = duration;
+		if ( !SAMRules::effectGate(this, effect, samEffectName(effect).c_str(),
+			&samStrength, &samDuration, samWasActive) )
+		{
+			return false;
+		}
+		if ( samStrength < 0 ) { samStrength = 0; }
+		if ( samStrength > 255 ) { samStrength = 255; }
+		effectStrength = (Uint8)samStrength;
+		duration = samDuration;
+		// A handler asking for permanent gets -1. Left to the max() below, -1 against an inactive
+		// effect's timer of 0 lands as 0 -- still permanent to the engine, but no longer the -1
+		// every reader reports "permanent" as.
+		if ( duration < 0 ) { overrideDuration = true; }
+		// A handler may have zeroed the strength, which means "do not apply this after all".
+		if ( effectStrength == 0 ) { return false; }
+	}
+
 	if ( effectStrength > 0 )
 	{
 		switch ( effect )
@@ -24203,6 +25011,39 @@ bool Entity::setEffect(int effect, std::variant<bool, Uint8> value, int duration
 		{
 			player = i;
 			break;
+		}
+	}
+
+	// S.A.M scripting hooks: player.on_effect_applied / player.on_effect_removed (the explicit
+	// setEffect path). Host-only, players only. The samWasActive guard means these fire only on
+	// a genuine transition, not a refresh or a no-op clear. (Deliberately no on_effect_refreshed
+	// event: vanilla sustained sources re-apply effects periodically — e.g. a telepathy blindfold
+	// every 45 ticks — so it would be noise; a mod that needs to watch a refresh/stack should
+	// poll sam_get_effect_strength / sam_get_effect_duration in on_tick instead.) The applied
+	// event now carries strength too. Timer-expiry removals are emitted from Entity::effectTimes.
+	if ( player >= 0 && multiplayer != CLIENT && effectStrength > 0 && !samWasActive )
+	{
+		const long long curStrength = (long long)myStats->getEffectActive(effect);
+		{
+			SamEvent samEv;
+			samEv.setName("player.on_effect_applied");
+			samEv.i("player", player);
+			samEv.s("effect_name", samEffectName(effect));
+			samEv.i("effect", (long long)effect);   // numeric slot, as the expiry path already sends
+			samEv.i("duration_ticks", (long long)myStats->EFFECTS_TIMERS[effect]);
+			samEv.i("strength", curStrength);
+			samEv.fire();
+		}
+	}
+	else if ( player >= 0 && multiplayer != CLIENT && effectStrength == 0 && samWasActive )
+	{
+		{
+			SamEvent samEv;
+			samEv.setName("player.on_effect_removed");
+			samEv.i("player", player);
+			samEv.s("effect_name", samEffectName(effect));
+			samEv.i("effect", (long long)effect);   // numeric slot, as the expiry path already sends
+			samEv.fire();
 		}
 	}
 
@@ -25934,6 +26775,15 @@ bool Entity::shouldRetreat(Stat& myStats)
 
 	// retreating monsters will not try path when losing sight of target
 
+	// A mod-declared "never_retreat" monster fights to the death. Deliberately placed
+	// ABOVE the fear/pacify/cowardice block, so the trait means what its name says --
+	// it also cannot be routed by a Fear spell, which is normally what a boss author
+	// wants. Vanilla monsters carry a 0 mask and reach the checks below unchanged.
+	if ( samMonsterHasTrait(&myStats, SAMMonsterTrait::NEVER_RETREAT) )
+	{
+		return false;
+	}
+
 	if ( myStats.getEffectActive(EFF_PACIFY) || myStats.getEffectActive(EFF_FEAR) || myStats.getEffectActive(EFF_COWARDICE) )
 	{
 		return true;
@@ -26204,7 +27054,51 @@ bool Entity::monsterHasSpellbook(int spellbookType)
 
 void Entity::playerStatIncrease(int playerClass, int chosenStats[3])
 {
-	std::vector<unsigned int> statWeights = classStatGrowth[playerClass];
+	// S.A.M FIX: classStatGrowth is a std::vector sized to the vanilla classes
+	// only. A custom/S.A.M class id (>= SAM_CLASS_ID_BASE = 1000) — or any id
+	// outside the table — indexes it OUT OF BOUNDS and copy-constructs a garbage
+	// vector header, throwing std::length_error ("vector too long") during
+	// level-up (e.g. the /levelup console command on a S.A.M class). Guard the
+	// lookup; for S.A.M classes derive stat weights from the class's declared
+	// strong/weak rolls, falling back to an even weighting.
+	std::vector<unsigned int> statWeights;
+	if ( playerClass >= 0 && playerClass < (int)classStatGrowth.size() )
+	{
+		statWeights = classStatGrowth[playerClass];
+	}
+	else
+	{
+		statWeights.assign(NUMSTATS, 2u); // neutral baseline weight per stat
+		if ( const SAMClassDef* samDef = SAMClasses::getClass(playerClass) )
+		{
+			auto samStatIndex = [](const std::string& n) -> int {
+				if ( n == "STR" ) { return STAT_STR; }
+				if ( n == "DEX" ) { return STAT_DEX; }
+				if ( n == "CON" ) { return STAT_CON; }
+				if ( n == "INT" ) { return STAT_INT; }
+				if ( n == "PER" ) { return STAT_PER; }
+				if ( n == "CHR" ) { return STAT_CHR; }
+				return -1;
+			};
+			for ( const std::string& s : samDef->strongRolls )
+			{
+				const int idx = samStatIndex(s);
+				if ( idx >= 0 && idx < NUMSTATS ) { statWeights[idx] = 6u; }
+			}
+			for ( const std::string& s : samDef->weakRolls )
+			{
+				const int idx = samStatIndex(s);
+				if ( idx >= 0 && idx < NUMSTATS ) { statWeights[idx] = 1u; }
+			}
+			// Explicit per-attribute weights win over strong/weak - the full graduated
+			// growth curve (vanilla uses 1..6), not just the 1/2/6 buckets.
+			for ( const auto& kv : samDef->statGrowthWeights )
+			{
+				const int idx = samStatIndex(kv.first);
+				if ( idx >= 0 && idx < NUMSTATS ) { statWeights[idx] = (unsigned int)std::max(0, kv.second); }
+			}
+		}
+	}
 
 	// debug to print which vector values are being used.
 	//for ( std::vector<int>::const_iterator i = statWeights.begin(); i != statWeights.end(); ++i )
@@ -27176,6 +28070,28 @@ int getBaseManaRegen(Entity* my, Stat& myStats, bool excludeItemsEffectsBonus)
 		}
 		regenPerMinute += perMinModifier;
 
+		// S.A.M scripting hook: a custom class can tune its own mana regen from its JSON
+		// "mp_regen" block — a flat base, per-stat scaling, and a final multiplier. This
+		// is the only way to make INT drive mana regen: statRegenMP above pins INT at 0.0
+		// and the loop skips any stat scored 0.0, so vanilla INT contributes nothing.
+		if ( client_classes[player] >= SAM_CLASS_ID_BASE )
+		{
+			const int samStatValues[NUMSTATS] = {
+				std::max(statGetSTR(&myStats, my), 0),
+				std::max(statGetDEX(&myStats, my), 0),
+				std::max(statGetCON(&myStats, my), 0),
+				std::max(statGetINT(&myStats, my), 0),
+				std::max(statGetPER(&myStats, my), 0),
+				std::max(statGetCHR(&myStats, my), 0),
+			};
+			SAMClasses::applyManaRegen(client_classes[player], samStatValues, NUMSTATS, regenPerMinute);
+		}
+
+		// A mod-supplied base/multiplier (or a large negative perMinModifier) could drive
+		// this to zero or below, and the divide immediately after would be undefined.
+		// Floor it to a very slow trickle instead.
+		regenPerMinute = std::max(0.01, regenPerMinute);
+
 		const int regenTicks = TICKS_PER_SECOND * 60 / regenPerMinute;
 		int regenCap = 1 * TICKS_PER_SECOND;
 
@@ -27762,6 +28678,12 @@ get text string for the different player chosen classes.
 
 char const * playerClassLangEntry(int classnum, int playernum)
 {
+	// S.A.M custom classes (runtime ids >= 1000): return the registered name.
+	if ( classnum >= SAM_CLASS_ID_BASE )
+	{
+		const SAMClassDef* samdef = SAMClasses::getClass(classnum);
+		return samdef ? samdef->name.c_str() : "undefined classname";
+	}
 	if ( classnum >= CLASS_BARBARIAN && classnum <= CLASS_JOKER )
 	{
 		return Language::get(1900 + classnum);
@@ -27808,6 +28730,12 @@ Adjusts helmet offsets for all monsters, depending on the type of headwear.
 
 void Entity::setHelmetLimbOffset(Entity* helm)
 {
+	// S.A.M: a mod hat or mask with its own model is placed like the vanilla item it names in
+	// "worn_like". Every rule below compares the limb's model with vanilla models, which a
+	// mod's model never matches, so it fell through to the final else and a hat authored on
+	// its side the way the vanilla hats are was worn sideways. For the length of this function
+	// the limb reads as its twin's model. No-op without such an item.
+	SAMWornAsTwin samWornAsTwin(helm);
 	helm->scalex = 1.01;
 	helm->scaley = 1.01;
 	helm->scalez = 1.01;
@@ -30360,6 +31288,13 @@ bool Entity::isSmiteWeakMonster()
 	Stat* myStats = getStats();
 	if ( myStats )
 	{
+		// A mod-declared "undead" monster counts as undead for smite and holy damage.
+		// Checked BEFORE the switch: the switch ends in default->false, so an arm added
+		// after it would be unreachable. Mask is 0 for every vanilla monster.
+		if ( samMonsterHasTrait(myStats, SAMMonsterTrait::UNDEAD) )
+		{
+			return true;
+		}
 		switch ( myStats->type )
 		{
 			case SKELETON:
@@ -30397,6 +31332,12 @@ bool Entity::isBossMonster()
 	Stat* myStats = getStats();
 	if ( myStats )
 	{
+		// S.A.M: a mod may declare its monster a boss -- boss music, the health bar, the
+		// death presentation. Vanilla monsters carry no traits, so vanilla is unchanged.
+		if ( samMonsterHasTrait(myStats, SAMMonsterTrait::BOSS) )
+		{
+			return true;
+		}
 		if ( myStats->type == MINOTAUR
 			|| myStats->type == SHOPKEEPER
 			|| monsterCanTradeWith(-1)
@@ -30579,6 +31520,11 @@ void Entity::setHelmetLimbOffsetWithMask(Entity* helm, Entity* mask)
 	{
 		return;
 	}
+
+	// S.A.M: both limbs read as their "worn_like" twins here, for the same reason as in
+	// setHelmetLimbOffset; their own models come back on every return below. No-op without one.
+	SAMWornAsTwin samHelmAsTwin(helm);
+	SAMWornAsTwin samMaskAsTwin(mask);
 
 	bool maskVisible = (!mask->flags[INVISIBLE]) || (mask->flags[INVISIBLE] && mask->flags[INVISIBLE_DITHER]);
 	bool helmVisible = (!helm->flags[INVISIBLE]) || (helm->flags[INVISIBLE] && helm->flags[INVISIBLE_DITHER]);
@@ -30773,6 +31719,11 @@ void Entity::setHelmetLimbOffsetWithMask(Entity* helm, Entity* mask)
 
 bool monsterIsImmobileTurret(Entity* my, Stat* myStats)
 {
+	// S.A.M: a mod may declare its monster a rooted turret.
+	if ( samMonsterHasTrait(myStats, SAMMonsterTrait::IMMOBILE_TURRET) )
+	{
+		return true;
+	}
 	if ( myStats )
 	{
 		if ( myStats->type == SENTRYBOT || myStats->type == SPELLBOT || myStats->type == DUMMYBOT )
@@ -30794,6 +31745,15 @@ bool monsterIsImmobileTurret(Entity* my, Stat* myStats)
 
 bool monsterChangesColorWhenAlly(Stat* myStats, Entity* entity)
 {
+	// A mod-declared "ally_recolour" monster takes the ally tint even when its base race
+	// is on the exclusion list below (HUMAN, SLIME, the robots...). This predicate defaults
+	// to TRUE, so the trait only ever matters for those excluded races -- which is exactly
+	// the case a modder cannot otherwise reach. Guarded on null; mask is 0 for vanilla.
+	if ( myStats && samMonsterHasTrait(myStats, SAMMonsterTrait::ALLY_RECOLOUR) )
+	{
+		return true;
+	}
+
 	int race = NOTHING;
 	if ( !myStats )
 	{
@@ -31050,6 +32010,23 @@ real_t Entity::getDamageTableEquipmentMod(Stat& myStats, Item& item, real_t base
 real_t Entity::getDamageTableMultiplier(Entity* my, Stat& myStats, DamageTableType damageType, int* magicResistance, int* outNumSources)
 {
 	real_t damageMultiplier = damagetables[myStats.type][damageType];
+	// S.A.M: a mod may override this species' resistance to this damage class.
+	//
+	// It has to be read HERE, and it cannot be a write into damagetables, because monster.hpp
+	// declares that array `static` at namespace scope INSIDE THE HEADER -- every translation
+	// unit that includes it owns a private copy. A setter living in the scripting runtime would
+	// modify sam_lua_runtime.cpp's copy, this line would keep reading entity.cpp's, and the
+	// whole feature would report success and change nothing.
+	//
+	// anySpeciesResist() is false in every game with no mod loaded, so this is one bool test.
+	if ( SAMCombat::anySpeciesResist() )
+	{
+		double samSpeciesMult = 0.0;
+		if ( SAMCombat::speciesResist((int)myStats.type, (int)damageType, &samSpeciesMult) )
+		{
+			damageMultiplier = (real_t)samSpeciesMult;
+		}
+	}
 	if ( myStats.getEffectActive(EFF_SHADOW_TAGGED) )
 	{
 		if ( myStats.type == LICH || myStats.type == LICH_FIRE || myStats.type == LICH_ICE
@@ -31592,6 +32569,15 @@ bool Entity::entityCanVomit() const
 
 	Stat* myStats = getStats();
 	if ( !myStats )
+	{
+		return false;
+	}
+
+	// S.A.M: a mod-declared "no_digestion" monster has no gut and never pukes. Note this
+	// predicate is an EXCLUSION list ending in `return true` -- most things CAN vomit --
+	// so unlike the other traits the only useful direction is forcing false. Mask is 0 for
+	// vanilla, and no player Stat can carry one, so players are unaffected either way.
+	if ( samMonsterHasTrait(myStats, SAMMonsterTrait::NO_DIGESTION) )
 	{
 		return false;
 	}
@@ -32578,6 +33564,37 @@ bool Entity::modifyDamageMultipliersFromEffects(Entity* hitentity, Entity* attac
 			}
 		}
 		result = true;
+	}
+
+	// S.A.M scripting hook: on_damage_multiplier -- the last word on this hit's multiplier,
+	// after every vanilla effect has had its say.
+	//
+	// THIS function and not getDamageTableMultiplier. Both look like the right place; only this
+	// one is. damageMultiplier is by reference here, the attacker and the target are both in
+	// scope, and the six call sites cover melee (entity.cpp), arrows (actarrow.cpp) and every
+	// magic path. getDamageTableMultiplier has 24 callers and several of them are the character
+	// sheet redrawing on a CLIENT every frame -- a script hook there would fire while nobody was
+	// being hit, on a machine that holds no Stat for the monster it was asked about.
+	//
+	// Host-side only: every caller resolves damage on the host. Costs one bool test with no
+	// scripts loaded (fireDamageMultiplierHook asks SamEvent::anyScripts() first and returns).
+	//
+	// A target with no Stat returned above and never reaches here, which is the same rule the
+	// engine's own effect modifiers follow.
+	if ( multiplayer != CLIENT )
+	{
+		double samMult = (double)damageMultiplier;
+		if ( SAMCombat::fireDamageMultiplierHook(
+				(long long)hitentity->getUID(),
+				attacker ? (long long)attacker->getUID() : 0,
+				samMult,
+				(int)damageTableType,
+				projectile ? (long long)projectile->getUID() : 0,
+				spellID) )
+		{
+			damageMultiplier = (real_t)samMult;
+			result = true;
+		}
 	}
 
 	return result;

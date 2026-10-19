@@ -315,9 +315,18 @@ else( NOT WIN32 )
 	set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -pg ${OPTIMIZATION_LEVEL} -ffast-math -funroll-loops -malign-double -fstrict-aliasing -mwindows")
 	set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} ${OPTIMIZATION_LEVEL} -ffast-math -funroll-loops -malign-double -fstrict-aliasing -mwindows")
 	# We should be using Visual Studio flags...or better yet, providing an option to select which you'd prefer.
-	set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MP")
-	set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MP ")
+	# /std:c++17 — Barony uses std::variant/std::optional etc.; MSVC defaults to
+	# C++14, so this must be set explicitly (the non-Windows branch sets -std=c++17).
+	set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MP /std:c++17")
+	set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MP /std:c++17 ")
+	# S.A.M: the vendored quickjs-ng amalgam is C11 and uses C11 atomics; MSVC needs
+	# these flags for C sources. lua54 (also C) compiles fine under C11 as well.
+	set(CMAKE_C_FLAGS_DEBUG   "${CMAKE_C_FLAGS_DEBUG} /MP /std:c11 /experimental:c11atomics")
+	set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /MP /std:c11 /experimental:c11atomics")
 	set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /SUBSYSTEM:WINDOWS")
+	# S.A.M: enlarge the exe stack so typescript.js (run under QuickJS at mod-load)
+	# has room for its deep recursion (default 1MB is not enough).
+	set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608")
   set (Windows 1)
 endif( NOT WIN32 )
 
@@ -361,6 +370,14 @@ ENDIF (APPLE)
 find_package(PhysFS REQUIRED)
 find_package(RapidJson REQUIRED)
 INCLUDE_DIRECTORIES(${RAPID_JSON_INCLUDE_DIR})
+
+# GLEW is required on Windows: src/main.hpp includes <GL/glew.h> and
+# src/init.cpp calls glewInit(). Vanilla CMakeLists never wired this up, so the
+# build fails to find the header and to link the loader. Provide it here.
+if (WIN32)
+	find_package(GLEW REQUIRED)
+	include_directories(${GLEW_INCLUDE_DIR} ${GLEW_INCLUDE_DIRS})
+endif()
 
 if (STEAMWORKS_ENABLED)
   find_package(NFD REQUIRED)
@@ -495,6 +512,29 @@ message("${CMAKE_CXX_FLAGS_RELEASE}")
 message("***************************")
 
 
+# S.A.M Framework (Support All Mods) — make framework/*.hpp headers
+# (e.g. sam_logger.hpp) includable from Barony source files.
+include_directories("${CMAKE_SOURCE_DIR}/../SAM-Framework/framework")
+# ...and the vendored Lua 5.4 headers (lua.h/lauxlib.h/lualib.h) used by
+# sam_lua_runtime.cpp and by the Lua core .c files (which include each other).
+include_directories("${CMAKE_SOURCE_DIR}/../SAM-Framework/framework/lua54")
+# ...and the vendored quickjs-ng headers used by sam_js_runtime.cpp and the
+# quickjs amalgam .c itself.
+include_directories("${CMAKE_SOURCE_DIR}/../SAM-Framework/framework/quickjs")
+
+# The quickjs amalgam (C) includes <stdatomic.h> unconditionally, which MSVC only
+# enables with /experimental:c11atomics. CMake strips that flag out of
+# CMAKE_C_FLAGS, so set it PER-FILE here — in the barony target's own directory
+# scope (a per-file setting from src/ would not reach this target).
+if(MSVC)
+	set_source_files_properties(
+		"${CMAKE_SOURCE_DIR}/../SAM-Framework/framework/quickjs/quickjs-amalgam.c"
+		PROPERTIES COMPILE_FLAGS "/experimental:c11atomics")
+endif()
+# ...and let framework/*.cpp include Barony headers (stat.hpp, mod_tools.hpp, ...)
+# which its own source files normally resolve via same-directory lookup.
+include_directories("${CMAKE_SOURCE_DIR}/src")
+
 add_subdirectory(src)
 if( WIN32 )
 	set(GAME_RESOURCE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/barony.rc")
@@ -534,6 +574,17 @@ else()
 	add_executable(barony ${GAME_SOURCES} ${GAME_RESOURCE_FILE})
   endif (GAME_ENABLED)
 endif(APPLE)
+
+if (GAME_ENABLED AND MSVC)
+  # S.A.M: the shipped Barony exe is DPI-aware via an embedded manifest; a stock MSVC build
+  # is not, so our replacement exe rendered blurry / mis-scaled on Windows displays above
+  # 100% (reported on the Workshop). MANIFESTINPUT MERGES this fragment into the linker's
+  # own generated manifest rather than replacing it, so the default trustInfo block is
+  # kept and the result matches the official exe.
+  target_link_options(barony PRIVATE
+    "/MANIFEST:EMBED"
+    "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/barony_dpi.manifest")
+endif()
 
 if (GAME_ENABLED)
   if(WIN32)
@@ -623,6 +674,7 @@ if (GAME_ENABLED)
 	#endif(LINUX)
   endif()
   target_link_libraries(barony ${OPENGL_LIBRARIES})
+  target_link_libraries(barony ${GLEW_LIBRARIES}) # GLEW (empty on non-Windows)
   target_link_libraries(barony ${THREADS_LIBRARIES}) # TODO: Not sure what this is doing, since it doesn't appear to be working in Linux!
   target_link_libraries(barony -lm) # TODO: In Visual Studio, I bet this is something else, right?
   if (NOT CMAKE_SYSTEM_NAME MATCHES "Haiku")
@@ -734,6 +786,7 @@ if (EDITOR_ENABLED)
 	#endif(LINUX)
   endif()
   target_link_libraries(${EDITOR_EXE_NAME} ${OPENGL_LIBRARIES})
+  target_link_libraries(${EDITOR_EXE_NAME} ${GLEW_LIBRARIES}) # GLEW (empty on non-Windows)
   target_link_libraries(${EDITOR_EXE_NAME} ${THREADS_LIBRARIES})
   target_link_libraries(${EDITOR_EXE_NAME} -lm) # TODO: Only for Mingw?
   if (NOT CMAKE_SYSTEM_NAME MATCHES "Haiku")

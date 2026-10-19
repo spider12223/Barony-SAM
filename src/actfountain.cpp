@@ -26,6 +26,7 @@
 #include "mod_tools.hpp"
 #include "sam_lua_runtime.hpp"
 #include "sam_js_runtime.hpp" // S.A.M scripting hooks
+#include "sam_loot.hpp"       // S.A.M: world.on_fixture_loot for the goatman potion drop
 
 //Fountain functions.
 const std::vector<unsigned int> fountainPotionDropChances =
@@ -245,7 +246,16 @@ void actFountain(Entity* my)
 							std::pair<int, int> generatedPotion = fountainGeneratePotionDrop(rng);
 							ItemType type = static_cast<ItemType>(generatedPotion.first);
 							int appearance = generatedPotion.second;
-							Item* item = newItem(type, EXCELLENT, 0, 1, appearance, false, NULL);
+							// S.A.M: world.on_fixture_loot("fountain"): rewrite this potion or cancel it.
+							// A rewritten type loses the standard potion appearance (it belonged to
+							// the old type) and takes 0.
+							int samType = (int)type, samStatus = (int)EXCELLENT, samBeatitude = 0, samCount = 1;
+							if ( !SAMLoot::fixtureLoot("fountain", i, (int)(my->x / 16), (int)(my->y / 16), samType, samStatus, samBeatitude, samCount) )
+							{
+								continue;
+							}
+							if ( samType != (int)type ) { type = static_cast<ItemType>(samType); appearance = 0; }
+							Item* item = newItem(type, static_cast<Status>(samStatus), (Sint16)samBeatitude, (Sint16)samCount, appearance, false, NULL);
 							if ( Entity* dropped = dropItemMonster(item, my, NULL) )
 							{
 								dropped->yaw = ((0 + local_rng.rand() % 360) / 180.f) * PI;

@@ -1,6 +1,8 @@
 // GameUI.cpp
 
 #include "GameUI.hpp"
+#include "sam_recipes.hpp" // S.A.M custom crafting kits
+#include "sam_rules.hpp"   // S.A.M XP curve: the XP bar's scale
 #include "MainMenu.hpp"
 #include "Frame.hpp"
 #include "Image.hpp"
@@ -18683,8 +18685,17 @@ void Player::CharacterSheet_t::updateCharacterSheetTooltip(SheetElements element
 				case SHEET_PER:
 				{
 					const int PER = statGetPER(stats[player.playernum], players[player.playernum]->entity);
-					const int range_bonus = std::min(std::max(0, PER / 5), 2);
-					const int sneakingBonus = range_bonus + 2;
+					int range_bonus = std::min(std::max(0, PER / 5), 2);
+					int samSneakExtra = 0;
+					// S.A.M (v3.2.0): a race's vision / sneak_vision and the VISION / SNEAK_VISION
+					// modifiers show here too. Vanilla's own number leaves out the eyepatch and the
+					// Gremlin's +2, so only S.A.M's part is added, and nothing without a mod.
+					if ( SAMRules::anyVision() )
+					{
+						range_bonus = SAMRules::visionRange(stats[player.playernum], players[player.playernum]->entity, range_bonus);
+						samSneakExtra = SAMRules::sneakVisionRange(stats[player.playernum], players[player.playernum]->entity, 0);
+					}
+					const int sneakingBonus = range_bonus + 2 + samSneakExtra;
 					snprintf(valueBuf, sizeof(valueBuf), getHoverTextString("stat_light_value_format").c_str(), sneakingBonus);
 				}
 				break;
@@ -18970,7 +18981,9 @@ void Player::CharacterSheet_t::updateCharacterSheetTooltip(SheetElements element
 				else if ( stats[player.playernum]->weapon )
 				{
 					Item* item = stats[player.playernum]->weapon;
-					if ( item->type >= WOODEN_SHIELD && item->type < NUMITEMS )
+					// S.A.M: NUM_ITEM_SLOTS so a custom weapon's name shows on the character sheet
+					// ATK hover instead of a blank.
+					if ( item->type >= WOODEN_SHIELD && item->type < NUM_ITEM_SLOTS )
 					{
 						char itemNameBuf[128];
 						if ( itemCategory(item) == MAGICSTAFF )
@@ -29641,7 +29654,15 @@ void Player::Inventory_t::activateItemContextMenuOption(Item* item, ItemContextM
 	{
 		if ( !disableItemUsage )
 		{
-			useItem(item, player);
+			// S.A.M: the player chose "Use". A mod may veto a genuine use, but this menu
+			// option also equips a plain equippable, which must never be blocked -- so only
+			// flag it deliberate for a USABLE custom item or a vanilla consumable.
+			const bool samVetoableUse =
+				( samItemHasTrait(item->type, SAMItemTrait::USABLE)
+					|| itemCategory(item) == POTION || itemCategory(item) == SCROLL
+					|| itemCategory(item) == FOOD || itemCategory(item) == SPELLBOOK
+					|| itemCategory(item) == TOME_SPELL );
+			useItem(item, player, nullptr, false, false, samVetoableUse);
 		}
 		return;
 	}
@@ -29755,7 +29776,10 @@ void Player::Inventory_t::activateItemContextMenuOption(Item* item, ItemContextM
 				playSoundPlayer(player, 90, 64);
 			}
 		}
-		else if ( item->type == TOOL_TINKERING_KIT )
+		// S.A.M: a mod can declare its own crafting kit (an item named as the "kit" of at
+		// least one recipe). Using it opens the same crafting screen, but the recipe list
+		// is scoped to that kit, so it never overlaps the vanilla tinkering kit.
+		else if ( item->type == TOOL_TINKERING_KIT || SAMRecipes::isCustomKit((int)item->type) )
 		{
 			if ( !disableItemUsage )
 			{
@@ -29783,12 +29807,26 @@ void Player::Inventory_t::activateItemContextMenuOption(Item* item, ItemContextM
 				{
 					players[player]->magic.spellbookUidFromHotbarSlot = item->uid;
 				}
-				useItem(item, player);
+				// S.A.M: vetoable only for a genuine use (USABLE custom item or consumable),
+				// never a plain equip -- an INTERACT can equip a spellbook.
+				const bool samVetoableUse =
+					( samItemHasTrait(item->type, SAMItemTrait::USABLE)
+						|| itemCategory(item) == POTION || itemCategory(item) == SCROLL
+						|| itemCategory(item) == FOOD || itemCategory(item) == SPELLBOOK
+						|| itemCategory(item) == TOME_SPELL );
+				useItem(item, player, nullptr, false, false, samVetoableUse);
 				players[player]->magic.spellbookUidFromHotbarSlot = 0;
 			}
 			else if ( !disableItemUsage && prompt == PROMPT_INTERACT )
 			{
-				useItem(item, player);
+				// S.A.M: vetoable only for a genuine use (USABLE custom item or consumable),
+				// never a plain equip -- an INTERACT can equip a spellbook.
+				const bool samVetoableUse =
+					( samItemHasTrait(item->type, SAMItemTrait::USABLE)
+						|| itemCategory(item) == POTION || itemCategory(item) == SCROLL
+						|| itemCategory(item) == FOOD || itemCategory(item) == SPELLBOOK
+						|| itemCategory(item) == TOME_SPELL );
+				useItem(item, player, nullptr, false, false, samVetoableUse);
 			}
 			else
 			{
@@ -29830,7 +29868,9 @@ void Player::Inventory_t::activateItemContextMenuOption(Item* item, ItemContextM
 					}
 					else
 					{
-						playerTryEquipItemAndUpdateServer(player, item, true);
+						// S.A.M: the player chose to wield it, so player.on_before_equip may refuse
+						// (it only asks for an equip, never for this same click taking it off).
+						playerTryEquipItemAndUpdateServer(player, item, true, /*samPlayerEquip=*/true);
 					}
 					return;
 				}
@@ -29842,7 +29882,10 @@ void Player::Inventory_t::activateItemContextMenuOption(Item* item, ItemContextM
 			}
 			else
 			{
-				useItem(item, player);
+				// S.A.M: the player chose Equip/Wield from the item menu -- the one case a
+				// mod may refuse (class gear restrictions, cursed items that reject you).
+				// Every other equip path leaves this false and behaves exactly as vanilla.
+				useItem(item, player, nullptr, false, false, false, /*samPlayerEquip=*/true);
 			}
 			return;
 		}
@@ -30913,6 +30956,18 @@ void Player::Inventory_t::processInventory()
 	}
 }
 
+// S.A.M: how full the XP bar is, 0..100. Vanilla draws EXP against a flat 100; a mod's XP curve
+// (sam_set_xp_curve) moves the threshold, and the bar has to move with it or it fills at 100 and
+// sits full until the real threshold arrives. One bool test when no curve is set.
+static int samXpBarPercent(const Stat* s)
+{
+	if ( !s ) { return 0; }
+	if ( !SAMRules::anyXpCurve() ) { return std::min(100, s->EXP); }
+	const int t = SAMRules::xpThreshold((int)s->LVL);
+	if ( t <= 0 ) { return std::min(100, s->EXP); }
+	return (int)std::min(100LL, (long long)s->EXP * 100LL / t);
+}
+
 void Player::HUD_t::resetBars()
 {
 	xpInfo.cycleProcessedOnTick = 0;
@@ -30922,7 +30977,7 @@ void Player::HUD_t::resetBars()
 	xpInfo.fadeIn = true;
 	if ( xpFrame )
 	{
-		xpBar.animateSetpoint = std::min(100, stats[player.playernum]->EXP) * 10;
+		xpBar.animateSetpoint = samXpBarPercent(stats[player.playernum]) * 10;
 		xpBar.animateValue = xpBar.animateSetpoint;
 		xpBar.animatePreviousSetpoint = xpBar.animateSetpoint;
 		xpBar.animateState = ANIMATE_NONE;
@@ -31373,7 +31428,7 @@ void Player::HUD_t::updateXPBar()
 	}
 	endCapRight->pos.x = pos.w - endCapRight->pos.w;
 
-	xpBar.animateSetpoint = std::min(100, stats[player.playernum]->EXP);
+	xpBar.animateSetpoint = samXpBarPercent(stats[player.playernum]);
 	xpBar.maxValue = 1000.0;
 
 	if ( xpBar.animateState == ANIMATE_LEVELUP_RISING )

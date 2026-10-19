@@ -15,8 +15,16 @@
 #include "../stat.hpp"
 #include "../messages.hpp"
 #include "../entity.hpp"
+#include "sam_classes.hpp" // S.A.M custom classes at the Assist Shrine
+#include "sam_recipes.hpp" // S.A.M mod-declared tinkering recipes
+#include "sam_items.hpp"   // S.A.M custom-item icon paths (crafting-cost material icons)
+#include "sam_logger.hpp"  // SAM_WARN for a full tinkering grid
 #include "../magic/magic.hpp"
 #include "interface.hpp"
+#include "sam_event.hpp"   // player.on_callout
+#include "sam_mp_input.hpp" // a vetoed ping taken back down on the pinger's screen
+#include "sam_races.hpp"   // S.A.M custom races: declared relations on the client
+#include "sam_loot.hpp"    // S.A.M: the "recipe" roll context for the alchemy skill-up pick
 #include "../monster.hpp"
 #include "../items.hpp"
 #include "../book.hpp"
@@ -8500,7 +8508,10 @@ bool GenericGUIMenu::isItemMixable(const Item* item)
 
 int GenericGUIMenu::isItemRationSeasoning(int type)
 {
-	if ( type >= WOODEN_SHIELD && type < NUMITEMS )
+	// S.A.M: NUMITEMS excluded custom items (ids >= NUMITEMS) from being cooking
+	// seasonings even though items[] is sized NUM_ITEM_SLOTS and the SEASONING_FOOD
+	// attribute below reads fine for them.
+	if ( type >= WOODEN_SHIELD && type < NUM_ITEM_SLOTS )
 	{
 		if ( items[type].hasAttribute("SEASONING_FOOD") )
 		{
@@ -8717,13 +8728,30 @@ ItemType alchemyCookResult(int player, Item* potion1Item, Item* potion2Item, int
 	return result;
 }
 
-ItemType alchemyMixResult(ItemType potion1, ItemType potion2, 
+ItemType alchemyMixResult(ItemType potion1, ItemType potion2,
 	bool& outRandomResult, bool& outTryDuplicatePotion, bool& outSamePotion, bool& outExplodeSelf)
 {
 	outTryDuplicatePotion = false;
 	ItemType result = POTION_SICKNESS;
 	outRandomResult = false;
 	outExplodeSelf = false;
+
+	// S.A.M: a custom potion has no entry in the vanilla pair->result table below, and the
+	// vanilla FALLBACKS are actively harmful to it. ACID's `default: outExplodeSelf` detonates
+	// the alembic (can kill the player), and a water-duplicate sets result to the custom id,
+	// which the creation loop cannot build -- silently eating both ingredients. Treat any brew
+	// touching a custom potion as an ordinary failed mix: a potion of sickness (a real entry in
+	// potionStandardAppearanceMap, so it is actually created), no explosion, no item loss.
+	// Author-defined custom brew results are a separate, larger feature. No-op when both potions
+	// are vanilla, so unmodded alchemy is byte-for-byte unchanged.
+	if ( potion1 >= SAM_ITEM_ID_BASE || potion2 >= SAM_ITEM_ID_BASE )
+	{
+		outRandomResult = false;
+		outTryDuplicatePotion = false;
+		outSamePotion = false;
+		outExplodeSelf = false;
+		return POTION_SICKNESS;
+	}
 
 	switch ( potion1 )
 	{
@@ -10512,6 +10540,10 @@ bool GenericGUIMenu::isItemSecondaryIngredient(int type)
 
 void GenericGUIMenu::alchemyLearnRecipeOnLevelUp(int skill)
 {
+	// S.A.M: the potion picked here is a RECIPE to learn, not a drop. The "recipe" context lets a
+	// loot table or a world.on_before_loot_roll handler tell it apart, so a randomizer that opens
+	// the pool does not teach the player to brew an artifact.
+	SAMLoot::ContextScope samCtx(SAMLoot::Recipe);
 	bool learned = false;
 	if ( skill > 0 )
 	{
@@ -10604,6 +10636,135 @@ void GenericGUIMenu::tinkeringCreateCraftableItemList()
 	items.push_back(newItem(CLOAK_BACKPACK, EXCELLENT, 0, 1, ITEM_TINKERING_APPEARANCE, true, &tinkeringTotalItems));
 	items[items.size() - 1]->x = 0;
 	items[items.size() - 1]->y = 3;
+
+	// ---- S.A.M mod-declared tinkering recipes ---------------------------------------
+	// A mod can HIDE vanilla craft entries and APPEND its own. Inert in vanilla:
+	// SAMRecipes::any() is false with no mod loaded, so the list built above is left
+	// exactly as it was. This must run BEFORE the inventory splice at the end of this
+	// function, or the craftable->inventory chain that tinkeringFreeLists() and
+	// rebuildGUIInventory() walk would be corrupted. It also runs before the bot-quality
+	// loop below, so an appended bot still gets its status scaled by skill like a vanilla one.
+	if ( SAMRecipes::any() )
+	{
+		// Which kit is the player standing at? openGUI stored the item that opened this
+		// menu, so a mod can ship its OWN kit with its OWN grid. When a custom kit is
+		// open the vanilla recipes are dropped entirely: that kit gets all 20 cells and
+		// never collides with normal crafting (which is exactly what "don't overlap with
+		// the normal tinkering kit" means). A workbench or the vanilla kit => openKit -1.
+		const int samOpenKit = tinkeringKitItem ? static_cast<int>(tinkeringKitItem->type) : -1;
+		// Scope every cost / skill / material lookup to the bench that is actually open.
+		SAMRecipes::setActiveKit(SAMRecipes::isCustomKit(samOpenKit) ? samOpenKit : -1);
+		const bool samCustomKit = ( samOpenKit >= 0 && SAMRecipes::isCustomKit(samOpenKit) );
+		// Recipes are matched against this: a custom kit shows only its own, the
+		// vanilla kit shows only unbound (-1) ones.
+		const int samOpenKitFilter = samCustomKit ? samOpenKit : -1;
+
+		// 1. Drop any vanilla entry a mod asked to remove. This hides the CRAFT entry
+		//    only — salvaging and repairing that item are separate systems, untouched.
+		//    A custom kit drops ALL of them, since it is a separate crafting surface.
+		for ( size_t i = 0; i < items.size(); )
+		{
+			Item* existing = items[i];
+			if ( existing && (samCustomKit || SAMRecipes::isVanillaSuppressed((int)existing->type)) )
+			{
+				if ( existing->node ) { list_RemoveNode(existing->node); } // frees the item
+				items.erase(items.begin() + i);
+				continue;
+			}
+			++i;
+		}
+
+		// 2. Work out which grid cells are still free.
+		const int samMaxX = TinkerGUI_t::MAX_TINKER_X;
+		const int samMaxY = TinkerGUI_t::MAX_TINKER_Y;
+		std::vector<bool> samUsed(samMaxX * samMaxY, false);
+		for ( Item* existing : items )
+		{
+			if ( !existing ) { continue; }
+			if ( existing->x >= 0 && existing->x < samMaxX && existing->y >= 0 && existing->y < samMaxY )
+			{
+				samUsed[existing->x + existing->y * samMaxX] = true;
+			}
+		}
+
+		// 3. Append each mod recipe: its pinned cell if free, else the next free one.
+		for ( int r = 0; r < SAMRecipes::count(); ++r )
+		{
+			int samType = 0, samStatus = EXCELLENT, samX = -1, samY = -1;
+			bool samPinned = false;
+			// Only recipes belonging to the kit that is actually open. A recipe with no
+			// kit (-1) lives on the vanilla tinkering kit; one naming a kit shows up
+			// only at that kit.
+			if ( SAMRecipes::kitForIndex(r) != samOpenKitFilter )
+			{
+				continue;
+			}
+			if ( !SAMRecipes::entryAtIndex(r, samType, samStatus, samX, samY, samPinned) )
+			{
+				continue; // unresolved item (its mod isn't loaded) — already warned
+			}
+			// A recipe naming an item that is ALREADY craftable (i.e. a vanilla entry) is a
+			// RE-COST, not a second entry: tinkeringGetCraftingCost / ...HasSkillLVLToCraft
+			// already answer for that type globally. Adding a cell here would show the same
+			// item twice and waste one of the few free cells.
+			bool samAlreadyListed = false;
+			for ( Item* existing : items )
+			{
+				if ( existing && static_cast<int>(existing->type) == samType ) { samAlreadyListed = true; break; }
+			}
+			if ( samAlreadyListed ) { continue; }
+
+			int cellX = -1, cellY = -1;
+			if ( samPinned && samX >= 0 && samX < samMaxX && samY >= 0 && samY < samMaxY
+				&& !samUsed[samX + samY * samMaxX] )
+			{
+				cellX = samX;
+				cellY = samY;
+			}
+			else
+			{
+				for ( int y = 0; y < samMaxY && cellX < 0; ++y )
+				{
+					for ( int x = 0; x < samMaxX; ++x )
+					{
+						if ( !samUsed[x + y * samMaxX] ) { cellX = x; cellY = y; break; }
+					}
+				}
+			}
+			if ( cellX < 0 )
+			{
+				// The grid is a fixed 5x4 and vanilla already fills 16 of the 20 cells, so
+				// this is the common failure. Say so loudly: an out-of-grid recipe would
+				// otherwise be silently invisible AND unclickable.
+				SAM_WARN("RECIPES", "Tinkering grid is full (" + std::to_string(samMaxX) + "x"
+					+ std::to_string(samMaxY) + ") — no room for '" + SAMRecipes::itemIdAtIndex(r)
+					+ "'. Hide a vanilla recipe with { \"remove\": \"<ITEM>\" } to free a cell.");
+				continue;
+			}
+			Item* made = newItem(static_cast<ItemType>(samType), static_cast<Status>(samStatus),
+				0, 1, ITEM_TINKERING_APPEARANCE, true, &tinkeringTotalItems);
+			if ( !made ) { continue; }
+			made->x = cellX;
+			made->y = cellY;
+			samUsed[cellX + cellY * samMaxX] = true;
+			items.push_back(made);
+		}
+
+		// An EMPTY craftable list is legitimate: the framework's built-in bench exists from
+		// startup, so until a mod binds a recipe to it there is genuinely nothing to craft.
+		// It used to get a placeholder craftable, because the splice at the end of this
+		// function hangs the player's inventory off the list's LAST node and an empty list
+		// has none -- leaving the GUI unable to see the inventory. That placeholder is now
+		// handled properly at the splice instead: showing the player a noisemaker they
+		// never asked for is worse than showing an empty grid, which is the truth.
+		if ( items.empty() )
+		{
+			SAM_DEBUG("RECIPES", samCustomKit
+				? "This kit has no recipes bound to it — showing an empty grid."
+				: "Every vanilla craftable was hidden and none were added — empty grid.");
+		}
+	}
+
 	for ( auto it = items.begin(); it != items.end(); ++it )
 	{
 		Item* item = *it;
@@ -10658,6 +10819,16 @@ void GenericGUIMenu::tinkeringCreateCraftableItemList()
 		{
 			tinkeringTotalLastCraftableNode->next = stats[gui_player]->inventory.first;
 		}
+		else
+		{
+			// S.A.M: no craftables at all. Point the HEAD at the inventory so the GUI can
+			// still walk into it (scrap detection, the Salvage and Repair tabs). Those
+			// nodes keep node->list == &inventory, so isNodeTinkeringCraftableItem stays
+			// false for them and none of them render as craftables. tinkeringFreeLists
+			// walks from .first and stops at the first inventory-owned node, so it frees
+			// nothing here, which is correct -- this list owns nothing.
+			tinkeringTotalItems.first = stats[gui_player]->inventory.first;
+		}
 		//messagePlayer(gui_player, "asserting total list size: %d", list_Size(&tinkeringTotalItems));
 	}
 }
@@ -10683,6 +10854,7 @@ void GenericGUIMenu::tinkeringFreeLists()
 			break;
 		}
 	}
+	SAMRecipes::setActiveKit(-1); // back to the ordinary kit
 	tinkeringMetalScrap.clear();
 	tinkeringMagicScrap.clear();
 	tinkeringTotalItems.first = nullptr;
@@ -11140,6 +11312,18 @@ bool GenericGUIMenu::tinkeringPlayerCanAffordCraft(const Item* item)
 	{
 		return false;
 	}
+	// S.A.M: a recipe can cost the mod's own items instead of scrap. When it does, those
+	// replace the scrap requirement completely (the recipe may well have no scrap cost).
+	{
+		int mA = -1, cA = 0, mB = -1, cB = 0;
+		if ( SAMRecipes::materialsFor((int)item->type, mA, cA, mB, cB) )
+		{
+			if ( mA >= 0 && tinkeringCountScrapTotal(mA) < cA ) { return false; }
+			if ( mB >= 0 && tinkeringCountScrapTotal(mB) < cB ) { return false; }
+			return true;
+		}
+	}
+
 	int metal = 0;
 	int magic = 0;
 	tinkeringGetCraftingCost(item, &metal, &magic);
@@ -11162,6 +11346,37 @@ Item* GenericGUIMenu::tinkeringCraftItemAndConsumeMaterials(const Item* item)
 	{
 		return nullptr;
 	}
+	// S.A.M custom materials: consume the mod's own items instead of scrap. Handled up
+	// front because such a recipe legitimately has no scrap cost, which the 0/0 bail
+	// below would otherwise reject.
+	{
+		int mA = -1, cA = 0, mB = -1, cB = 0;
+		if ( SAMRecipes::materialsFor((int)item->type, mA, cA, mB, cB) )
+		{
+			if ( (mA >= 0 && tinkeringCountScrapTotal(mA) < cA)
+				|| (mB >= 0 && tinkeringCountScrapTotal(mB) < cB) )
+			{
+				return nullptr; // not enough materials
+			}
+			for ( int pass = 0; pass < 2; ++pass )
+			{
+				const int mt = ( pass == 0 ) ? mA : mB;
+				const int need = ( pass == 0 ) ? cA : cB;
+				if ( mt < 0 ) { continue; }
+				for ( int c = 0; c < need; ++c )
+				{
+					Item* used = uidToItem(tinkeringRetrieveLeastScrapStack(mt));
+					if ( used ) { consumeItem(used, gui_player); }
+				}
+			}
+			if ( tinkeringKitRollIfShouldBreak() )
+			{
+				tinkeringKitDegradeOnUse(gui_player);
+			}
+			return newItem(item->type, item->status, item->beatitude, 1, ITEM_TINKERING_APPEARANCE, true, nullptr);
+		}
+	}
+
 	int metal = 0;
 	int magic = 0;
 	tinkeringGetCraftingCost(item, &metal, &magic);
@@ -11288,6 +11503,25 @@ Item* GenericGUIMenu::tinkeringCraftItemAndConsumeMaterials(const Item* item)
 
 Uint32 GenericGUIMenu::tinkeringRetrieveLeastScrapStack(int type)
 {
+	// S.A.M: a recipe may cost the mod's own items instead of scrap. Those are not in the
+	// two cached scrap sets, so walk the inventory for them. Same rule as vanilla: consume
+	// from the SMALLEST stack first, so big stacks stay intact.
+	if ( type != TOOL_METAL_SCRAP && type != TOOL_MAGIC_SCRAP )
+	{
+		if ( !stats[gui_player] ) { return 0; }
+		int lowestCount = 9999;
+		Uint32 lowestUid = 0;
+		for ( node_t* n = stats[gui_player]->inventory.first; n != nullptr; n = n->next )
+		{
+			Item* it = (Item*)n->element;
+			if ( it && (int)it->type == type && it->count > 0 && it->count < lowestCount )
+			{
+				lowestCount = it->count;
+				lowestUid = it->uid;
+			}
+		}
+		return lowestUid;
+	}
 	if ( type == TOOL_METAL_SCRAP )
 	{
 		if ( !tinkeringMetalScrap.empty() )
@@ -11330,6 +11564,17 @@ Uint32 GenericGUIMenu::tinkeringRetrieveLeastScrapStack(int type)
 int GenericGUIMenu::tinkeringCountScrapTotal(int type)
 {
 	int count = 0;
+	// S.A.M custom material: count it straight from the inventory (see above).
+	if ( type != TOOL_METAL_SCRAP && type != TOOL_MAGIC_SCRAP )
+	{
+		if ( !stats[gui_player] ) { return 0; }
+		for ( node_t* n = stats[gui_player]->inventory.first; n != nullptr; n = n->next )
+		{
+			Item* it = (Item*)n->element;
+			if ( it && (int)it->type == type ) { count += it->count; }
+		}
+		return count;
+	}
 	if ( type == TOOL_METAL_SCRAP )
 	{
 		if ( !tinkeringMetalScrap.empty() )
@@ -11405,6 +11650,21 @@ bool GenericGUIMenu::tinkeringGetCraftingCost(const Item* item, int* metal, int*
 	if ( !item || !metal || !magic )
 	{
 		return false;
+	}
+
+	// S.A.M: a mod-declared recipe supplies the scrap cost for its own custom item, and
+	// may also re-cost a vanilla one. Placed BEFORE the switch so it wins for both. The
+	// registry is empty in vanilla, so this is a failed lookup and falls straight through.
+	// NOTE: this function is static and is also called off the GUI (scores.cpp achievement
+	// counting, host-side salvage), so it must never touch gui_player.
+	{
+		int samMetal = 0, samMagic = 0;
+		if ( SAMRecipes::costFor((int)item->type, samMetal, samMagic) )
+		{
+			*metal = samMetal;
+			*magic = samMagic;
+			return true;
+		}
 	}
 
 	switch ( item->type )
@@ -12115,6 +12375,20 @@ bool GenericGUIMenu::tinkeringGetItemValue(const Item* item, int* metal, int* ma
 			break;
 	}
 
+	// S.A.M custom item: the switch above is a hardcoded per-type salvage table that no
+	// custom id matches, so custom items fell through to `default` (0/0) and could never
+	// be salvaged or repaired. Read the declared yield from the item JSON's
+	// `attributes: { "TINKER_SALVAGE_METAL": n, "TINKER_SALVAGE_MAGIC": n }`. An item that
+	// declares neither stays 0/0 and is simply not tinkerable, which is the right default.
+	// Falls into the shared tail below, so the beatitude bonus and return convention hold.
+	if ( item->type >= NUMITEMS && item->type < NUM_ITEM_SLOTS )
+	{
+		auto& samAttrs = items[item->type].attributes;
+		auto samMetal = samAttrs.find("TINKER_SALVAGE_METAL");
+		auto samMagic = samAttrs.find("TINKER_SALVAGE_MAGIC");
+		if ( samMetal != samAttrs.end() ) { *metal = samMetal->second; }
+		if ( samMagic != samAttrs.end() ) { *magic = samMagic->second; }
+	}
 
 	if ( *metal > 0 || *magic > 0 )
 	{
@@ -12307,6 +12581,19 @@ int GenericGUIMenu::tinkeringPlayerHasSkillLVLToCraft(const Item* item)
 		skillLVL = (stats[gui_player]->getModifiedProficiency(PRO_LOCKPICKING) + statGetPER(stats[gui_player], players[gui_player]->entity)) / 20; // 0 to 5
 	}
 
+	// S.A.M: a mod-declared recipe supplies its own skill requirement, as the same 0..5
+	// tier vanilla uses (the GUI recovers the displayed number by multiplying by 20, so
+	// staying on that granularity means no display code has to change). Returning -1 for
+	// "skill too low" preserves the overloaded contract every caller here depends on.
+	// Empty registry in vanilla => failed lookup => falls through to the switch below.
+	{
+		int samReq = 0;
+		if ( SAMRecipes::skillFor((int)item->type, samReq) )
+		{
+			return ( skillLVL >= samReq ) ? samReq : -1;
+		}
+	}
+
 	switch ( item->type )
 	{
 		case TOOL_LOCKPICK:
@@ -12431,7 +12718,8 @@ Item* GenericGUIMenu::tinkeringKitFindInInventory()
 		for ( node_t* invnode = stats[gui_player]->inventory.first; invnode != NULL; invnode = invnode->next )
 		{
 			Item* tinkerItem = (Item*)invnode->element;
-			if ( tinkerItem && tinkerItem->type == TOOL_TINKERING_KIT && tinkerItem->status > BROKEN )
+			if ( tinkerItem && tinkerItem->status > BROKEN
+				&& ( tinkerItem->type == TOOL_TINKERING_KIT || SAMRecipes::isCustomKit((int)tinkerItem->type) ) )
 			{
 				return tinkerItem;
 			}
@@ -14537,6 +14825,63 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 	auto baseFrame = tinkerFrame->findFrame("tinker base");
 	baseFrame->setDisabled(false);
 
+	// S.A.M: per-kit crafting-panel skin. A mod's custom kit item may declare a "kit_ui"
+	// map of panel ROLE -> its own PNG, so its bench looks like its own thing instead of
+	// the vanilla tinkering kit. Resolved every frame rather than at build time because
+	// the Frame tree is retained and the same panel is reused for the vanilla kit: asking
+	// each frame is what guarantees the vanilla art comes back when the vanilla kit opens.
+	//
+	// samArt() is the single decision point. It answers the vanilla literal unless a
+	// custom kit is open AND that kit supplied that role AND the file is on disk, so a
+	// partial skin, a missing file, or no mod at all all fall back cleanly.
+	auto samArt = [](const char* role, const char* vanilla) -> std::string {
+		const int samKit = SAMRecipes::activeKit();
+		if ( samKit >= 0 )
+		{
+			const std::string p = SAMItems::getKitUiPath(samKit, role);
+			if ( !p.empty() )
+			{
+				// Carry over Barony's sampler prefixes. Image::Image reads a leading '*'
+				// as point sampling and '#' as clamp, and strips them before resolving
+				// the file. Substituting a bare path silently drops both, which bilinear
+				// filters pixel art into mush and lets the edges bleed -- most visible on
+				// the 27x27 item frame, which the panel draws at 54x54.
+				size_t n = 0;
+				while ( vanilla[n] == '*' || vanilla[n] == '#' ) { ++n; }
+				return std::string(vanilla, n) + p;
+			}
+		}
+		return std::string(vanilla);
+	};
+	{
+		struct SamSkinnable { Frame* frame; const char* image; const char* role; const char* vanilla; };
+		const SamSkinnable samSkinnables[] = {
+			{ drawerFrame, "tinker drawer img",    "drawer",         "*images/ui/Tinkering/Tinker_Construct_Drawer_01.png" },
+			{ baseFrame,   "tinker base img",      "base",           "*images/ui/Tinkering/Tinker_Construct_Base_00.png" },
+			{ baseFrame,   "action prompt lcover", "prompt_left",    "*images/ui/Tinkering/Tinker_PromptCoverLeft_00.png" },
+			{ baseFrame,   "action prompt rcover", "prompt_right",   "*images/ui/Tinkering/Tinker_PromptCoverRight_00.png" },
+			{ baseFrame,   "filter nav left arrow","arrow_left",     "*#images/ui/Tinkering/Tinker_Button_ArrowL_00.png" },
+			{ baseFrame,   "filter nav right arrow","arrow_right",   "*#images/ui/Tinkering/Tinker_Button_ArrowR_00.png" },
+			{ baseFrame,   "held scrap img",       "scrap_backing",  "*images/ui/Tinkering/Tinker_ScrapBacking_00.png" },
+		};
+		for ( const auto& s : samSkinnables )
+		{
+			if ( !s.frame ) { continue; }
+			if ( auto img = s.frame->findImage(s.image) )
+			{
+				img->path = samArt(s.role, s.vanilla);
+			}
+		}
+		// The close button's art is only set at build time, so it needs re-asserting here
+		// for the same retained-frame reason as the images above.
+		if ( auto closeBtn = baseFrame->findButton("close tinker button") )
+		{
+			closeBtn->setBackground(samArt("close", "*images/ui/Tinkering/Button_X_00.png").c_str());
+			closeBtn->setBackgroundHighlighted(samArt("close_high", "*images/ui/Tinkering/Button_XHigh_00.png").c_str());
+			closeBtn->setBackgroundActivated(samArt("close_press", "*images/ui/Tinkering/Button_XPress_00.png").c_str());
+		}
+	}
+
 	tinkerFrame->setSize(tinkerFramePos);
 
 	SDL_Rect baseFramePos = baseFrame->getSize();
@@ -14733,6 +15078,26 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 	// held qtys
 	int heldMetalScrap = parentGUI.tinkeringCountScrapTotal(TOOL_METAL_SCRAP);
 	int heldMagicScrap = parentGUI.tinkeringCountScrapTotal(TOOL_MAGIC_SCRAP);
+	// S.A.M: when the highlighted recipe is paid for in the mod's own materials, this whole
+	// row has to describe THOSE items instead of scrap -- the two counts, the backing width,
+	// the two icons, and whether there is a second column at all. All four are decided from
+	// the ONE predicate below. Computing it separately at each site let them disagree: the
+	// counts were being substituted on the Salvage and Repair tabs while the icons were not,
+	// captioning the vanilla scrap gear with a count of an unrelated mod material.
+	//
+	// Restricted to the Craft tab deliberately. Salvage grants real scrap and Repair spends
+	// it, so both must keep reporting real scrap even while a mod-crafted item is highlighted
+	// (setItemDisplayNameAndPrice sets itemType on those tabs too). itemType is -1 when
+	// nothing is highlighted, which materialsFor answers false for.
+	int samHeldMatA = -1, samHeldCntA = 0, samHeldMatB = -1, samHeldCntB = 0;
+	const bool samHeldCustom =
+		parentGUI.tinkeringFilter == TINKER_FILTER_CRAFTABLE
+		&& SAMRecipes::materialsFor(itemType, samHeldMatA, samHeldCntA, samHeldMatB, samHeldCntB);
+	if ( samHeldCustom )
+	{
+		heldMetalScrap = ( samHeldMatA >= 0 ) ? parentGUI.tinkeringCountScrapTotal(samHeldMatA) : 0;
+		heldMagicScrap = ( samHeldMatB >= 0 ) ? parentGUI.tinkeringCountScrapTotal(samHeldMatB) : 0;
+	}
 	auto metalHeldText = baseFrame->findField("held metal txt");
 	auto magicHeldText = baseFrame->findField("held magic txt");
 	{
@@ -14740,8 +15105,60 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 		heldScrapText->setDisabled(false);
 
 		auto heldScrapBg = baseFrame->findImage("held scrap img");
+		// S.A.M: same treatment as the cost row above. Tinker_ScrapBacking_00.png is 176x36
+		// with both scrap icons baked in (gear at x 8..31, gem at x 82..97) and a transparent
+		// gutter at x 76..79, so a one-material recipe crops cleanly to the left 76px. Set
+		// BEFORE pos.x below, which right-aligns the pill off its own width.
+		{
+			if ( samHeldCustom && samHeldMatB < 0 )
+			{
+				// Proportional crop, same reasoning as the cost plate above. This art's
+				// transparent gutter sits at 76/176 of the width rather than halfway.
+				const Image* samHeldImg = Image::get(heldScrapBg->path.c_str());
+				const int samSrcW = samHeldImg ? (int)samHeldImg->getWidth() : 176;
+				const int samSrcH = samHeldImg ? (int)samHeldImg->getHeight() : 36;
+				heldScrapBg->section = SDL_Rect{ 0, 0, samSrcW * 76 / 176, samSrcH };
+				heldScrapBg->pos.w = 76;
+			}
+			else
+			{
+				heldScrapBg->section = SDL_Rect{ 0, 0, 0, 0 };
+				heldScrapBg->pos.w = 176;
+			}
+		}
 		heldScrapBg->pos.x = baseFrame->getSize().w - 18 - heldScrapBg->pos.w;
 		heldScrapBg->pos.y = baseFrame->getSize().h - 48 - 32;
+		// S.A.M: overlay the material's own icon on each baked scrap icon (measured boxes:
+		// A = 24x24 at +8,+6 and B = 16x22 at +82,+6). Disabled first, unconditionally, so a
+		// non-material recipe always clears whatever the previous selection left enabled.
+		{
+			auto samHeldIconA = baseFrame->findImage("sam held icon a");
+			auto samHeldIconB = baseFrame->findImage("sam held icon b");
+			if ( samHeldIconA && samHeldIconB )
+			{
+				samHeldIconA->disabled = true;
+				samHeldIconB->disabled = true;
+				if ( samHeldCustom )
+				{
+					const std::string pA = ( samHeldMatA >= SAM_ITEM_ID_BASE ) ? SAMItems::getIconPath(samHeldMatA) : "";
+					const std::string pB = ( samHeldMatB >= SAM_ITEM_ID_BASE ) ? SAMItems::getIconPath(samHeldMatB) : "";
+					if ( !pA.empty() )
+					{
+						samHeldIconA->path = pA;
+						samHeldIconA->pos.x = heldScrapBg->pos.x + 8;
+						samHeldIconA->pos.y = heldScrapBg->pos.y + 6;
+						samHeldIconA->disabled = false;
+					}
+					if ( !pB.empty() )
+					{
+						samHeldIconB->path = pB;
+						samHeldIconB->pos.x = heldScrapBg->pos.x + 82;
+						samHeldIconB->pos.y = heldScrapBg->pos.y + 6;
+						samHeldIconB->disabled = false;
+					}
+				}
+			}
+		}
 
 		SDL_Rect metalPos{ heldScrapBg->pos.x - 4, heldScrapBg->pos.y + 9, 74, 24 };
 		SDL_Rect magicPos{ heldScrapBg->pos.x - 24, heldScrapBg->pos.y + 9, 166, 24 };
@@ -14751,6 +15168,15 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 		magicHeldText->setColor(hudColors.characterSheetLightNeutral);
 
 		updateTinkerScrapHeld(metalHeldText, magicHeldText, heldMetalScrap, heldMagicScrap);
+
+		// S.A.M: a recipe that costs one custom material has no second column, but the held
+		// row stringifies its count unconditionally and would print a "0" that reads as
+		// "you have no magic scrap" for a craft that never wanted any. Blank it instead.
+		// Runs after the vanilla update so it only ever overwrites the modded case.
+		if ( samHeldCustom && samHeldMatB < 0 && magicHeldText )
+		{
+			magicHeldText->setText("");
+		}
 
 		SDL_Rect heldScrapTxtPos = heldScrapText->getSize();
 		heldScrapTxtPos.w = heldScrapBg->pos.x + 2;
@@ -14808,7 +15234,7 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 		Uint32 highlightColor = hudColors.characterSheetLighter1Neutral;
 
 		filterBtn->setColor(makeColor(255, 255, 255, 255));
-		filterBtn->setBackground("*#images/ui/Tinkering/Tinker_Filter_Center_00.png");
+		filterBtn->setBackground(samArt("filter_center", "*#images/ui/Tinkering/Tinker_Filter_Center_00.png").c_str());
 		Field* filterTxt = baseFrame->findField("filter salvage txt");
 		filterTxt->setDisabled(false);
 		filterTxt->setText(Language::get(3645));
@@ -14832,7 +15258,7 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 		if ( parentGUI.tinkeringFilter == GenericGUIMenu::TINKER_FILTER_SALVAGEABLE )
 		{
 			filterBtn->setColor(makeColor(255, 255, 255, 255));
-			filterBtn->setBackground("*#images/ui/Tinkering/Tinker_Filter_CenterHigh_00.png");
+			filterBtn->setBackground(samArt("filter_center_high", "*#images/ui/Tinkering/Tinker_Filter_CenterHigh_00.png").c_str());
 			SDL_Rect txtPos = filterTxt->getSize();
 			txtPos.y += 2;
 			filterTxt->setSize(txtPos);
@@ -14854,7 +15280,7 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 			filterBtn->deselect();
 		}
 		filterBtn->setColor(makeColor(255, 255, 255, 255));
-		filterBtn->setBackground("*#images/ui/Tinkering/Tinker_Filter_Left_00.png");
+		filterBtn->setBackground(samArt("filter_left", "*#images/ui/Tinkering/Tinker_Filter_Left_00.png").c_str());
 		filterTxt = baseFrame->findField("filter craft txt");
 		filterTxt->setDisabled(false);
 		filterTxt->setText(Language::get(3644));
@@ -14881,7 +15307,7 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 		if ( parentGUI.tinkeringFilter == GenericGUIMenu::TINKER_FILTER_CRAFTABLE )
 		{
 			filterBtn->setColor(makeColor(255, 255, 255, 255));
-			filterBtn->setBackground("*#images/ui/Tinkering/Tinker_Filter_LeftHigh_00.png");
+			filterBtn->setBackground(samArt("filter_left_high", "*#images/ui/Tinkering/Tinker_Filter_LeftHigh_00.png").c_str());
 			SDL_Rect txtPos = filterTxt->getSize();
 			txtPos.y += 2;
 			filterTxt->setSize(txtPos);
@@ -14903,7 +15329,7 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 			filterBtn->deselect();
 		}
 		filterBtn->setColor(makeColor(255, 255, 255, 255));
-		filterBtn->setBackground("*#images/ui/Tinkering/Tinker_Filter_Right_00.png");
+		filterBtn->setBackground(samArt("filter_right", "*#images/ui/Tinkering/Tinker_Filter_Right_00.png").c_str());
 		filterTxt = baseFrame->findField("filter repair txt");
 		filterTxt->setDisabled(false);
 		filterTxt->setText(Language::get(3646));
@@ -14928,7 +15354,7 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 		if ( parentGUI.tinkeringFilter == GenericGUIMenu::TINKER_FILTER_REPAIRABLE )
 		{
 			filterBtn->setColor(makeColor(255, 255, 255, 255));
-			filterBtn->setBackground("*#images/ui/Tinkering/Tinker_Filter_RightHigh_00.png");
+			filterBtn->setBackground(samArt("filter_right_high", "*#images/ui/Tinkering/Tinker_Filter_RightHigh_00.png").c_str());
 			SDL_Rect txtPos = filterTxt->getSize();
 			txtPos.y += 2;
 			filterTxt->setSize(txtPos);
@@ -14971,6 +15397,22 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 	}
 
 	auto itemDisplayTooltip = baseFrame->findFrame("tinker display tooltip");
+	// S.A.M: the tooltip's three art pieces, same per-frame rule as the panel above.
+	{
+		struct SamTipSkin { const char* image; const char* role; const char* vanilla; };
+		const SamTipSkin samTipSkins[] = {
+			{ "item text img", "name_plate",    "*images/ui/Tinkering/Tinker_LabelName_2Row_00.png" },
+			{ "item cost img", "cost_backing",  "*images/ui/Tinkering/Tinker_CostBacking_00.png" },
+			{ "item bg img",   "item_surround", "*images/ui/Tinkering/Tinker_ItemBGSurround_00.png" },
+		};
+		for ( const auto& t : samTipSkins )
+		{
+			if ( auto img = itemDisplayTooltip->findImage(t.image) )
+			{
+				img->path = samArt(t.role, t.vanilla);
+			}
+		}
+	}
 	itemDisplayTooltip->setDisabled(false);
 
 	auto actionPromptTxt = baseFrame->findField("action prompt txt");
@@ -15037,6 +15479,38 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 
 	auto costBg = itemDisplayTooltip->findImage("item cost img");
 	auto costScrapText = itemDisplayTooltip->findField("item cost label");
+	// S.A.M: make the cost row show the recipe's REAL materials. Vanilla bakes both scrap
+	// icons into Tinker_CostBacking_00.png, so a recipe paid for in a mod's own items would
+	// read as scrap. Two overlay images carry the material's own inventory icon instead, and
+	// the backing is cropped to one column when the recipe uses a single material (the source
+	// art has a transparent gutter at x=72, so it cuts cleanly).
+	//
+	// This sits at function scope, ahead of the layout block, for two reasons. The width has
+	// to be set BEFORE pos.x is right-aligned off it, or a width change lands a frame late.
+	// And the restore has to run on EVERY frame: nested inside the price-text branches it
+	// would be skipped whenever the row shows "-", stranding a cropped backing on screen.
+	int samMatA = -1, samCntA = 0, samMatB = -1, samCntB = 0;
+	const bool samCustomCost =
+		parentGUI.tinkeringFilter == TINKER_FILTER_CRAFTABLE
+		&& SAMRecipes::materialsFor(itemType, samMatA, samCntA, samMatB, samCntB);
+	if ( samCustomCost && samMatB < 0 )
+	{
+		// Crop to the left column. `section` is in SOURCE pixels, so it has to scale with
+		// the actual image: a mod shipping a 2x-resolution skin would otherwise be cropped
+		// at the vanilla 72px offset and show a quarter of its plate. The vanilla art has a
+		// transparent gutter at exactly half its width, so half is the cut either way.
+		// pos.w stays 72 because that is the DESTINATION size the panel lays out.
+		const Image* samCostImg = Image::get(costBg->path.c_str());
+		const int samSrcW = samCostImg ? (int)samCostImg->getWidth() : 144;
+		const int samSrcH = samCostImg ? (int)samCostImg->getHeight() : 34;
+		costBg->section = SDL_Rect{ 0, 0, samSrcW / 2, samSrcH };
+		costBg->pos.w = 72;
+	}
+	else
+	{
+		costBg->section = SDL_Rect{ 0, 0, 0, 0 };
+		costBg->pos.w = 144;
+	}
 	{
 		costBg->pos.x = displayItemTextImgBaseX + displayItemTextImg->pos.w - costBg->pos.w;
 		costBg->pos.y = displayItemTextImg->pos.y + displayItemTextImg->pos.h + 4;
@@ -15050,6 +15524,41 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 		costScrapTxtPos.y = metalPos.y;
 		costScrapTxtPos.h = 24;
 		costScrapText->setSize(costScrapTxtPos);
+	}
+	// S.A.M: the material overlays anchor off the backing, so they are positioned after the
+	// layout block above. Both are disabled first, unconditionally, so a recipe that does not
+	// use custom materials always clears whatever the previous selection left enabled.
+	{
+		auto samIconA = itemDisplayTooltip->findImage("sam cost icon a");
+		auto samIconB = itemDisplayTooltip->findImage("sam cost icon b");
+		if ( samIconA && samIconB )
+		{
+			samIconA->disabled = true;
+			samIconB->disabled = true;
+			if ( samCustomCost )
+			{
+				// Only custom items resolve to an icon without an Item instance to hand.
+				// A vanilla material keeps the baked icon.
+				const std::string pathA = ( samMatA >= SAM_ITEM_ID_BASE )
+					? SAMItems::getIconPath(samMatA) : "";
+				const std::string pathB = ( samMatB >= SAM_ITEM_ID_BASE )
+					? SAMItems::getIconPath(samMatB) : "";
+				if ( !pathA.empty() )
+				{
+					samIconA->path = pathA;
+					samIconA->pos.x = costBg->pos.x + 6;
+					samIconA->pos.y = costBg->pos.y + 6;
+					samIconA->disabled = false;
+				}
+				if ( !pathB.empty() )
+				{
+					samIconB->path = pathB;
+					samIconB->pos.x = costBg->pos.x + 80;
+					samIconB->pos.y = costBg->pos.y + 6;
+					samIconB->disabled = false;
+				}
+			}
+		}
 	}
 
 	auto itemSlotFrame = itemDisplayTooltip->findFrame("item slot frame");
@@ -15370,6 +15879,7 @@ void GenericGUIMenu::TinkerGUI_t::updateTinkerMenu()
 						}
 					}
 				}
+
 			}
 		}
 	}
@@ -15995,6 +16505,19 @@ void GenericGUIMenu::TinkerGUI_t::createTinkerMenu()
 			auto itemCostBg = itemDisplayTooltip->addImage(SDL_Rect{ 0, 0, 144, 34 },
 				0xFFFFFFFF, "*images/ui/Tinkering/Tinker_CostBacking_00.png", "item cost img");
 
+			// S.A.M: the two scrap icons in the cost row are baked into Tinker_CostBacking_00.png,
+			// so a recipe paid for in a mod's own items has no way to show what it actually costs.
+			// These two overlays sit exactly over the baked gear / gem and carry the material's
+			// own inventory icon instead. Both are created DISABLED with no path, and only ever
+			// enabled for a recipe that SAMRecipes::materialsFor answers true for, so with no mod
+			// loaded they are never drawn and the row is pixel-identical to vanilla.
+			auto samCostIconA = itemDisplayTooltip->addImage(SDL_Rect{ 0, 0, 24, 24 },
+				0xFFFFFFFF, "", "sam cost icon a");
+			samCostIconA->disabled = true;
+			auto samCostIconB = itemDisplayTooltip->addImage(SDL_Rect{ 0, 0, 16, 22 },
+				0xFFFFFFFF, "", "sam cost icon b");
+			samCostIconB->disabled = true;
+
 			auto metalText = itemDisplayTooltip->addField("item metal value", 32);
 			metalText->setFont(itemFont);
 			metalText->setText("");
@@ -16235,6 +16758,15 @@ void GenericGUIMenu::TinkerGUI_t::createTinkerMenu()
 		{
 			auto heldScrapBg = bgFrame->addImage(SDL_Rect{ 0, 0, 176, 36 },
 				0xFFFFFFFF, "*images/ui/Tinkering/Tinker_ScrapBacking_00.png", "held scrap img");
+
+			// S.A.M: material-icon overlays for the held row, mirroring the cost row's pair.
+			// Created with no path and disabled, so vanilla never draws or resolves them.
+			auto samHeldIconA = bgFrame->addImage(SDL_Rect{ 0, 0, 24, 24 },
+				0xFFFFFFFF, "", "sam held icon a");
+			samHeldIconA->disabled = true;
+			auto samHeldIconB = bgFrame->addImage(SDL_Rect{ 0, 0, 16, 22 },
+				0xFFFFFFFF, "", "sam held icon b");
+			samHeldIconB->disabled = true;
 
 			auto heldScrapText = bgFrame->addField("held scrap label", 64);
 			heldScrapText->setFont(itemFont);
@@ -29140,7 +29672,8 @@ CalloutRadialMenu::CalloutType CalloutRadialMenu::getCalloutTypeForEntity(const 
 			}
 			else if ( multiplayer == CLIENT
 				&& !parent->monsterAllyGetPlayerLeader()
-				&& !monsterally[monsterType][stats[player]->type] )
+				&& SAMRaces::clientEnemyView(player, monsterType,
+					!monsterally[monsterType][stats[player]->type]) )
 			{
 				enemies = true;
 			}
@@ -29148,7 +29681,8 @@ CalloutRadialMenu::CalloutType CalloutRadialMenu::getCalloutTypeForEntity(const 
 		else
 		{
 			if ( !parent->monsterAllyGetPlayerLeader()
-				&& !monsterally[monsterType][stats[player]->type] )
+				&& SAMRaces::clientEnemyView(player, monsterType,
+					!monsterally[monsterType][stats[player]->type]) )
 			{
 				enemies = true;
 			}
@@ -30075,6 +30609,31 @@ bool CalloutRadialMenu::createParticleCallout(Entity* entity, CalloutRadialMenu:
 	if ( !entity ) { return false; }
 	if ( _cmd == CALLOUT_CMD_CANCEL ) { return false; }
 
+	// S.A.M: Barony already classifies every ping into one of 33 CalloutTypes plus a set of
+	// help flags, and until now nothing could read any of it. Both createParticleCallout
+	// overloads are the single funnel: on the host, a local player's ping and a remote
+	// client's ping (routed here by the 'CALL' handler) both pass through, and the outbound
+	// broadcast happens further down, so a veto here stops the ping before it is sent.
+	// Returning false is already every caller's "not sent" contract.
+	if ( multiplayer != CLIENT )
+	{
+		SamEvent samCallEv("player.on_callout");
+		samCallEv.i("player", (long long)getPlayer())
+			.i("cmd", (long long)_cmd)
+			.i("type", (long long)getCalloutTypeForEntity(getPlayer(), entity))
+			.i("target_uid", (long long)(overrideUID ? overrideUID : entity->getUID()))
+			.i("x", (long long)(entity->x / 16))
+			.i("y", (long long)(entity->y / 16))
+			.i("help_flags", (long long)clientCalloutHelpFlags);
+		if ( !samCallEv.fire() )
+		{
+			// A joiner drew this ping and played its sound before asking; take the marker back
+			// down on their screen too (S.A.M clients only -- a stock client keeps its own).
+			SAMMpInput::retractCallout(getPlayer(), entity->getUID());
+			return false;
+		}
+	}
+
 	Uint32 existingMessageSent = 0;
 	for ( int i = 0; i < MAXPLAYERS; ++i )
 	{
@@ -30195,6 +30754,24 @@ bool CalloutRadialMenu::createParticleCallout(Entity* entity, CalloutRadialMenu:
 bool CalloutRadialMenu::createParticleCallout(real_t x, real_t y, real_t z, Uint32 uid, CalloutRadialMenu::CalloutCommand _cmd)
 {
 	if ( _cmd == CALLOUT_CMD_CANCEL ) { return false; }
+
+	// S.A.M: the coordinate overload of the same funnel. See the entity overload above.
+	if ( multiplayer != CLIENT )
+	{
+		SamEvent samCallEv("player.on_callout");
+		samCallEv.i("player", (long long)getPlayer())
+			.i("cmd", (long long)_cmd)
+			.i("type", (long long)getCalloutTypeForUid(getPlayer(), uid))
+			.i("target_uid", (long long)uid)
+			.i("x", (long long)(x / 16))
+			.i("y", (long long)(y / 16))
+			.i("help_flags", (long long)clientCalloutHelpFlags);
+		if ( !samCallEv.fire() )
+		{
+			SAMMpInput::retractCallout(getPlayer(), uid);   // see the entity overload above
+			return false;
+		}
+	}
 
 	//for ( int i = 0; i < MAXPLAYERS; ++i )
 	//{
@@ -31975,6 +32552,23 @@ void GenericGUIMenu::AssistShrineGUI_t::changeCurrentView(GenericGUIMenu::Assist
 		}
 	}
 
+	// S.A.M custom classes (ids >= SAM_CLASS_ID_BASE): append them after the vanilla
+	// classes, continuing the same grid cursor. Stored by their real runtime id; the
+	// slot comparisons and the confirm/apply path already work by value, and
+	// isCharacterValidFromDLC treats a registered custom class as valid.
+	// Offered in MULTIPLAYER too as of #49: the "ASSC" packet now carries the class as a
+	// 32-bit id tail (data[9], len 13), so a 1000+ id survives the wire instead of being
+	// truncated to one signed byte. Populate unconditionally.
+	for ( int samIdx = 0; samIdx < SAMClasses::count(); ++samIdx )
+	{
+		const int samClassId = SAMClasses::classIdAtIndex(samIdx);
+		if ( !SAMClasses::getClass(samClassId) ) { continue; }
+		int coord = x + y * 100;
+		classSlots[coord] = samClassId;
+		++x;
+		if ( x >= MAX_ASSISTSHRINE_X ) { x = 0; ++y; }
+	}
+
 	raceSlots.push_back(RACE_HUMAN);
 	if ( enabledDLCPack1 )
 	{
@@ -32272,13 +32866,39 @@ void GenericGUIMenu::AssistShrineGUI_t::updateClassSlots()
 	for ( auto& pair : classSlots )
 	{
 		int classIndex = pair.second;
-		auto key = MainMenu::classes_in_order[classIndex];
-		auto find = MainMenu::classes.find(key);
 		static const std::string prefix = "*images/ui/Main Menus/Play/PlayerCreation/ClassSelection/";
 
 		int x = pair.first % 100;
 		int y = pair.first / 100;
 
+		// S.A.M custom class: render its portrait (or the placeholder icon) rather than
+		// indexing the vanilla classes_in_order table, which would read out of bounds for
+		// a runtime id >= SAM_CLASS_ID_BASE. Mirrors the char-select carousel's icon logic.
+		if ( classIndex >= SAM_CLASS_ID_BASE )
+		{
+			const SAMClassDef* samdef = SAMClasses::getClass(classIndex);
+			if ( samdef )
+			{
+				if ( auto slotFrame = getAssistShrineSlotFrame(x, y) )
+				{
+					auto slotBg = slotFrame->findImage("class bg");
+					auto slotFg = slotFrame->findImage("class fg");
+					if ( slotBg && slotFg )
+					{
+						bool selected = (selectedClass == -1 && savedClass == -1 && client_classes[parentGUI.gui_player] == classIndex)
+							|| (savedClass >= 0 && savedClass == classIndex && selectedClass == -1)
+							|| (selectedClass >= 0 && selectedClass == classIndex);
+						if ( !samdef->portraitPath.empty() ) { slotFg->path = ("*" + samdef->portraitPath); }
+						else { slotFg->path = (prefix + "ClassSelect_Icon_Barbarian_00.png"); }
+						slotBg->path = (prefix + (selected ? "ClassSelect_IconBGBaseHigh_00.png" : "ClassSelect_IconBGBase_00.png"));
+					}
+				}
+			}
+			continue;
+		}
+
+		auto key = MainMenu::classes_in_order[classIndex];
+		auto find = MainMenu::classes.find(key);
 		if ( find != MainMenu::classes.end() )
 		{
 			if ( auto slotFrame = getAssistShrineSlotFrame(x, y) )
@@ -32792,14 +33412,15 @@ void GenericGUIMenu::AssistShrineGUI_t::onCharacterChange()
 	else if ( multiplayer == CLIENT )
 	{
 		strcpy((char*)net_packet->data, "ASSC");
-		net_packet->data[4] = (Sint8)savedClass;
+		net_packet->data[4] = (Sint8)savedClass;   // keep: vanilla low-byte fallback
 		net_packet->data[5] = (Sint8)savedRace;
 		net_packet->data[6] = (Sint8)savedSex;
 		net_packet->data[7] = (Sint8)savedAppearance;
 		net_packet->data[8] = parentGUI.gui_player;
+		SDLNet_Write32((Uint32)savedClass, &net_packet->data[9]); // S.A.M: real 32-bit class id tail
 		net_packet->address.host = net_server.host;
 		net_packet->address.port = net_server.port;
-		net_packet->len = 9;
+		net_packet->len = 13;                       // was 9 (+ the 4-byte id tail)
 		sendPacketSafe(net_sock, -1, net_packet, 0);
 
 		addNotification(Language::get(6334), Language::get(6337), "", AssistNotification_t::NOTIF_SEND_REQ);
@@ -32829,14 +33450,15 @@ void GenericGUIMenu::AssistShrineGUI_t::onCharacterChange()
 			if ( !client_disconnected[i] )
 			{
 				strcpy((char*)net_packet->data, "ASSC");
-				net_packet->data[4] = (Sint8)savedClass;
+				net_packet->data[4] = (Sint8)savedClass;   // keep: vanilla low-byte fallback
 				net_packet->data[5] = (Sint8)savedRace;
 				net_packet->data[6] = (Sint8)savedSex;
 				net_packet->data[7] = (Sint8)savedAppearance;
 				net_packet->data[8] = parentGUI.gui_player;
+				SDLNet_Write32((Uint32)savedClass, &net_packet->data[9]); // S.A.M: real 32-bit class id tail
 				net_packet->address.host = net_clients[i - 1].host;
 				net_packet->address.port = net_clients[i - 1].port;
-				net_packet->len = 9;
+				net_packet->len = 13;                       // was 9 (+ the 4-byte id tail)
 				sendPacketSafe(net_sock, -1, net_packet, i - 1);
 			}
 		}
@@ -37551,7 +38173,13 @@ void GenericGUIMenu::AssistShrineGUI_t::updateAssistShrine()
 								// hp/mp
 								{
 									auto hpmp_values = classTooltip->findField("hpmp_values");
-									const int i = std::min((Sint32)itemType, (Sint32)(MainMenu::ClassDescriptions::data.size() - 1));
+									// ClassDescriptions::data is a map KEYED BY class id, not a contiguous
+									// array — the old std::min(itemType, size-1) yielded a non-existent key
+									// for a S.A.M custom class (id >= 1000), and map[] default-constructing
+									// that entry crashed when its survivalComplexity was read. Use a real key:
+									// the class itself if it has description data, else Barbarian as a safe
+									// placeholder (custom classes have no vanilla difficulty/hp-mp rating).
+									const int i = MainMenu::ClassDescriptions::data.count(itemType) ? (Sint32)itemType : (Sint32)CLASS_BARBARIAN;
 									char buf[32];
 									snprintf(buf, sizeof(buf), "%d\n%d",
 										MainMenu::ClassDescriptions::data[i].hp,
@@ -37562,7 +38190,13 @@ void GenericGUIMenu::AssistShrineGUI_t::updateAssistShrine()
 								// difficulty stars
 								auto difficulty_stars = classTooltip->findField("difficulty_stars");
 								{
-									const int i = std::min((Sint32)itemType, (Sint32)(MainMenu::ClassDescriptions::data.size() - 1));
+									// ClassDescriptions::data is a map KEYED BY class id, not a contiguous
+									// array — the old std::min(itemType, size-1) yielded a non-existent key
+									// for a S.A.M custom class (id >= 1000), and map[] default-constructing
+									// that entry crashed when its survivalComplexity was read. Use a real key:
+									// the class itself if it has description data, else Barbarian as a safe
+									// placeholder (custom classes have no vanilla difficulty/hp-mp rating).
+									const int i = MainMenu::ClassDescriptions::data.count(itemType) ? (Sint32)itemType : (Sint32)CLASS_BARBARIAN;
 									for ( int c = 0; c < 2; ++c ) {
 										difficulty_stars->addColorToLine(c, std::get<2>(MainMenu::ClassDescriptions::data[i].survivalComplexity[c]));
 									}

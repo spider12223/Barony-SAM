@@ -21,6 +21,11 @@
 #include "magic.hpp"
 #include "../mod_tools.hpp"
 #include "../ui/GameUI.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
+#include "sam_spells.hpp" // SAM_SPELL_ID_BASE + custom spellbook/foci spell ids
+#include "sam_js_runtime.hpp"
+#include "sam_mp_input.hpp"   // player.on_spell_learned reported from the learner's own machine
 
 list_t channeledSpells[MAXPLAYERS];
 
@@ -368,7 +373,7 @@ bool addSpell(int spell, int player, bool ignoreSkill)
 				Item* item = (Item*)node->element;
 				if ( item->type == SPELL_ITEM )
 				{
-					if ( item->appearance >= 1000 )
+					if ( item->appearance >= 1000 && item->appearance < 1000 + NUM_SPELLS )
 					{
 						if ( item->appearance - 1000 == spell )
 						{
@@ -480,6 +485,16 @@ bool addSpell(int spell, int player, bool ignoreSkill)
 	{
 		Compendium_t::Events_t::eventUpdateWorld(player, Compendium_t::CPDM_SPELLS_LEARNED, "magicians guild", 1);
 	}
+
+	// S.A.M scripting hook: player.on_spell_learned. addSpell only ever runs for a LOCAL player
+	// (it returns early above for anyone else), and this used to fire only where multiplayer !=
+	// CLIENT -- so every spell a joiner learned was invisible to every script. SAMMpInput fires it
+	// on the host: directly for the host's own players, reported by the joiner's game for theirs.
+	if ( player >= 0 )
+	{
+		SAMMpInput::reportSpellLearned(player, new_spell->ID, new_spell->spell_internal_name);
+	}
+
 	return true;
 }
 
@@ -1465,7 +1480,10 @@ int getSpellbookFromSpellID(int spellID)
 	auto find = ItemTooltips.spellItems.find(spellID);
 	if ( find != ItemTooltips.spellItems.end() )
 	{
-		if ( find->second.spellbookId >= 0 && find->second.spellbookId < NUMITEMS )
+		// S.A.M: NUM_ITEM_SLOTS so a CUSTOM spellbook can be the answer to "which book
+		// teaches this spell" -- the reverse of getSpellIDFromSpellbook. Vanilla ids are all
+		// below NUMITEMS, so vanilla lookups are unaffected.
+		if ( find->second.spellbookId >= 0 && find->second.spellbookId < NUM_ITEM_SLOTS )
 		{
 			itemType = (ItemType)find->second.spellbookId;
 			return itemType;
@@ -1648,12 +1666,43 @@ int getSpellbookFromSpellID(int spellID)
 
 int getSpellIDFromFoci(int fociType)
 {
-	if ( fociType >= 0 && fociType < NUMITEMS )
+	// S.A.M: NUM_ITEM_SLOTS, not NUMITEMS. This function is already a pure registry read --
+	// no switch, no hardcoded list -- so a custom item carrying the attribute works with no
+	// other change. The vanilla-enum bound was the only thing excluding it. A vanilla type
+	// is always below NUMITEMS, so every vanilla answer is unchanged.
+	if ( fociType >= 0 && fociType < NUM_ITEM_SLOTS )
 	{
 		if ( items[fociType].hasAttribute("foci_spell") )
 		{
 			auto& spellID = items[fociType].attributes["foci_spell"];
-			if ( spellID >= SPELL_NONE && spellID < NUM_SPELLS )
+			// S.A.M: vanilla condition UNCHANGED; OR-in custom spell ids (>= SAM_SPELL_ID_BASE)
+			// built into allGameSpells, so a custom focus/book can channel a CUSTOM spell. Strict
+			// superset -- NOT a bare allGameSpells test, which would drop the ~30 vanilla spell
+			// ids that exist but are never constructed.
+			if ( ( spellID >= SPELL_NONE && spellID < NUM_SPELLS )
+				|| ( spellID >= SAM_SPELL_ID_BASE && allGameSpells.find(spellID) != allGameSpells.end() ) )
+			{
+				return spellID;
+			}
+		}
+	}
+	return SPELL_NONE;
+}
+
+// S.A.M: the third sibling of getSpellIDFromFoci / getSpellIDFromSpellbook. Barony hardcodes
+// the staff -> spell map as a switch inside Entity::attack, so a custom staff has no spell at
+// all. Vanilla already records the answer for its own staffs (mod_tools writes
+// attributes["magicstaff_spell"] from each spell's magicstaff internal name) and then never
+// reads it -- so this is a pure registry read of data the engine already keeps. Validated
+// against allGameSpells, not "< NUM_SPELLS", so a custom staff can cast a CUSTOM spell too.
+int getSpellIDFromMagicstaff(int magicstaffType)
+{
+	if ( magicstaffType >= 0 && magicstaffType < NUM_ITEM_SLOTS )
+	{
+		if ( items[magicstaffType].hasAttribute("magicstaff_spell") )
+		{
+			const int spellID = items[magicstaffType].attributes["magicstaff_spell"];
+			if ( spellID > SPELL_NONE && allGameSpells.find(spellID) != allGameSpells.end() )
 			{
 				return spellID;
 			}
@@ -1664,12 +1713,21 @@ int getSpellIDFromFoci(int fociType)
 
 int getSpellIDFromSpellbook(int spellbookType)
 {
-	if ( spellbookType >= 0 && spellbookType < NUMITEMS )
+	// S.A.M: NUM_ITEM_SLOTS, not NUMITEMS. This function is already a pure registry read --
+	// no switch, no hardcoded list -- so a custom item carrying the attribute works with no
+	// other change. The vanilla-enum bound was the only thing excluding it. A vanilla type
+	// is always below NUMITEMS, so every vanilla answer is unchanged.
+	if ( spellbookType >= 0 && spellbookType < NUM_ITEM_SLOTS )
 	{
 		if ( items[spellbookType].hasAttribute("spellbook_spell") )
 		{
 			auto& spellID = items[spellbookType].attributes["spellbook_spell"];
-			if ( spellID >= SPELL_NONE && spellID < NUM_SPELLS )
+			// S.A.M: vanilla condition UNCHANGED; OR-in custom spell ids (>= SAM_SPELL_ID_BASE)
+			// built into allGameSpells, so a custom focus/book can channel a CUSTOM spell. Strict
+			// superset -- NOT a bare allGameSpells test, which would drop the ~30 vanilla spell
+			// ids that exist but are never constructed.
+			if ( ( spellID >= SPELL_NONE && spellID < NUM_SPELLS )
+				|| ( spellID >= SAM_SPELL_ID_BASE && allGameSpells.find(spellID) != allGameSpells.end() ) )
 			{
 				return spellID;
 			}
@@ -1904,7 +1962,10 @@ spell_t* getSpellFromItem(const int player, Item* item, bool usePlayerInventory)
 	}
 
 	Uint32 appearance = item->appearance;
-	if ( item->type == SPELL_ITEM && item->appearance >= 1000 )
+	// Shapeshift spells encode appearance = 1000 + spellID (spellID < NUM_SPELLS). Only
+	// remap that specific range — S.A.M custom spells use ids >= 2000 (appearance >= 2000)
+	// and must resolve to their own ID, not be knocked down by 1000.
+	if ( item->type == SPELL_ITEM && item->appearance >= 1000 && item->appearance < 1000 + NUM_SPELLS )
 	{
 		appearance -= 1000; // hack for normally uncontrollable spells.
 	}
@@ -1948,6 +2009,13 @@ int canUseShapeshiftSpellInCurrentForm(const int player, Item& item)
 	if ( item.appearance < 1000 )
 	{
 		return -1;
+	}
+	// S.A.M custom spells (id >= 2000, so appearance >= 1000 + NUM_SPELLS) are NOT
+	// shapeshift spells — they're always usable regardless of form. Callers gate on
+	// appearance >= 1000 before calling, so return 1 ("allowed") to let the cast proceed.
+	if ( item.appearance >= 1000 + NUM_SPELLS )
+	{
+		return 1;
 	}
 	if ( !stats[player] )
 	{

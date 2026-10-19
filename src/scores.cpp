@@ -22,6 +22,9 @@
 #include "net.hpp"
 #include "player.hpp"
 #include "sam_classes.hpp"   // SAM_CLASS_ID_BASE — custom class ids in save DLC validation
+#include "sam_world_state.hpp" // S.A.M: per-character mod state riding in additional_data
+#include "sam_items.hpp"       // S.A.M: custom items re-matched by name when a save is read
+#include "sam_logger.hpp"
 #include "sys/stat.h"
 #include "paths.hpp"
 #include "collision.hpp"
@@ -2568,6 +2571,165 @@ bool saveGameExists(bool singleplayer, int saveIndex)
 	}
 }
 
+// S.A.M: custom items are saved by NUMERIC id, and numeric ids are handed out per mod SET
+// (sorted by namespace, then declaration order). Add a mod that sorts earlier and every id
+// after it moves, so a save from last week would come back holding a DIFFERENT mod's items.
+// Every save now records what each id meant ("sam_itemids" in additional_data, written by
+// SAMWorldState::collect). Here, right after the file is parsed and its hash checked, every
+// custom item is re-pointed at the id its NAME has now. One whose mod is not loaded is
+// dropped from the in-memory save with a log line, rather than silently becoming whatever
+// now sits in that slot; it is only gone for good if the player saves again without the
+// mod. Old saves without the table are left exactly as they were. Vanilla items
+// (type < SAM_ITEM_ID_BASE) are never touched, so this is a no-op for a vanilla save.
+// It lives in getSaveGameInfo because loadGame and loadGameFollowers both take the info
+// by const reference; this is the one place the struct is still ours to change.
+namespace
+{
+	using SamItemVec = std::vector<SaveGameInfo::Player::stat_t::item_t>;
+	struct SamRemapTally
+	{
+		int remapped = 0;
+		std::map<std::string, int> dropped; // name -> count
+	};
+
+	// Remap one item list in place. `removed` (optional) receives the indices dropped, in
+	// ascending order, so index-based side tables can be shifted to match.
+	void samRemapItemList(SamItemVec& v, const std::map<int, int>& oldToNew,
+		const std::map<int, std::string>& unresolved, SamRemapTally& tally, std::vector<size_t>* removed)
+	{
+		SamItemVec kept;
+		kept.reserve(v.size());
+		for ( size_t i = 0; i < v.size(); ++i )
+		{
+			SaveGameInfo::Player::stat_t::item_t it = v[i];
+			if ( it.type >= static_cast<Uint32>(SAM_ITEM_ID_BASE) )
+			{
+				const auto m = oldToNew.find(static_cast<int>(it.type));
+				if ( m != oldToNew.end() )
+				{
+					if ( static_cast<Uint32>(m->second) != it.type )
+					{
+						it.type = static_cast<Uint32>(m->second);
+						++tally.remapped;
+					}
+				}
+				else
+				{
+					const auto u = unresolved.find(static_cast<int>(it.type));
+					if ( u != unresolved.end() )
+					{
+						tally.dropped[u->second] += std::max(1, it.count);
+						if ( removed ) { removed->push_back(i); }
+						continue;
+					}
+					// Not in the table at all: unknown provenance. Leave it as it was.
+				}
+			}
+			kept.push_back(it);
+		}
+		v.swap(kept);
+	}
+
+	// An index into a list that just lost `removed` entries. UINT32_MAX = it was one of them.
+	Uint32 samShiftIndex(Uint32 idx, const std::vector<size_t>& removed)
+	{
+		Uint32 before = 0;
+		for ( size_t r : removed )
+		{
+			if ( r == idx ) { return UINT32_MAX; }
+			if ( r < idx ) { ++before; }
+		}
+		return idx - before;
+	}
+
+	// One stat block (a player or a follower). `invRemoved` reports the inventory drops so
+	// the caller can fix the Player-level appraisal list, which indexes the inventory too.
+	void samRemapStat(SaveGameInfo::Player::stat_t& st, const std::map<int, int>& oldToNew,
+		const std::map<int, std::string>& unresolved, SamRemapTally& tally, std::vector<size_t>& invRemoved)
+	{
+		invRemoved.clear();
+		samRemapItemList(st.inventory, oldToNew, unresolved, tally, &invRemoved);
+		if ( !invRemoved.empty() )
+		{
+			// player_equipment is slot name -> inventory INDEX (UINT32_MAX = nothing equipped).
+			for ( auto& eq : st.player_equipment )
+			{
+				if ( eq.second != UINT32_MAX ) { eq.second = samShiftIndex(eq.second, invRemoved); }
+			}
+		}
+		samRemapItemList(st.void_chest_inventory, oldToNew, unresolved, tally, nullptr);
+		for ( auto& bag : st.player_lootbags )
+		{
+			samRemapItemList(bag.second.items, oldToNew, unresolved, tally, nullptr);
+		}
+		// npc_equipment is slot name -> the item itself, nothing indexes it. Rebuilt rather
+		// than edited in place: item_t defaults its move constructor, which deletes its copy
+		// assignment, so neither `= ` nor vector::erase compiles on it. swap() needs neither.
+		std::vector<std::pair<std::string, SaveGameInfo::Player::stat_t::item_t>> keptEquip;
+		keptEquip.reserve(st.npc_equipment.size());
+		for ( const auto& slot : st.npc_equipment )
+		{
+			SamItemVec one(1, slot.second);
+			samRemapItemList(one, oldToNew, unresolved, tally, nullptr);
+			if ( one.empty() ) { continue; }
+			keptEquip.push_back(std::make_pair(slot.first, one[0]));
+		}
+		st.npc_equipment.swap(keptEquip);
+	}
+
+	void samRemapSavedItems(SaveGameInfo& info)
+	{
+		std::string table;
+		for ( const auto& kv : info.additional_data )
+		{
+			if ( kv.first == "sam_itemids" ) { table = kv.second; break; }
+		}
+		std::map<int, int> oldToNew;
+		std::map<int, std::string> unresolved;
+		if ( !SAMItems::remapSavedItemIds(table, oldToNew, unresolved) ) { return; }
+
+		SamRemapTally tally;
+		for ( auto& p : info.players )
+		{
+			std::vector<size_t> removed;
+			samRemapStat(p.stats, oldToNew, unresolved, tally, removed);
+			if ( !removed.empty() )
+			{
+				// appraisal_item_progress is (inventory index, progress).
+				std::vector<std::pair<int, int>> progress;
+				for ( const auto& ap : p.appraisal_item_progress )
+				{
+					const Uint32 n = samShiftIndex(static_cast<Uint32>(ap.first), removed);
+					if ( n != UINT32_MAX ) { progress.push_back(std::make_pair(static_cast<int>(n), ap.second)); }
+				}
+				p.appraisal_item_progress.swap(progress);
+			}
+			for ( auto& follower : p.followers )
+			{
+				samRemapStat(follower, oldToNew, unresolved, tally, removed);
+			}
+		}
+
+		// getSaveGameInfo also feeds the save-slot list, so the same file is read many
+		// times per menu visit; say each thing once per (file, mod set).
+		static std::string lastLogged;
+		const std::string logKey = table + "|" + info.gamename + "|" + std::to_string(info.dungeon_lvl);
+		if ( tally.remapped == 0 && tally.dropped.empty() ) { return; }
+		if ( logKey == lastLogged ) { return; }
+		lastLogged = logKey;
+		if ( tally.remapped > 0 )
+		{
+			SAM_INFO("WORLD", std::to_string(tally.remapped) + " custom item(s) in '" + info.gamename
+				+ "' re-pointed to their current ids (the mod set changed since it was saved).");
+		}
+		for ( const auto& kv : tally.dropped )
+		{
+			SAM_WARN("WORLD", "Dropped " + std::to_string(kv.second) + "x [" + kv.first + "] from '"
+				+ info.gamename + "': its mod is not loaded. Re-enable that mod BEFORE saving again to keep it.");
+		}
+	}
+}
+
 /*-------------------------------------------------------------------------------
 
 	getSaveGameInfo
@@ -2623,6 +2785,10 @@ SaveGameInfo getSaveGameInfo(bool singleplayer, int saveIndex)
 	if (hash != info.hash) {
 		info.hash = 0;
 	}
+
+	// S.A.M: AFTER the hash check (the hash covers item types as written), re-point every
+	// custom item at the id its name has now. No-op for vanilla saves and old saves.
+	samRemapSavedItems(info);
 
 	return info;
 }
@@ -6041,6 +6207,12 @@ int SaveGameInfo::populateFromSession(const int playernum)
 		info->additional_data.push_back(std::make_pair("game_scenario", gameModeManager.currentSession.challengeRun.scenarioStr));
 	}
 
+	// S.A.M Framework: append any per-character mod state as "sam:<namespace>:<key>" pairs.
+	// additional_data is already written with the save and already covered by its integrity
+	// hash, and every reader of it skips keys it does not know, so this costs vanilla
+	// nothing and stays consistent with the save it belongs to. No-op with no mods loaded.
+	SAMWorldState::collect(info->additional_data);
+
 
 	if ( info->game_version >= 410 )
 	{
@@ -6366,7 +6538,12 @@ int loadGame(int player, const SaveGameInfo& info) {
 	//	return 1;
 	//}
 
-	if ( (info.players_connected.size() <= player) || !info.players_connected[player]) {
+	// S.A.M: also bound info.players, not just info.players_connected. 35 sites below read
+	// info.players[player], and the two vectors are only checked against each other much
+	// later (loadGameFollowers). A truncated or hand-edited save satisfied the connected
+	// check and then read past the end of players.
+	if ( (info.players_connected.size() <= player) || (info.players.size() <= player)
+		|| !info.players_connected[player]) {
 		if ( !info.hiscore_dummy_loading )
 		{
 			printlog("loadGame() failed: given player is not connected");
@@ -6420,8 +6597,12 @@ int loadGame(int player, const SaveGameInfo& info) {
 			printlog("[SESSION]: Using savegame server flags");
 			gameModeManager.currentSession.seededRun.seed = info.customseed;
 			gameModeManager.currentSession.seededRun.seedString = info.customseed_string;
+			// S.A.M Framework: this save is authoritative for its own character, so drop
+			// whatever the previous run left in memory before taking this one's keys.
+			SAMWorldState::beginLoad();
 			for ( auto& pair : info.additional_data )
 			{
+				SAMWorldState::absorb(pair.first, pair.second); // ignores non-"sam:" keys
 				if ( pair.first == "game_scenario" )
 				{
 					gameModeManager.currentSession.challengeRun.setup(pair.second);
@@ -6442,6 +6623,11 @@ int loadGame(int player, const SaveGameInfo& info) {
 					}
 				}
 			}
+			// S.A.M: the save has finished handing us its keys. Content ids are deterministic
+			// for a given mod SET, so a set that differs from the one this save was written
+			// with is the one thing that can silently change what a saved custom item IS.
+			// Say so plainly rather than let the player discover it as a mystery.
+			SAMWorldState::warnIfModSetChanged();
 		}
 	}
 
@@ -6955,6 +7141,10 @@ list_t* loadGameFollowers(const SaveGameInfo& info) {
 				stringCopy(value, attr.second.c_str(), sizeof(value), attr.second.size());
 				stats->attributes.emplace(std::make_pair(key, value));
 			}
+			// S.A.M: the attributes map just came back from disk, so re-derive the trait
+			// cache from it. Without this a recruited follower loses its mod-declared
+			// traits on save/reload while still carrying the attribute that defines them.
+			samRefreshTraits(stats);
 
 			// read follower inventory
 			for (auto& item : follower.inventory) {

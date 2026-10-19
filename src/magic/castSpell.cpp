@@ -26,6 +26,10 @@
 #include "../prng.hpp"
 #include "../mod_tools.hpp"
 #include "../paths.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
+#include "sam_js_runtime.hpp"
+#include "sam_mp_input.hpp"   // a joiner's "not enough mana" reported to the host
 
 void castSpellInit(Uint32 caster_uid, spell_t* spell, bool usingSpellbook, bool usingTome)
 {
@@ -250,6 +254,16 @@ void castSpellInit(Uint32 caster_uid, spell_t* spell, bool usingSpellbook, bool 
 				}
 			}
 		}
+
+		// S.A.M scripting hook: a player's cast failed for lack of mana. castSpellInit is the
+		// caster's OWN cast-start code (only local input calls it), so for a joiner this ran on
+		// their machine, where the event was gated off, and nothing reached the host. SAMMpInput
+		// fires it on the host for every player; the host's "fizzle" below already did.
+		if ( player >= 0 )
+		{
+			SAMMpInput::reportSpellFailed(player, spell->ID, spell->spell_internal_name, "not_enough_mana");
+		}
+
 		return;
 	}
 	if (magiccost < 0)
@@ -617,6 +631,33 @@ Entity* castSpell(Uint32 caster_uid, spell_t* spell, bool using_magicstaff, bool
 		}
 	}
 
+	// S.A.M scripting hook: a player initiated a spell cast (host side; mana not yet
+	// deducted). Only primitives cross into scripts. target_uid is 0 (untargeted casts).
+	if ( player >= 0 && multiplayer != CLIENT )
+	{
+		SAMLua::Event ev;
+		ev.setName("player.on_spell_cast").i("player", player)
+			.i("spell_id", spell->ID).i("target_uid", 0)
+			.s("spell_name", spell->spell_internal_name);
+		SAMLua::dispatchEvent(ev);
+
+		const bool samCancelledLua = SAMLua::lastDispatchCancelled();
+
+		SAMJs::Event jsev;
+		jsev.setName("player.on_spell_cast").i("player", player)
+			.i("spell_id", spell->ID).i("target_uid", 0)
+			.s("spell_name", spell->spell_internal_name);
+		SAMJs::dispatchEvent(jsev);
+
+		// CANCELLABLE: a handler returning false stops the cast before any mana is spent.
+		// Safe to return null here -- castSpell already does so on 14 vanilla failure paths
+		// (out of mana, silenced, no such spell), so every caller handles it.
+		if ( samCancelledLua || SAMJs::lastDispatchCancelled() )
+		{
+			return nullptr;
+		}
+	}
+
 	bool newbie = false;
 	bool overdrewIntoHP = false;
 	bool playerCastingFromKnownSpellbook = false;
@@ -925,6 +966,21 @@ Entity* castSpell(Uint32 caster_uid, spell_t* spell, bool using_magicstaff, bool
 						}
 					}
 				}
+
+				// S.A.M scripting hook: a player's spell fumbled/fizzled (host side).
+				if ( player >= 0 && multiplayer != CLIENT )
+				{
+					{
+						SamEvent samEv;
+						samEv.setName("player.on_spell_failed");
+						samEv.i("player", (long long)player);
+						samEv.i("spell_id", (long long)spell->ID);
+						samEv.s("spell_name", std::string(spell->spell_internal_name));
+						samEv.s("reason", std::string("fizzle"));
+						samEv.fire();
+					}
+				}
+
 				return NULL;
 			}
 		}

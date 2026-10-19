@@ -23,6 +23,7 @@
 #include "items.hpp"
 #include "scores.hpp"
 #include "mod_tools.hpp"
+#include "sam_classes.hpp" // S.A.M Framework custom classes (@class= script tag)
 #include "paths.hpp"
 
 /*-------------------------------------------------------------------------------
@@ -3113,7 +3114,13 @@ void TextSourceScript::handleTextSourceScript(Entity& src, std::string input)
 		else if ( (*it).find("@class=") != std::string::npos )
 		{
 			int result = textSourceProcessScriptTag(input, "@class=", src);
-			if ( result != k_ScriptError && result >= CLASS_BARBARIAN && result < NUMCLASSES )
+			// S.A.M: also accept a registered custom class id (>= SAM_CLASS_ID_BASE), which
+			// `result < NUMCLASSES` used to reject. The apply body below already works for
+			// them — initClass() routes custom ids to applyLoadout — and the DLC remaps are
+			// all bounded at CLASS_PALADIN, so a custom id passes through them untouched.
+			if ( result != k_ScriptError && result >= CLASS_BARBARIAN
+				&& (result < NUMCLASSES
+					|| (result >= SAM_CLASS_ID_BASE && SAMClasses::getClass(result) != nullptr)) )
 			{
 				if ( !enabledDLCPack1 && result >= CLASS_CONJURER && result <= CLASS_BREWER )
 				{

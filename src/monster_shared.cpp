@@ -18,6 +18,9 @@
 #include "monster.hpp"
 #include "shops.hpp"
 #include "net.hpp"
+#ifndef EDITOR
+#include "sam_races.hpp"   // hostMonsterForHeadSprite: a custom head still belongs to a body
+#endif
 
 #include <cassert>
 
@@ -301,6 +304,14 @@ Monster Entity::getMonsterTypeFromSprite() const
 
 Monster Entity::getMonsterTypeFromSprite(const int sprite)
 {
+#ifndef EDITOR
+	// S.A.M: a player wearing a custom race (or class) head has a sprite that is in no
+	// monsterSprites[] row, and this used to answer NOTHING for it -- so the weapon limb
+	// took its focal point from limbs[0] (all zeros), the camera used the wrong height, and
+	// every other caller that derives a body from its head guessed wrong. The framework
+	// knows which body the head was authored for; ask it first. Empty map in vanilla.
+	if ( const int samHost = SAMRaces::hostMonsterForHeadSprite(sprite) ) { return static_cast<Monster>(samHost); }
+#endif
 	Sint32 mySprite = sprite;
 	static std::unordered_map<Sint32, Monster> spriteToMonster;
 	if ( spriteToMonster.empty() ) {

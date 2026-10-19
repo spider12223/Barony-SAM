@@ -24,6 +24,7 @@
 #include "mod_tools.hpp"
 #include "sam_lua_runtime.hpp"
 #include "sam_js_runtime.hpp" // S.A.M scripting hooks
+#include "sam_loot.hpp"       // S.A.M: world.on_fixture_loot for the ring a sink gives
 
 /*-------------------------------------------------------------------------------
 
@@ -182,8 +183,12 @@ void actSink(Entity* my)
 							//Random beatitude (third parameter).
 							int beatitude = rng.rand() % 5 - 2; //No item will be able to generate with less than -2 or more than +2 beatitude
 
+							// S.A.M: world.on_fixture_loot("sink"): rewrite the ring or cancel it (no item and
+							// no pickup message; the sink still counts as used).
+							int samType = ring, samStatus = (int)status, samBeatitude = beatitude, samCount = 1;
+							const bool samMakeRing = SAMLoot::fixtureLoot("sink", i, (int)(my->x / 16), (int)(my->y / 16), samType, samStatus, samBeatitude, samCount);
 							//Actually create the item, put it in the player's inventory, and then free the memory of the temp item.
-							Item* item = newItem(static_cast<ItemType>(ring), static_cast<Status>(status), beatitude, 1, rng.rand(), false, NULL);
+							Item* item = samMakeRing ? newItem(static_cast<ItemType>(samType), static_cast<Status>(samStatus), (Sint16)samBeatitude, (Sint16)samCount, rng.rand(), false, NULL) : nullptr;
 							if (item)
 							{
 								itemPickup(i, item);

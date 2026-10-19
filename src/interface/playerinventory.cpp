@@ -14,6 +14,7 @@
 #include "../game.hpp"
 #include "../stat.hpp"
 #include "../items.hpp"
+#include "sam_items.hpp" // S.A.M custom item registry — getIconPath for custom inventory icons
 #include "../shops.hpp"
 #include "../engine/audio/sound.hpp"
 #include "../net.hpp"
@@ -2282,8 +2283,31 @@ void select_inventory_slot(int player, int currentx, int currenty, int diffx, in
 	inventoryUI.selectSlot(x, y);
 }
 
+// S.A.M: an item slot with no registered image variations has variations == 0, which
+// makes the usual `appearance % variations` a divide-by-zero. That happens for real when
+// a save still references a custom item whose mod has since been removed -- the slot is
+// zeroed static storage. Index 0 is the right answer there: list_Node returns null for an
+// empty list and the caller already handles a null node.
+static int samVariationIndex(const Item& item)
+{
+	const int v = items[item.type].variations;
+	return ( v > 0 ) ? (int)(item.appearance % v) : 0;
+}
+
 std::string getItemSpritePath(const int player, Item& item)
 {
+	// S.A.M custom items (type >= SAM_ITEM_ID_BASE) serve their inventory icon
+	// straight from the mod's registered PNG, independent of the vanilla images[]/
+	// appearance indexing (which a reserved custom slot doesn't populate reliably).
+	// Falls through to the normal lookup if there is no custom icon.
+	if ( (int)item.type >= SAM_ITEM_ID_BASE )
+	{
+		const std::string samIcon = SAMItems::getIconPath((int)item.type);
+		if ( !samIcon.empty() )
+		{
+			return samIcon;
+		}
+	}
 	if ( item.type == SPELL_ITEM )
 	{
 		return ItemTooltips.getSpellIconPath(player, item, -1);
@@ -2342,12 +2366,12 @@ std::string getItemSpritePath(const int player, Item& item)
 			}
 			else
 			{
-				imagePathsNode = list_Node(&items[item.type].images, item.appearance % items[item.type].variations);
+				imagePathsNode = list_Node(&items[item.type].images, samVariationIndex(item));
 			}
 		}
 		else
 		{
-			imagePathsNode = list_Node(&items[item.type].images, item.appearance % items[item.type].variations);
+			imagePathsNode = list_Node(&items[item.type].images, samVariationIndex(item));
 		}
 		if ( imagePathsNode )
 		{
@@ -4772,7 +4796,10 @@ void Player::HUD_t::updateFrameTooltip(Item* item, const int x, const int y, int
     {
         tooltipDisplayedSettings.updateItem(player, item);
         
-        std::string tooltipType = ItemTooltips.tmpItems[item->type].tooltip;
+        // S.A.M: custom items (type >= NUMITEMS) are NOT in the tmpItems vector; read
+        // their tooltip from items[] (sized for the custom range) to avoid an OOB read.
+        std::string tooltipType = ( (int)item->type >= 0 && (size_t)item->type < ItemTooltips.tmpItems.size() )
+            ? ItemTooltips.tmpItems[item->type].tooltip : items[item->type].tooltip;
         
         if ( ItemTooltips.tooltips.find(tooltipType) == ItemTooltips.tooltips.end() )
         {
@@ -5040,19 +5067,22 @@ void Player::HUD_t::updateFrameTooltip(Item* item, const int x, const int y, int
                 headerMaxWidthKey = ItemTooltips.spellItems[spell->ID].internalName;
             }
         }
-        else
+        else if ( (int)item->type >= 0 && (size_t)item->type < ItemTooltips.tmpItems.size() )
         {
-            if ( itemTooltip.minWidths.find(ItemTooltips.tmpItems[item->type].internalName) != itemTooltip.minWidths.end() )
+            // S.A.M: guarded — custom items (type >= NUMITEMS) aren't in tmpItems, so we
+            // skip these width-key lookups (they keep their defaults) instead of an OOB read.
+            const std::string& internalName = ItemTooltips.tmpItems[item->type].internalName;
+            if ( itemTooltip.minWidths.find(internalName) != itemTooltip.minWidths.end() )
             {
-                minWidthKey = ItemTooltips.tmpItems[item->type].internalName;
+                minWidthKey = internalName;
             }
-            if ( itemTooltip.maxWidths.find(ItemTooltips.tmpItems[item->type].internalName) != itemTooltip.maxWidths.end() )
+            if ( itemTooltip.maxWidths.find(internalName) != itemTooltip.maxWidths.end() )
             {
-                maxWidthKey = ItemTooltips.tmpItems[item->type].internalName;
+                maxWidthKey = internalName;
             }
-            if ( itemTooltip.headerMaxWidths.find(ItemTooltips.tmpItems[item->type].internalName) != itemTooltip.headerMaxWidths.end() )
+            if ( itemTooltip.headerMaxWidths.find(internalName) != itemTooltip.headerMaxWidths.end() )
             {
-                headerMaxWidthKey = ItemTooltips.tmpItems[item->type].internalName;
+                headerMaxWidthKey = internalName;
             }
         }
         
@@ -5283,7 +5313,8 @@ void Player::HUD_t::updateFrameTooltip(Item* item, const int x, const int y, int
                     {
                         if ( icon.conditionalAttribute.find("magicstaff_") != std::string::npos )
                         {
-                            if ( ItemTooltips.tmpItems[item->type].internalName != icon.conditionalAttribute )
+                            if ( (size_t)item->type >= ItemTooltips.tmpItems.size()
+                                || ItemTooltips.tmpItems[item->type].internalName != icon.conditionalAttribute )
                             {
                                 continue;
                             }
@@ -5294,7 +5325,8 @@ void Player::HUD_t::updateFrameTooltip(Item* item, const int x, const int y, int
                     {
                         if ( icon.conditionalAttribute.find("scroll_") != std::string::npos )
                         {
-                            if ( ItemTooltips.tmpItems[item->type].internalName != icon.conditionalAttribute )
+                            if ( (size_t)item->type >= ItemTooltips.tmpItems.size()
+                                || ItemTooltips.tmpItems[item->type].internalName != icon.conditionalAttribute )
                             {
                                 continue;
                             }
@@ -10637,7 +10669,8 @@ void Player::Inventory_t::updateInventory()
 							else
 							{
 								// force equip potion/spellbook
-								playerTryEquipItemAndUpdateServer(player, item, true);
+								// S.A.M: a player's choice, so player.on_before_equip may refuse it.
+								playerTryEquipItemAndUpdateServer(player, item, true, /*samPlayerEquip=*/true);
 							}
 						}
 					}
@@ -11468,6 +11501,38 @@ std::vector<ItemContextMenuPrompts> getContextMenuOptionsForItem(const int playe
 		{
 			playerOwnedItem = true;
 		}
+	}
+
+	// S.A.M: this whole function is an if-chain on exact item type, so a custom item only
+	// ever reaches a generic branch and can never offer a "use" action -- which meant a mod
+	// could define an item that did nothing when clicked. An item declaring the "usable"
+	// trait gets the option here; activating it routes to useItem, which fires the
+	// cancellable player.on_item_use hook where the mod decides what actually happens.
+	// Vanilla items carry no traits, so this arm is unreachable without a mod.
+	// Only in plain inventory context. A shop, tinker bench, alchemy, feather, item-effect
+	// or mailbox screen each has its OWN option set (e.g. Sell) added by the post-processing
+	// further down, and returning early here would skip it -- a usable item would show Use
+	// where vanilla strips it, and could never be sold. In those contexts, fall through and
+	// let the item be handled like any other.
+	const bool samSpecialGui =
+		players[player]->gui_mode == GUI_MODE_SHOP
+		|| GenericGUI[player].tinkerGUI.bOpen || GenericGUI[player].alchemyGUI.bOpen
+		|| GenericGUI[player].mailboxGUI.bOpen || GenericGUI[player].featherGUI.bOpen
+		|| GenericGUI[player].itemfxGUI.bOpen;
+	if ( samItemHasTrait(item->type, SAMItemTrait::USABLE) && playerOwnedItem
+		&& !openedChest[player] && !samSpecialGui )
+	{
+		// PROMPT_EAT, not PROMPT_CONSUME: only EAT routes to useItem. CONSUME goes to
+		// item_FoodAutomaton, which does nothing for a non-food item. The label is
+		// dynamic and a custom TOOL falls through itemUseString to "Use".
+		options.push_back(PROMPT_EAT);
+		if ( items[item->type].item_slot != ItemEquippableSlot::NO_EQUIP )
+		{
+			options.push_back(itemIsEquipped(item, player) ? PROMPT_UNEQUIP : PROMPT_EQUIP);
+		}
+		options.push_back(PROMPT_APPRAISE);
+		options.push_back(PROMPT_DROP);
+		return options;
 	}
 
 	if ( openedChest[player] && itemCategory(item) != SPELL_CAT )

@@ -22,6 +22,7 @@
 #include "../../ui/MainMenu.hpp"
 #include "../../mod_tools.hpp"
 #include "../../ui/Button.hpp"
+#include "sam_sounds.hpp"   // S.A.M: mod replacements for vanilla sounds, and sound volumes
 
 /*-------------------------------------------------------------------------------
 
@@ -133,6 +134,14 @@ FMOD::Channel* playSoundPos(real_t x, real_t y, Uint16 snd, Uint8 vol)
 {
 	auto result = playSoundPosLocal(x, y, snd, vol);
 
+	// S.A.M: a mod's own sound crosses to the other machines by NAME, not by its slot number: a
+	// slot is only the same sound on a machine that loaded exactly the same mods (sam_sounds.hpp).
+	// False for every vanilla sound, which goes out below exactly as it always has.
+	if ( multiplayer == SERVER && vol > 0 && SAMSounds::broadcastPos(x, y, snd, -1, vol) )
+	{
+		return result;
+	}
+
 	if (multiplayer == SERVER && vol > 0)
 	{
 		for (int c = 1; c < MAXPLAYERS; c++)
@@ -177,7 +186,13 @@ FMOD::Channel* playSoundPosLocal(real_t x, real_t y, Uint16 snd, Uint8 vol)
 	{
 		return nullptr;
 	}
-	if (sounds[snd] == nullptr || vol == 0)
+	// S.A.M: a mod's replacement for this vanilla sound, and its volume. Swapped HERE, at the
+	// moment of playing, so the network keeps carrying the vanilla index and a player without the
+	// mod still hears the original. The channel group below stays the ORIGINAL sound's, so a
+	// replaced water or ambient loop keeps its volume slider. One bool test with no mod loaded.
+	Uint16 samPlay = snd;
+	if ( SAMSounds::anyRouting() ) { samPlay = SAMSounds::route(snd, &vol); }
+	if (sounds[samPlay] == nullptr || vol == 0)
 	{
 		return nullptr;
 	}
@@ -254,7 +269,7 @@ FMOD::Channel* playSoundPosLocal(real_t x, real_t y, Uint16 snd, Uint8 vol)
 	bool diskbusy = false;
 	sounds[snd]->getOpenState(&openState, &percentBuffered, &starving, &diskbusy);
 	printlog("Sound: %d state: %d pc: %d starving: %d diskbusy: %d", snd, openState, percentBuffered, starving, diskbusy);*/
-	fmod_result = fmod_system->playSound(sounds[snd], getChannelGroupForSoundIndex(snd), true, &channel);
+	fmod_result = fmod_system->playSound(sounds[samPlay], getChannelGroupForSoundIndex(snd), true, &channel);
 	if (FMODErrorCheck())
 	{
 		return nullptr;
@@ -288,6 +303,24 @@ FMOD::Channel* playSoundEntity(Entity* entity, Uint16 snd, Uint8 vol)
 	{
 		return nullptr;
 	}
+	// S.A.M: this monster's, or this entity's equipped item's, own sound for this vanilla one.
+	// It plays HERE, and the other machines are told the VANILLA sound it stands in for plus the
+	// mod sound's name, the promise route() keeps for replacements: a stock client hears the
+	// game's own sound, a S.A.M client the mod's. Handing the swapped slot to playSoundPos put a
+	// number on the wire that a stock client drops and a different mod list reads as another sound.
+	if ( SAMSounds::anyEntityRouting() )
+	{
+		const Uint16 samRouted = SAMSounds::routeForEntity(entity, snd);
+		if ( samRouted != snd )
+		{
+			auto result = playSoundPosLocal(entity->x, entity->y, samRouted, vol);
+			if ( multiplayer == SERVER && vol > 0 )
+			{
+				SAMSounds::broadcastPos(entity->x, entity->y, samRouted, snd, vol);
+			}
+			return result;
+		}
+	}
 	return playSoundPos(entity->x, entity->y, snd, vol);
 }
 
@@ -297,6 +330,7 @@ FMOD::Channel* playSoundEntityLocal(Entity* entity, Uint16 snd, Uint8 vol)
 	{
 		return nullptr;
 	}
+	if ( SAMSounds::anyEntityRouting() ) { snd = SAMSounds::routeForEntity(entity, snd); }
 	return playSoundPosLocal(entity->x, entity->y, snd, vol);
 }
 
@@ -322,12 +356,14 @@ FMOD::Channel* playSound(Uint16 snd, Uint8 vol)
 	{
 		return nullptr;
 	}
-	if (sounds[snd] == nullptr || vol == 0)
+	Uint16 samPlay = snd;   // S.A.M: see playSoundPosLocal
+	if ( SAMSounds::anyRouting() ) { samPlay = SAMSounds::route(snd, &vol); }
+	if (sounds[samPlay] == nullptr || vol == 0)
 	{
 		return nullptr;
 	}
 	FMOD::Channel* channel = nullptr;
-	fmod_result = fmod_system->playSound(sounds[snd], getChannelGroupForSoundIndex(snd), true, &channel);
+	fmod_result = fmod_system->playSound(sounds[samPlay], getChannelGroupForSoundIndex(snd), true, &channel);
     if (fmod_result == FMOD_OK && channel) {
         //Faux 3D. Set to 0 and then set the channel's mode to be relative  to the player's head to achieve global sound.
         FMOD_VECTOR position;
@@ -361,12 +397,14 @@ FMOD::Channel* playSoundNotification(Uint16 snd, Uint8 vol)
 	{
 		return nullptr;
 	}
-	if ( sounds[snd] == nullptr || vol == 0 )
+	Uint16 samPlay = snd;   // S.A.M: see playSoundPosLocal
+	if ( SAMSounds::anyRouting() ) { samPlay = SAMSounds::route(snd, &vol); }
+	if ( sounds[samPlay] == nullptr || vol == 0 )
 	{
 		return nullptr;
 	}
 	FMOD::Channel* channel;
-	fmod_result = fmod_system->playSound(sounds[snd], music_notification_group, true, &channel);
+	fmod_result = fmod_system->playSound(sounds[samPlay], music_notification_group, true, &channel);
 	//Faux 3D. Set to 0 and then set the channel's mode to be relative  to the player's head to achieve global sound.
 	FMOD_VECTOR position;
 	position.x = 0.f;

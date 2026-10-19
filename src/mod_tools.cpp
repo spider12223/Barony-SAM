@@ -30,7 +30,11 @@ See LICENSE for details.
 #ifndef EDITOR
 #include "sam_spells.hpp" // S.A.M custom-spell icon lookup (getSpellIconPath hook)
 #include "sam_items.hpp"  // S.A.M custom .vox model registration (registerModModels)
+#include "sam_models.hpp" // SAMModels::count (do not read a stale model cache once grown)
 #include "sam_classes.hpp" // S.A.M per-class appearance (resolveAppearance)
+#include "sam_races.hpp"   // S.A.M per-race limb models (resolveLimbModels)
+#include "sam_sounds.hpp" // S.A.M custom sound registration (appendSounds)
+#include "sam_music.hpp"
 #endif
 #include <thread>
 #include <future>
@@ -3142,13 +3146,23 @@ std::string ItemTooltips_t::getSpellIconPath(const int player, Item& item, int s
 			spellImageNode = list_Node(&items[SPELL_ITEM].images, 0);
 		}
 	}
-	else if ( itemCategory(&item) == SPELLBOOK )
+	else if ( itemCategory(&item) == SPELLBOOK || itemCategory(&item) == TOME_SPELL )
 	{
-		spellImageNode = list_Node(&items[SPELL_ITEM].images, getSpellIDFromSpellbook(item.type));
-	}
-	else if ( itemCategory(&item) == TOME_SPELL )
-	{
-		spellImageNode = list_Node(&items[SPELL_ITEM].images, item.getTomeSpellID());
+		const int samBookSpell = ( itemCategory(&item) == SPELLBOOK )
+			? getSpellIDFromSpellbook(item.type) : item.getTomeSpellID();
+		// S.A.M: a custom book teaching a CUSTOM spell (id >= 2000) has no entry in the vanilla
+		// SPELL_ITEM image list, so list_Node would miss and render null.png. Use the mod's icon
+		// (else a generic orb), mirroring the SPELL_ITEM branch. Vanilla spells are unaffected.
+		if ( samBookSpell >= SAM_SPELL_ID_BASE )
+		{
+			std::string samIcon = SAMSpells::getIconPath(samBookSpell);
+			if ( !samIcon.empty() ) { return samIcon; }
+			spellImageNode = list_Node(&items[SPELL_ITEM].images, SPELL_FORCEBOLT);
+		}
+		else
+		{
+			spellImageNode = list_Node(&items[SPELL_ITEM].images, samBookSpell);
+		}
 	}
 	else if ( item.type == TOOL_SPELLBOT )
 	{
@@ -11746,7 +11760,17 @@ void Mods::unloadMods(bool force)
 			}
 			free(polymodels);
 			polymodels = nullptr;
+			// S.A.M: once a mod has appended models, nummodels is larger than the count
+			// models.cache was written for. The cache read then either fails at the first
+			// appended index (a full rebuild, which is merely slow) or -- if a previous
+			// session wrote a cache while the table was grown -- SUCCEEDS and fills this
+			// session's custom indices with the other session's geometry. Turning the cache
+			// off across this call prevents both the bad read and writing mod triangles back
+			// into the shared cache. No effect when no mod ships a model.
+			const bool samOldModelCache = useModelCache;
+			if ( SAMModels::count() > 0 ) { useModelCache = false; }
 			generatePolyModels(0, nummodels, false);
+			useModelCache = samOldModelCache;
 			Mods::modelsListRequiresReloadUnmodded = false;
 		}
 		Mods::modelsListModifiedIndexes.clear();
@@ -11910,8 +11934,10 @@ void Mods::loadMods()
 	SAMItems::registerModModels();
 
 	// Classes can name a custom head, so their appearance can only be resolved once the
-	// models above actually exist and have indices.
+	// models above actually exist and have indices. Races name whole limb sets for the
+	// same reason and have to wait for the same thing.
 	SAMClasses::resolveAppearance();
+	SAMRaces::resolveLimbModels();
 
 	updateLoadingScreen(20);
 	doLoadingScreen();
@@ -11921,6 +11947,11 @@ void Mods::loadMods()
 		physfsReloadSounds(false);
 		Mods::soundListRequiresReloadUnmodded = true;
 	}
+
+	// S.A.M: append mod-shipped custom sounds onto the engine table. MUST be after the
+	// vanilla sound-reload above (which rebuilds against the base numsounds) so our
+	// appended indices stay invisible to it. No-op when no mod ships sounds.
+	SAMSounds::appendSounds();
 
 	updateLoadingScreen(30);
 	doLoadingScreen();
@@ -11983,6 +12014,11 @@ void Mods::loadMods()
 		}
 		Mods::musicRequireReloadUnmodded = false;
 	}
+
+	// S.A.M: open mod-shipped music AFTER the vanilla reload above, which releases and recreates
+	// every vanilla track -- a mod's own streams are separate objects it never touches. No-op when
+	// no mod ships music.
+	SAMMusic::appendTracks();
 
 	updateLoadingScreen(70);
 	doLoadingScreen();

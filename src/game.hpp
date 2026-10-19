@@ -410,6 +410,12 @@ int mapLevel(int player, int radius, int _x, int _y, bool usingSpell);
 void mapLevel2(int player);
 void mapFoodOnLevel(int player);
 bool mapTileDiggable(const int x, const int y);
+// S.A.M: defined in maps.cpp with no prototype anywhere, so nothing outside that file could
+// ask where the generator is allowed to place things. Exposed for sam_get_playable_bounds.
+int getMapPossibleLocationX1();
+int getMapPossibleLocationY1();
+int getMapPossibleLocationX2();
+int getMapPossibleLocationY2();
 
 class TileEntityListHandler
 {

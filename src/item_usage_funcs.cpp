@@ -27,6 +27,10 @@
 #include "prng.hpp"
 #include "mod_tools.hpp"
 #include "scrolls.hpp"
+#include "sam_effects.hpp"  // log which custom effect a cure-ailment actually strips
+#include "sam_spells.hpp"  // SAM_SPELL_ID_BASE (custom-spell book difficulty)
+#include "sam_classes.hpp"  // SAM_CLASS_ID_BASE + numStartingSpells (protect class spells from forget)
+#include "sam_logger.hpp"
 
 bool potionUseAbundanceEffect(Item* item, Entity* entity, Entity* usedBy)
 {
@@ -1411,6 +1415,14 @@ bool item_PotionCureAilment(Item*& item, Entity* entity, Entity* usedBy)
 		{
 			if ( stats->getEffectActive(c) )
 			{
+				// S.A.M: proof-in-the-log that a real cure-ailment strips a custom effect,
+				// not just that the predicate answers true. Only fires for custom slots when
+				// a mod is loaded, so it is silent in a vanilla game.
+				if ( c >= SAM_EFFECT_SLOT_BASE && SAMEffects::any() )
+				{
+					SAM_INFO("EFFECTS", "cure-ailment removed custom effect '"
+						+ SAMEffects::nameForSlot(c) + "' (slot " + std::to_string(c) + ").");
+				}
 				stats->clearEffect(c);
 				if ( stats->EFFECTS_TIMERS[c] > 0 )
 				{
@@ -6042,19 +6054,35 @@ void item_Spellbook(Item*& item, int player)
 
 			// delete its accompanying spell item(s)
 
+			// S.A.M #52: how many spells at the FRONT of the list are protected class spells a
+			// cursed book must not forget. Shaman keeps its 15; a custom class protects the spells
+			// it declared in starting_spells. 0 => vanilla behaviour (any spell forgettable).
+			// Same limitation as vanilla Shaman: this protects the first N list entries, which are
+			// the class spells granted at creation -- a spell learned later and sorted ahead is not
+			// specially protected. Good enough, and identical to how Shaman already behaves.
+			int samNumProtected = 0;
 			if ( client_classes[player] == CLASS_SHAMAN )
 			{
-				// don't forget your racial spells otherwise borked.
+				samNumProtected = CLASS_SHAMAN_NUM_STARTING_SPELLS;
+			}
+			else if ( client_classes[player] >= SAM_CLASS_ID_BASE )
+			{
+				samNumProtected = SAMClasses::numStartingSpells(client_classes[player]);
+			}
+
+			if ( samNumProtected > 0 )
+			{
+				// don't forget your racial/class spells otherwise borked.
 				// special roll checking.
-				if ( list_Size(&players[player]->magic.spellList) <= CLASS_SHAMAN_NUM_STARTING_SPELLS )
+				if ( list_Size(&players[player]->magic.spellList) <= samNumProtected )
 				{
 					// no spells to delete. return early.
 					messagePlayer(player, MESSAGE_HINT, Language::get(973));
 					consumeItem(item, player);
 					return;
 				}
-				spellToDelete = local_rng.rand() % (list_Size(&players[player]->magic.spellList) - CLASS_SHAMAN_NUM_STARTING_SPELLS);
-				spellToDelete += CLASS_SHAMAN_NUM_STARTING_SPELLS; // e.g 16 spells is 0 + 15, 15th index.
+				spellToDelete = local_rng.rand() % (list_Size(&players[player]->magic.spellList) - samNumProtected);
+				spellToDelete += samNumProtected;
 				node = list_Node(&players[player]->magic.spellList, spellToDelete);
 				spell = (spell_t*)node->element;
 				spellID = spell->ID;
@@ -6314,12 +6342,19 @@ void item_Spellbook(Item*& item, int player)
 				learned = addSpell(SPELL_CRAB_WEB, player);
 				break;
 			default:
+				// S.A.M: a custom spell defaults to difficulty 0 = "learnable by any caster". The
+				// vanilla learn gate still refuses even a difficulty-0 spell when Spellcasting+INT
+				// is below 0 (a low-INT melee class) -- exactly the character a modder most wants to
+				// hand a book to. Pass ignoreSkill for a difficulty-0 custom spell so the default is
+				// genuinely universal; an author who sets difficulty > 0 keeps the normal skill gate.
 				if ( items[item->type].category == SPELLBOOK )
 				{
 					int spellID = getSpellIDFromSpellbook(item->type);
 					if ( spellID > SPELL_NONE )
 					{
-						learned = addSpell(spellID, player);
+						spell_t* samS = getSpellFromID(spellID);
+						const bool samIgnoreSkill = ( spellID >= SAM_SPELL_ID_BASE && samS && samS->difficulty <= 0 );
+						learned = addSpell(spellID, player, samIgnoreSkill);
 					}
 				}
 				else if ( items[item->type].category == TOME_SPELL )
@@ -6327,7 +6362,8 @@ void item_Spellbook(Item*& item, int player)
 					int spellID = item->getTomeSpellID();
 					if ( auto spell = getSpellFromID(spellID) )
 					{
-						learned = addSpell(spell->ID, player);
+						const bool samIgnoreSkill = ( spell->ID >= SAM_SPELL_ID_BASE && spell->difficulty <= 0 );
+						learned = addSpell(spell->ID, player, samIgnoreSkill);
 					}
 				}
 				break;
@@ -6697,6 +6733,11 @@ void item_FoodAutomaton(Item*& item, int player)
 
 bool itemIsConsumableByAutomaton(const Item& item)
 {
+	// S.A.M: a mod may declare this trait on its own item. Checked FIRST because the
+	// list below ends in a `default: return false` that would make a trailing check
+	// unreachable. Vanilla items carry no traits, so every vanilla answer is unchanged.
+	if ( samItemHasTrait(item.type, SAMItemTrait::AUTOMATON_FOOD) ) { return true; }
+
 	switch ( item.type )
 	{
 		case FOOD_BREAD:

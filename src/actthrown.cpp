@@ -937,7 +937,9 @@ void actThrown(Entity* my)
 			}
 			free(item);
 		}
-		else if ( my->skill[10] >= WOODEN_SHIELD && my->skill[10] < NUMITEMS && items[my->skill[10]].category == THROWN )
+		// S.A.M: NUM_ITEM_SLOTS, so a custom thrown weapon is recovered by Return Item over a
+			// pit like a vanilla one. It used to fall through and be lost permanently.
+		else if ( my->skill[10] >= WOODEN_SHIELD && my->skill[10] < NUM_ITEM_SLOTS && items[my->skill[10]].category == THROWN )
 		{
 			if ( parent )
 			{

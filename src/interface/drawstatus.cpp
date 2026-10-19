@@ -2273,7 +2273,8 @@ void drawStatusNew(const int player)
 							else
 							{
 								// force equip potion/spellbook
-								playerTryEquipItemAndUpdateServer(player, item, true);
+								// S.A.M: a player's choice, so player.on_before_equip may refuse it.
+								playerTryEquipItemAndUpdateServer(player, item, true, /*samPlayerEquip=*/true);
 							}
 						}
 						else
@@ -3397,14 +3398,37 @@ void drawStatusNew(const int player)
 							{
 								players[player]->magic.spellbookUidFromHotbarSlot = item->uid;
 							}
-							useItem(item, player);
+							// S.A.M: from the HOTBAR, activating an equippable item that is not yet
+							// equipped means "wield this" -- that is what a player expects, and a mod
+							// must not be able to turn it into something else. Only treat it as a
+							// vetoable USE when equipping is not the obvious intent: the item has no
+							// equip slot, or it is already equipped (so activating it again can only
+							// mean use it). The explicit "Use" option in the item menu covers the
+							// rest, and that one is always vetoable.
+							const bool samEquippable =
+								( item->type >= 0 && item->type < NUM_ITEM_SLOTS
+									&& items[item->type].item_slot != ItemEquippableSlot::NO_EQUIP );
+							const bool samWouldEquip = ( samEquippable && !itemIsEquipped(item, player) );
+							const bool samVetoableUse = !samWouldEquip
+								&& ( samItemHasTrait(item->type, SAMItemTrait::USABLE)
+									|| itemCategory(item) == POTION || itemCategory(item) == SCROLL
+									|| itemCategory(item) == FOOD || itemCategory(item) == SPELLBOOK
+									|| itemCategory(item) == TOME_SPELL );
+							// S.A.M: a hotbar activation that will EQUIP is also a player choice, so
+							// it may be refused too. samWouldEquip was computed above.
+							useItem(item, player, nullptr, false, false, samVetoableUse,
+								/*samPlayerEquip=*/samWouldEquip);
 							players[player]->magic.spellbookUidFromHotbarSlot = 0;
 						}
 					}
 				}
 				else
 				{
-					playerTryEquipItemAndUpdateServer(player, item, true);
+					// S.A.M: the hotbar's "equip it" (a learned spellbook, a potion readied to
+					// throw) is the player's choice too, so player.on_before_equip may refuse it.
+					// The call itself only asks for an equip, never for the same press taking the
+					// item off again.
+					playerTryEquipItemAndUpdateServer(player, item, true, /*samPlayerEquip=*/true);
 				}
 			}
 			else

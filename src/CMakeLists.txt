@@ -113,7 +113,66 @@ list(APPEND GAME_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/monster_summons.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/monster_moth.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/monster_duck.cpp"
+	# S.A.M Framework (Support All Mods)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_logger.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_errors.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_workshop.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_loader.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_classes.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_items.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_effects.cpp" # custom status effects — game only (engine hooks are #ifndef EDITOR)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_hud.cpp" # script-driven HUD layer — game only (needs the UI root Frame)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_images.cpp" # mod-supplied pictures — game only (needs Image + the UI root Frame)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_ui.cpp" # interactive mod panels - game only (needs Frame/Button)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_catalog.cpp" # read the game content registries - game only
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_rooms.cpp" # prefab room injection into vanilla levelsets
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_world.cpp" # world queries, terrain and mechanisms
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_rules.cpp" # stat modifiers, effect immunity, the XP curve
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_speed.cpp" # sam_set_game_speed: the simulation clock, singleplayer only
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_loot.cpp" # loot pool control and the generation events (world.on_before_loot_roll and friends)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_settings.cpp" # mod actions in the Bindings page, mod settings in the General tab
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_camera.cpp" # script camera control — game only (needs cameras[] and the renderer)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_combat.cpp" # species damage resistance + on_damage_multiplier — game only (entity.cpp is not in EDITOR_SOURCES)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_world_state.cpp" # per-character mod state inside the savegame
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_event.cpp" # one event, fired once, to both runtimes
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_races.cpp" # custom playable races — game only
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_sounds.cpp" # custom sounds — game only (FMOD createSound)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_music.cpp" # mod music: tracks, vanilla replacements, floor rules -- game only
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_recipes.cpp" # tinkering recipes — game only (needs the item table)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_workbench.cpp" # built-in Hunter's Workbench + embedded art — game only
+	# v0.7.0 F5 monster stat overrides — both builds (stat_shared.cpp calls apply(), and
+	# stat_shared.cpp is in EDITOR_SOURCES too), so mirror this into EDITOR_SOURCES below.
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_monster_patches.cpp"
+	# game only — editor has no networking / no PhysFS data patching / no save backup (do NOT add to EDITOR_SOURCES)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_sync.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_net.cpp" # multiplayer contracts + the ordered SAMC/SAMQ channels
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_mp_inventory.cpp" # host mirror of remote backpacks + spell lists
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_mp_input.cpp" # keys, actions and client-raised events in multiplayer
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_mp_entities.cpp" # replication of script-made entities and world edits
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_patcher.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_monsters.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_spells.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_models.cpp" # custom .vox models — game only (needs GL: generateVBOs)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_bodies.cpp" # custom creature body models — game only (draw-site override)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_backup.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_test.cpp" # -samtest: run a mod's own tests unattended -- game only (needs Mods::loadMods and mainloop)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_lua_runtime.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_js_runtime.cpp"
 )
+
+# S.A.M Lua 5.4 runtime — vendored C core (game only). Compiled straight into
+# GAME_SOURCES; this build has no PCH and no /WX, so C sources are safe here.
+# Exclude the two standalone CLI mains (lua.c interpreter, luac.c compiler),
+# which each define their own main().
+file(GLOB SAM_LUA54_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/lua54/*.c")
+list(FILTER SAM_LUA54_SOURCES EXCLUDE REGEX "/(lua|luac)[.]c$")
+list(APPEND GAME_SOURCES ${SAM_LUA54_SOURCES})
+
+# S.A.M JavaScript/TypeScript runtime — vendored quickjs-ng amalgam (game only).
+# Its C11 + c11atomics flags are set globally on CMAKE_C_FLAGS in the top-level
+# CMakeLists (per-file COMPILE_FLAGS don't cross the src/ -> barony-target
+# directory-scope boundary).
+list(APPEND GAME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/quickjs/quickjs-amalgam.c")
 
 list(APPEND EDITOR_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
@@ -140,6 +199,14 @@ list(APPEND EDITOR_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/mod_tools.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/prng.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/shader.cpp"
+	# S.A.M Framework (Support All Mods)
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_logger.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_errors.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_workshop.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_loader.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_classes.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_items.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/../../SAM-Framework/framework/sam_monster_patches.cpp" # v0.7.0 F5 (stat_shared.cpp calls it)
 )
 
 add_subdirectory(magic)

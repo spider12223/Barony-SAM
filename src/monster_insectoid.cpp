@@ -22,6 +22,7 @@
 #include "magic/magic.hpp"
 #include "prng.hpp"
 #include "mod_tools.hpp"
+#include "sam_items.hpp" // "worn_like": a mod mask with its own model sits like a vanilla one
 
 void initInsectoid(Entity* my, Stat* myStats)
 {
@@ -1498,6 +1499,9 @@ void insectoidMoveBodyparts(Entity* my, Stat* myStats, double dist)
 						entity->flags[INVISIBLE] = true;
 					}
 				}
+				// S.A.M: a mod mask (or the hat under it) with its own model is placed like the vanilla
+				// item it names in "worn_like"; see SAMItems::wornAsTwinBegin. No-op without one.
+				SAMItems::wornAsTwinBegin(entity, helmet);
 				if ( entity->sprite != 165 && entity->sprite != 1196 )
 				{
 					if ( entity->sprite == items[MASK_SHAMAN].index )
@@ -1524,6 +1528,7 @@ void insectoidMoveBodyparts(Entity* my, Stat* myStats, double dist)
 					entity->focaly = limbs[INSECTOID][10][1] - 2.25; // -2.25
 					entity->focalz = limbs[INSECTOID][10][2]; // .25
 				}
+				SAMItems::wornAsTwinEnd();
 				break;
 			// Left wing:
 			case 12:

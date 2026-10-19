@@ -17,6 +17,8 @@
 #include "../engine/audio/sound.hpp"
 #include "../items.hpp"
 #include "../player.hpp"
+#include "sam_races.hpp"   // S.A.M custom races: declared relations on the client
+#include "sam_items.hpp"   // "worn_like": a mod's gloves show as a vanilla pair on the casting hands
 #include "magic.hpp"
 #include "../net.hpp"
 #include "../scores.hpp"
@@ -690,7 +692,7 @@ void spellcasting_animation_manager_t::setRangeFinderLocation()
 							&& !(entity->isInertMimic())
 							&& ((multiplayer != CLIENT && entity->checkEnemy(caster))
 								|| (multiplayer == CLIENT
-									&& !entity->monsterAllyGetPlayerLeader() && !monsterally[entity->getMonsterTypeFromSprite()][caster->getStats()->type])) )
+									&& !entity->monsterAllyGetPlayerLeader() && SAMRaces::clientEnemyView(caster->skill[2], entity->getMonsterTypeFromSprite(), !monsterally[entity->getMonsterTypeFromSprite()][caster->getStats()->type]))) )
 						{
 							// monsters have wider interact angle for aim assist
 							bonusRange = true;
@@ -1333,59 +1335,62 @@ void actLeftHandMagic(Entity* my)
 	}
 	else
 	{
-		if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == GLOVES || stats[HANDMAGIC_PLAYERNUM]->gloves->type == GLOVES_DEXTERITY )
+		// S.A.M: a mod's gloves show as the vanilla pair setGloveSprite draws them as. A custom
+		// type matched nothing here, so the casting hand kept its old model or none at all.
+		const int samGloveType = SAMItems::wornTypeFor(stats[HANDMAGIC_PLAYERNUM]->gloves->type);
+		if ( samGloveType == GLOVES || samGloveType == GLOVES_DEXTERITY )
 		{
 			my->sprite = 659;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == BRACERS || stats[HANDMAGIC_PLAYERNUM]->gloves->type == BRACERS_CONSTITUTION )
+		else if ( samGloveType == BRACERS || samGloveType == BRACERS_CONSTITUTION )
 		{
 			my->sprite = 660;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == GAUNTLETS || stats[HANDMAGIC_PLAYERNUM]->gloves->type == GAUNTLETS_STRENGTH )
+		else if ( samGloveType == GAUNTLETS || samGloveType == GAUNTLETS_STRENGTH )
 		{
 			my->sprite = 661;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == BRASS_KNUCKLES )
+		else if ( samGloveType == BRASS_KNUCKLES )
 		{
 			my->sprite = 662;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == IRON_KNUCKLES )
+		else if ( samGloveType == IRON_KNUCKLES )
 		{
 			my->sprite = 663;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == SPIKED_GAUNTLETS )
+		else if ( samGloveType == SPIKED_GAUNTLETS )
 		{
 			my->sprite = 664;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == CRYSTAL_GLOVES )
+		else if ( samGloveType == CRYSTAL_GLOVES )
 		{
 			my->sprite = 666;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == ARTIFACT_GLOVES )
+		else if ( samGloveType == ARTIFACT_GLOVES )
 		{
 			my->sprite = 665;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == SUEDE_GLOVES )
+		else if ( samGloveType == SUEDE_GLOVES )
 		{
 			my->sprite = 803;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == BONE_BRACERS )
+		else if ( samGloveType == BONE_BRACERS )
 		{
 			my->sprite = 2108;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == BLACKIRON_GAUNTLETS )
+		else if ( samGloveType == BLACKIRON_GAUNTLETS )
 		{
 			my->sprite = 2110;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == SILVER_GAUNTLETS )
+		else if ( samGloveType == SILVER_GAUNTLETS )
 		{
 			my->sprite = 2112;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == QUILTED_GLOVES )
+		else if ( samGloveType == QUILTED_GLOVES )
 		{
 			my->sprite = 2114;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == CHAIN_GLOVES )
+		else if ( samGloveType == CHAIN_GLOVES )
 		{
 			my->sprite = 2116;
 		}
@@ -1476,6 +1481,16 @@ void actLeftHandMagic(Entity* my)
 			default:
 				my->sprite = 656;
 				break;
+		}
+
+		// S.A.M: a custom race's own casting hand. Separate field from the arm because it is
+		// a separate model in every vanilla race too. Local-only and never networked (this
+		// entity is made for a local player and carries NOUPDATE).
+		if ( stats[HANDMAGIC_PLAYERNUM] && stats[HANDMAGIC_PLAYERNUM]->playerRace >= SAM_RACE_ID_BASE
+			&& (int)playerRace == SAMRaces::hostMonsterForRace(stats[HANDMAGIC_PLAYERNUM]->playerRace) )
+		{
+			const int samHand = SAMRaces::fpHandLeftModelFor(stats[HANDMAGIC_PLAYERNUM]->playerRace);
+			if ( samHand >= 0 ) { my->sprite = samHand; }
 		}
 		/*}
 		else if ( playerAppearance / 6 == 0 )
@@ -2149,59 +2164,62 @@ void actRightHandMagic(Entity* my)
 	}
 	else
 	{
-		if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == GLOVES || stats[HANDMAGIC_PLAYERNUM]->gloves->type == GLOVES_DEXTERITY )
+		// S.A.M: a mod's gloves show as the vanilla pair setGloveSprite draws them as. A custom
+		// type matched nothing here, so the casting hand kept its old model or none at all.
+		const int samGloveType = SAMItems::wornTypeFor(stats[HANDMAGIC_PLAYERNUM]->gloves->type);
+		if ( samGloveType == GLOVES || samGloveType == GLOVES_DEXTERITY )
 		{
 			my->sprite = 637;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == BRACERS || stats[HANDMAGIC_PLAYERNUM]->gloves->type == BRACERS_CONSTITUTION )
+		else if ( samGloveType == BRACERS || samGloveType == BRACERS_CONSTITUTION )
 		{
 			my->sprite = 638;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == GAUNTLETS || stats[HANDMAGIC_PLAYERNUM]->gloves->type == GAUNTLETS_STRENGTH )
+		else if ( samGloveType == GAUNTLETS || samGloveType == GAUNTLETS_STRENGTH )
 		{
 			my->sprite = 639;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == BRASS_KNUCKLES )
+		else if ( samGloveType == BRASS_KNUCKLES )
 		{
 			my->sprite = 640;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == IRON_KNUCKLES )
+		else if ( samGloveType == IRON_KNUCKLES )
 		{
 			my->sprite = 641;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == SPIKED_GAUNTLETS )
+		else if ( samGloveType == SPIKED_GAUNTLETS )
 		{
 			my->sprite = 642;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == CRYSTAL_GLOVES )
+		else if ( samGloveType == CRYSTAL_GLOVES )
 		{
 			my->sprite = 591;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == ARTIFACT_GLOVES )
+		else if ( samGloveType == ARTIFACT_GLOVES )
 		{
 			my->sprite = 590;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == SUEDE_GLOVES )
+		else if ( samGloveType == SUEDE_GLOVES )
 		{
 			my->sprite = 802;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == BONE_BRACERS )
+		else if ( samGloveType == BONE_BRACERS )
 		{
 			my->sprite = 2107;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == BLACKIRON_GAUNTLETS )
+		else if ( samGloveType == BLACKIRON_GAUNTLETS )
 		{
 			my->sprite = 2109;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == SILVER_GAUNTLETS )
+		else if ( samGloveType == SILVER_GAUNTLETS )
 		{
 			my->sprite = 2111;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == QUILTED_GLOVES )
+		else if ( samGloveType == QUILTED_GLOVES )
 		{
 			my->sprite = 2113;
 		}
-		else if ( stats[HANDMAGIC_PLAYERNUM]->gloves->type == CHAIN_GLOVES )
+		else if ( samGloveType == CHAIN_GLOVES )
 		{
 			my->sprite = 2115;
 		}
@@ -2290,6 +2308,17 @@ void actRightHandMagic(Entity* my)
 			default:
 				my->sprite = 634;
 				break;
+		}
+
+		// S.A.M: the RIGHT casting hand duplicates the held-weapon arm while the weapon is
+		// hidden mid-cast, and vanilla gives both the same model index. So it reads the arm
+		// field, not the hand field -- otherwise the arm visibly changes shape the instant a
+		// spell starts and changes back when it ends.
+		if ( stats[HANDMAGIC_PLAYERNUM] && stats[HANDMAGIC_PLAYERNUM]->playerRace >= SAM_RACE_ID_BASE
+			&& (int)playerRace == SAMRaces::hostMonsterForRace(stats[HANDMAGIC_PLAYERNUM]->playerRace) )
+		{
+			const int samArm = SAMRaces::fpArmModelFor(stats[HANDMAGIC_PLAYERNUM]->playerRace);
+			if ( samArm >= 0 ) { my->sprite = samArm; }
 		}
 		/*else if ( playerAppearance / 6 == 0 )
 		{

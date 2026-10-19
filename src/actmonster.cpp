@@ -16,6 +16,7 @@
 #include "entity.hpp"
 #include "items.hpp"
 #include "monster.hpp"
+#include "sam_monsters.hpp" // custom body hitbox override
 #include "engine/audio/sound.hpp"
 #include "shops.hpp"
 #include "interface/interface.hpp"
@@ -29,6 +30,14 @@
 #include "mod_tools.hpp"
 #include "ui/MainMenu.hpp"
 #include "menu.hpp"
+#include "sam_lua_runtime.hpp"
+#include "sam_bodies.hpp"   // hostAnnounce: tell clients what this monster looks like
+#include "sam_mp_entities.hpp" // an invisibility effect ending must reach the clients
+#include "sam_races.hpp"     // S.A.M custom races — declared shop disposition
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
+#include "sam_js_runtime.hpp"
+#include "sam_rules.hpp"       // S.A.M stat modifiers: a monster's SPEED
+#include "sam_loot.hpp"        // S.A.M: the "monster" roll context around a species init, and world.on_monster_inventory
 
 float limbs[NUMMONSTERS][30][3];
 
@@ -415,7 +424,33 @@ bool ShopkeeperPlayerHostility_t::isPlayerEnemy(const int player)
 bool ShopkeeperPlayerHostility_t::playerRaceCheckHostility(const int player, const Monster type) const
 {
 	if ( player < 0 || player >= MAXPLAYERS ) { return false; }
-	if ( type != HUMAN && type != AUTOMATON && type != DRYAD && type != MYCONID && type != SALAMANDER && type != GNOME ) 
+
+	// S.A.M: a custom race can declare how shops see it, overriding what its host body
+	// would imply -- a goatman-bodied race that shops will nonetheless serve, or a
+	// human-bodied one they will not.
+	//
+	// Handled HERE rather than in checkEnemy so shopkeepers keep a single authority. Do it
+	// there and a race declaring shopkeepers friendly would stay friendly no matter what it
+	// stole, because the wanted level would be computed and then overridden. Declared
+	// hostility still leaves the monocle disguise below reachable, exactly as a monster
+	// race's does.
+	bool accepted = !( type != HUMAN && type != AUTOMATON && type != DRYAD
+		&& type != MYCONID && type != SALAMANDER && type != GNOME );
+	// Only in the race's own body, and never while shapeshifted. Polymorphed or shapeshifted, `type`
+	// is the new form, and vanilla refuses service to a shapeshifted player whatever it wears (the
+	// monocle below is skipped too). The effect is tested as well as the body, because a race on a
+	// rat, spider, troll or imp body can take its OWN form, which leaves `type` unchanged (v3.3.0).
+	if ( stats[player] && stats[player]->playerRace >= SAM_RACE_ID_BASE
+		&& stats[player]->stat_appearance == 0
+		&& !stats[player]->getEffectActive(EFF_SHAPESHIFT)
+		&& (int)type == SAMRaces::hostMonsterForRace(stats[player]->playerRace) )
+	{
+		const int samRel = SAMRaces::declaredAllegiance(stats[player]->playerRace, SHOPKEEPER);
+		// 1 ally and 2 neutral both trade: neutral is the absence of hostility (v3.3.0).
+		if ( samRel >= 0 ) { accepted = (samRel == 1 || samRel == 2); }
+	}
+
+	if ( !accepted )
 	{
 		if ( stats[player] && stats[player]->mask && stats[player]->mask->type == MONOCLE )
 		{
@@ -1262,6 +1297,7 @@ Entity* summonMonster(Monster creature, long x, long y, bool forceLocation)
 {
     auto entity = summonMonsterNoSmoke(creature, x, y, forceLocation);
 
+
     // make a puff
     if (entity) {
         if (creature == MINOTAUR) {
@@ -1447,6 +1483,31 @@ end:
 			net_packet->address.host = net_clients[c - 1].host;
 			net_packet->address.port = net_clients[c - 1].port;
 			sendPacketSafe(net_sock, -1, net_packet, c - 1);
+		}
+	}
+
+	if ( multiplayer != CLIENT )
+	{
+		if ( entity )
+		{
+			{
+				SamEvent samEv;
+				samEv.setName("world.on_monster_spawned");
+				samEv.i("monster_uid", (long long)entity->getUID());
+				samEv.i("monster_type", (long long)creature);
+				// S.A.M: the CANONICAL name, because this is the field a script feeds back into
+				// sam_spawn_monster, and that only knows monstertypename[]. The localized string
+				// is "crystal golem" where the canonical one is "crystalgolem", and in any
+				// non-English locale every species diverges. The display form is still here,
+				// under a name that says what it is.
+				samEv.s("monster_name", ( creature >= 0 && creature < NUMMONSTERS )
+					? std::string(monstertypename[creature]) : std::string());
+				samEv.s("monster_display_name", getMonsterLocalizedName(creature));
+				samEv.i("floor_x", (long long)(entity->x / 16));
+				samEv.i("floor_y", (long long)(entity->y / 16));
+				samEv.i("floor", (long long)currentlevel);
+				samEv.fire();
+			}
 		}
 	}
 
@@ -2805,6 +2866,10 @@ void actMonster(Entity* my)
 		if (myStats)
 		{
 			myStats->monster_sound = NULL;
+			// S.A.M: every roll a species init makes is this monster's gear: the "monster" context
+			// with the uid, which createMonsterEquipment / createCustomInventory inherit. A
+			// shopkeeper's store is stocked inside its init and sets its own "shop" scope there.
+			SAMLoot::ContextScope samMonsterCtx(SAMLoot::Monster, (long long)my->getUID(), -1, -1, (int)myStats->type);
 			switch ( myStats->type )
 			{
 				case HUMAN: initHuman(my, myStats); break;
@@ -2866,6 +2931,25 @@ void actMonster(Entity* my)
 				case MINIMIMIC: initMiniMimic(my, myStats); break;
 				default: break; //This should never be reached.
 			}
+			// S.A.M: a mod-declared custom BODY may be far larger than the creature it is
+			// based on, and the base creature's hitbox would leave you swinging at thin air.
+			// Applied right after the vanilla init so it overrides whatever that set, and
+			// only when a mod actually asks for it -- vanilla monsters keep their own box.
+			if ( myStats )
+			{
+				if ( const SAMMonsters::BodyDef* samBody = SAMMonsters::bodyForName(myStats->name) )
+				{
+					if ( samBody->hitbox > 0 )
+					{
+						my->sizex = samBody->hitbox;
+						my->sizey = samBody->hitbox;
+					}
+				}
+			}
+			// S.A.M: world.on_monster_inventory, once the species init has made its starting gear
+			// (worn slots and pockets alike), so a mod can rewrite what any creature carries and
+			// therefore drops, without an edit in every monster_*.cpp.
+			SAMLoot::afterMonsterInit(my, myStats);
 		}
 
 		MONSTER_INIT = 2;
@@ -2931,6 +3015,29 @@ void actMonster(Entity* my)
 		printlog("ERROR: monster entity at %p has no stats struct!", my);
 		return;
 	}
+
+	// S.A.M: an ADDITIVE per-monster script tick (sam_attach_behavior). It sits here, after
+	// the stats guard, rather than at the end of actMonster because 34 different `return`
+	// statements below would skip an end-of-function site. The one-tick lag against
+	// "strictly after this frame's AI" is invisible at 50Hz and buys total reachability.
+	// Vanilla cost is one predictable branch on a global bool: the map is empty and the
+	// flag false unless a mod attached something. Clients never reach here (actMonster
+	// returns early for them well above), so this is host-authoritative like every other hook.
+#ifndef EDITOR
+	// S.A.M: tell the clients this monster's custom body, once. It lives here rather than at
+	// the monster-creation sites because this runs for every living monster on every path --
+	// generator, script spawn, summon trap, follower -- and because the Stat name is not
+	// always written by the time creation returns. Costs one hash-set lookup per monster per
+	// tick, and returns on the first compare when no mod declares a body.
+	SAMBodies::hostAnnounce(my);
+
+	if ( SAMLua::anyMonsterBehaviors() )
+	{
+		const int samBehaviorIdx = SAMLua::monsterBehaviorIndexFor((unsigned long long)my->getUID());
+		if ( samBehaviorIdx >= 0 ) { SAMLua::runBehavior(samBehaviorIdx, (unsigned long long)my->getUID()); }
+	}
+#endif
+
 	myStats->defending = false;
 	myStats->sneaking = 0;
 
@@ -3689,6 +3796,27 @@ void actMonster(Entity* my)
 			}
 		}
 
+		// S.A.M scripting hook (v0.7.0 F4): this monster is genuinely dying (past the
+		// cursed-flesh polymorph escape above, which returns without death). Host-only
+		// (clients never reach this block). killer_uid is the entity that landed the
+		// kill (0 if unattributed); floor is the current dungeon level.
+		{
+			const long long samDiedUid    = (long long)my->getUID();
+			const long long samDiedType   = (long long)myStats->type;
+			const long long samKillerUid  = (long long)myStats->killer_uid;
+			const long long samDiedFloor  = (long long)currentlevel;
+
+			SAMLua::Event ev;
+			ev.setName("on_monster_died").i("monster_uid", samDiedUid).i("monster_type", samDiedType)
+				.i("killer_uid", samKillerUid).i("floor", samDiedFloor);
+			SAMLua::dispatchEvent(ev);
+
+			SAMJs::Event jsev;
+			jsev.setName("on_monster_died").i("monster_uid", samDiedUid).i("monster_type", samDiedType)
+				.i("killer_uid", samKillerUid).i("floor", samDiedFloor);
+			SAMJs::dispatchEvent(jsev);
+		}
+
 		//TODO: Refactor die function.
 		// drop all equipment
 		entity = dropItemMonster(myStats->helmet, my, myStats);
@@ -4351,6 +4479,11 @@ void actMonster(Entity* my)
 
 	// calculate weight
 	real_t weightratio = my->monsterGetWeightRatio();
+	// S.A.M: a mod's SPEED modifier on this creature. weightratio is the one factor every
+	// movement path below multiplies by -- chasing, strafing, fleeing and the recovery from a
+	// knockback -- so scaling it here reaches all of them from one place. One bool test when
+	// no mod has modified anything.
+	if ( SAMRules::anyStatMod() ) { weightratio = SAMRules::apply(myStats, my, SAMRules::SAM_ST_SPEED, weightratio); }
 	// determine if I have a ranged weapon or not
 	hasrangedweapon = my->hasRangedWeapon();
 
@@ -4435,6 +4568,7 @@ void actMonster(Entity* my)
 		if ( myStats->getEffectActive(EFF_INVISIBLE) )
 		{
 			my->flags[INVISIBLE] = true;
+			SAMMpEntities::noteInvisibleByEffect(my); // S.A.M: remembered only in a hosted game with scripts
 			for ( node = list_Node(&my->children, 2); node != NULL; node = node->next )
 			{
 				Entity* entity = (Entity*)node->element;
@@ -4444,6 +4578,14 @@ void actMonster(Entity* my)
 		else
 		{
 			my->flags[INVISIBLE] = false;
+			// S.A.M: ENTU only ever SETS a flag on a client, so when the effect ends here nothing told
+			// anyone and every client kept the monster hidden for good -- one only the host could
+			// see, attacking them (sam_apply_effect(uid, "INVISIBLE") is what a script is pointed
+			// to). Say it once, with the engine's own ENTF. Always false without a mod.
+			if ( SAMMpEntities::invisibleEffectEnded(my) )
+			{
+				serverUpdateEntityFlag(my, INVISIBLE);
+			}
 			for ( node = list_Node(&my->children, 2); node != NULL; node = node->next )
 			{
 				Entity* entity = (Entity*)node->element;
@@ -14355,6 +14497,17 @@ bool Entity::monsterIsTinkeringCreation()
 	{
 		return false;
 	}
+	// S.A.M: a mod may declare its monster a tinkering construct (salvageable, repairable,
+	// commandable like a robot). Placed AFTER the actMonster guard so a mod can never make
+	// a PLAYER one, and BEFORE the race chain, which ends in `return false` -- an arm added
+	// after it would be dead code. Mask is 0 for every vanilla monster.
+	//
+	// Author gotcha, worth knowing before you tick this: a monster marked as a construct is
+	// worth ZERO experience to kill (entity.cpp bails out of the XP award for constructs).
+	if ( samMonsterHasTrait(getStats(), SAMMonsterTrait::TINKER_CONSTRUCT) )
+	{
+		return true;
+	}
 	if ( race == GYROBOT || race == DUMMYBOT || race == SENTRYBOT || race == SPELLBOT )
 	{
 		return true;
@@ -14776,6 +14929,15 @@ bool Entity::monsterIsTargetable(bool targetInertMimics) const
 	}
 	else if ( behavior == &actMonster ) 
 	{ 
+		// S.A.M: INVERTED relative to the other trait checks. This predicate defaults to
+		// TRUE and holds a list of EXCLUSIONS, so a mod opts OUT of being targetable --
+		// decorative props, holograms, a companion that should not steal autoaim. Placed
+		// inside the actMonster branch, after the actPlayer check above, so a mod can never
+		// make a PLAYER untargetable no matter what it declares.
+		if ( samMonsterHasTrait(getStats(), SAMMonsterTrait::UNTARGETABLE) )
+		{
+			return false;
+		}
 		Monster type = getMonsterTypeFromSprite();
 		if ( type == GYROBOT )
 		{
@@ -15411,6 +15573,12 @@ bool Entity::monsterCanTradeWith(int player)  const
 {
 	if ( behavior == &actMonster )
 	{
+		// S.A.M: a mod may declare its monster a trader. Vanilla monsters carry no traits,
+		// so this is unreachable without a mod and every vanilla answer is unchanged.
+		if ( samMonsterHasTrait(getStats(), SAMMonsterTrait::TRADER) )
+		{
+			return true;
+		}
 		Monster type = NOTHING;
 		if ( Stat* myStats = getStats() )
 		{

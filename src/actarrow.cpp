@@ -1671,6 +1671,47 @@ void actArrow(Entity* my)
 						}
 					}
 
+					// S.A.M scripting hook: player.on_block for a RANGED hit — mirrors the melee
+					// dispatch in entity.cpp so blocking an arrow/bolt with a shield fires the SAME
+					// "player.on_block" event (same fields). `hit.entity` is the blocking player,
+					// `parent` the shooter (may be null for a trap arrow). Host-only; `damage` is
+					// the post-block damage that leaked through, `my->arrowPower` the incoming hit.
+					if ( hit.entity->behavior == &actPlayer && hitstats->defending && hitstats->shield
+						&& multiplayer != CLIENT )
+					{
+						const int samPlayerHit = hit.entity->skill[2];
+						if ( samPlayerHit >= 0 && samPlayerHit < MAXPLAYERS )
+						{
+							const long long samFullBlock  = ( damage <= 0 ) ? 1 : 0;
+							const long long samDamageTaken = (long long)std::max(0, damage);
+							const long long samAtkUid  = parent ? (long long)parent->getUID() : 0;
+							const long long samAtkType = ( parent && parent->getStats() ) ? (long long)parent->getStats()->type : -1;
+							const long long samBlocked = (long long)my->arrowPower;
+
+							SAMLua::Event ev;
+							ev.setName("player.on_block");
+							ev.i("player", samPlayerHit);
+							ev.i("shield_type", (long long)hitstats->shield->type);
+							ev.i("full_block", samFullBlock);
+							ev.i("damage_taken", samDamageTaken);
+							ev.i("attacker_uid", samAtkUid);
+							ev.i("attacker_type", samAtkType);
+							ev.i("damage_blocked", samBlocked);
+							SAMLua::dispatchEvent(ev);
+
+							SAMJs::Event jsev;
+							jsev.setName("player.on_block");
+							jsev.i("player", samPlayerHit);
+							jsev.i("shield_type", (long long)hitstats->shield->type);
+							jsev.i("full_block", samFullBlock);
+							jsev.i("damage_taken", samDamageTaken);
+							jsev.i("attacker_uid", samAtkUid);
+							jsev.i("attacker_type", samAtkType);
+							jsev.i("damage_blocked", samBlocked);
+							SAMJs::dispatchEvent(jsev);
+						}
+					}
+
 					bool armorDegraded = false;
 
 					// hit armor degrade

@@ -23,6 +23,8 @@
 #include "shops.hpp"
 #include "mod_tools.hpp"
 #include "prng.hpp"
+#include "sam_loot.hpp"   // S.A.M: shop-stock events, the roll context, the category draw
+#include "sam_items.hpp" // "worn_like": a mod mask with its own model sits like a vanilla one
 
 std::vector<Item*> generateShopkeeperConsumables(Entity& my, Stat& myStats, int storetype)
 {
@@ -325,6 +327,18 @@ void initShopkeeper(Entity* my, Stat* myStats)
 			{
 				my->monsterStoreType = -1;
 			}
+
+			// S.A.M: world.on_before_shop_stock, after the editor's custom flags so the mod has the
+			// last word. store_type, num_items, shop_level and blessed are writable; a cancel (or
+			// store_type -1) takes the "generate nothing" case below, the shopkeeper keeps its label
+			// and the mod stocks it from world.on_shop_stocked with sam_set_shop_stock. Every roll in
+			// the switch is a "shop" roll for the tables and for world.on_before_loot_roll.
+			{
+				int samStoreType = my->monsterStoreType;
+				SAMLoot::beforeShopStock(my, myStats, samStoreType, numitems, shoplevel, blessedShopkeeper);
+				my->monsterStoreType = samStoreType;
+			}
+			SAMLoot::ContextScope samShopCtx(SAMLoot::Shop, (long long)my->getUID(), my->monsterStoreType);
 
 			bool sellVampireBlood = false;
 			for ( c = 0; c < MAXPLAYERS; ++c )
@@ -961,7 +975,7 @@ void initShopkeeper(Entity* my, Stat* myStats)
 					// general store
 					for ( c = 0; c < numitems; c++ )
 					{
-						Category cat = static_cast<Category>(rng.rand() % (Category::CATEGORY_MAX - 2));
+						Category cat = static_cast<Category>(SAMLoot::pickCategory(rng, SAMLoot::PickPlain));   // S.A.M: the vanilla draw, or one weighted by sam_set_loot_category_weight
 						tmpItem = newItem(itemLevelCurveEntity(*my, cat, 0, shoplevel + 5, rng), static_cast<Status>(WORN + rng.rand() % 3), 0, 1 + rng.rand() % 3, rng.rand(), false, &myStats->inventory);
 						if ( tmpItem && (itemCategory(tmpItem) == WEAPON || itemCategory(tmpItem) == ARMOR || itemCategory(tmpItem) == RING || itemCategory(tmpItem) == AMULET) )
 						{
@@ -1122,6 +1136,11 @@ void initShopkeeper(Entity* my, Stat* myStats)
 				}
 			}
 		}
+
+		// S.A.M: world.on_shop_stocked, with the slots laid out and the consumables placed. A
+		// handler rewrites the stock with sam_set_shop_stock or the container functions, which lay
+		// the slots out again themselves; a potion a handler adds is normalised below as well.
+		SAMLoot::afterShopStock(my, myStats);
 
 		for ( node_t* node = myStats->inventory.first; node != nullptr; node = nextnode )
 		{
@@ -2061,6 +2080,9 @@ void shopkeeperMoveBodyparts(Entity* my, Stat* myStats, double dist)
 						entity->flags[INVISIBLE] = true;
 					}
 				}
+				// S.A.M: a mod mask (or the hat under it) with its own model is placed like the vanilla
+				// item it names in "worn_like"; see SAMItems::wornAsTwinBegin. No-op without one.
+				SAMItems::wornAsTwinBegin(entity, helmet);
 
 				if ( entity->sprite != 165 && entity->sprite != 1196 )
 				{
@@ -2088,6 +2110,7 @@ void shopkeeperMoveBodyparts(Entity* my, Stat* myStats, double dist)
 					entity->focaly = limbs[SHOPKEEPER][10][1] - 2.25; // -2.25
 					entity->focalz = limbs[SHOPKEEPER][10][2]; // .5
 				}
+				SAMItems::wornAsTwinEnd();
 				break;
 		}
 	}

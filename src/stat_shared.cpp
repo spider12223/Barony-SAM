@@ -16,6 +16,7 @@ See LICENSE for details.
 #include "entity.hpp"
 #include "items.hpp"
 #include "prng.hpp"
+#include "sam_monster_patches.hpp" // S.A.M v0.7.0 F5: runtime monster base-stat overrides
 
 // Constructor
 Stat::Stat(Sint32 sprite) :
@@ -1746,6 +1747,10 @@ void setDefaultMonsterStats(Stat* stats, int sprite)
 		default:
 			break;
 	}
+	// S.A.M v0.7.0 Feature 5: apply any runtime monster base-stat overrides
+	// (sam_patch_monster). No-op unless a script patched this monster's type; runs for
+	// every freshly built monster Stat, so future spawns pick up the override.
+	SAMMonsterPatch::apply(stats);
 }
 
 bool isMonsterStatsDefault(Stat& myStats)

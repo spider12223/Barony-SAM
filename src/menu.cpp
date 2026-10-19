@@ -56,8 +56,22 @@
 #include "ui/MainMenu.hpp"
 #include "ui/Image.hpp"
 #include "sam_lua_runtime.hpp"
+#include "sam_rules.hpp"
+#include "sam_net.hpp"   // S.A.M: multiplayer channels (tick / clear)
+#include "sam_mp_input.hpp" // S.A.M: per-run event latches; a kicked player's leave event
+#include "sam_mp_inventory.hpp" // S.A.M: drop the last character's backpack/spell mirror
+#include "sam_event.hpp"      // SamEvent: one build, both runtimes
+#include "sam_images.hpp" // S.A.M: clear any mod picture left on screen when a new game starts
+#include "sam_hud.hpp"  // S.A.M: drop a script-drawn HUD when a run ends
+#include "sam_ui.hpp"   // S.A.M: close mod panels when a run ends
+#include "sam_camera.hpp" // S.A.M: drop a script's camera rig when a new game starts
+#include "sam_music.hpp"  // S.A.M: forget a forced music track when a new game starts
+#include "sam_speed.hpp"  // S.A.M: a scripted game speed ends with the run
 #include "sam_js_runtime.hpp"
+#include "sam_sync.hpp"  // S.A.M: say who in this game is not running S.A.M
 #include "sam_classes.hpp"
+#include "sam_races.hpp"
+#include "sam_world_state.hpp" // S.A.M: clear per-character mod state when a run ends
 
 #ifdef STEAMWORKS
 //Helper func. //TODO: Bugger.
@@ -647,6 +661,14 @@ int isCharacterValidFromDLC(Stat& myStats, int characterClass)
 			break;
 		default:
 			break;
+	}
+
+	// S.A.M: a registered custom race (id >= 200) is not DLC-gated and is
+	// class-agnostic like Human — the class's own DLC ownership was already
+	// validated by the class switch above, so the race never invalidates it.
+	if ( myStats.playerRace >= SAM_RACE_ID_BASE && SAMRaces::get(myStats.playerRace) != nullptr )
+	{
+		return VALID_OK_CHARACTER;
 	}
 
 	if ( myStats.playerRace == RACE_HUMAN )
@@ -5317,6 +5339,8 @@ static void handleMainMenu(bool mode)
 					sendPacketSafe(net_sock, -1, net_packet, playerToKick - 1);
 
 					client_disconnected[playerToKick] = true;
+					// S.A.M: player.on_player_joined fired for them, so their leave must fire too.
+					SAMMpInput::firePlayerLeft(playerToKick);
 					// notify everyone else.
 					for ( int i = 1; i < MAXPLAYERS; i++ )
 					{
@@ -8944,6 +8968,14 @@ void doNewGame(bool makeHighscore) {
 		}
 	}
 
+	// S.A.M: this run's revive answers start empty on every machine. The two level loads below
+	// call assignActions with no player.on_before_revive question and no level-change packet in
+	// front of them (the first floor of a run is never asked: there is no packet at that point to
+	// carry an answer on, and asking only on the host would revive on the clients and not here),
+	// so without this a co-op save holding a dead player could apply the LAST answer of the
+	// PREVIOUS run to the first floor of this one.
+	SAMMpInput::resetReviveVerdicts();
+
 	// load dungeon
 	if ( multiplayer != CLIENT )
 	{
@@ -9356,6 +9388,13 @@ void doNewGame(bool makeHighscore) {
 			}
 		}
 
+		// S.A.M: this is a fresh character's FIRST save, and it runs before the per-run reset
+		// further down (the one gated on wasLoadingSaveGame). Without clearing here too, the
+		// previous character's per-character mod state was serialised into this file and
+		// only replaced on the next save. `loadingsavegame` is still live at this point (it
+		// is zeroed below), so it is the right guard: when a save IS being loaded, loadGame
+		// restored that save's state and it must be kept.
+		if ( !loadingsavegame ) { SAMWorldState::clearAll(); SAMLua::resetRandomStreams(); }
 		if ( multiplayer == SINGLE )
 		{
 			if ( gameModeManager.allowsSaves() )
@@ -9671,40 +9710,131 @@ void doNewGame(bool makeHighscore) {
 	loading = false;
 	intro = false;
 
+	// S.A.M Framework: both ordered multiplayer channels start over with the run, on every
+	// machine, before anything below can queue a single op.
+	//
+	// This is here for the same reason as every other reset in this block: doEndgame is
+	// OPTIONAL between two runs (see the note further down), and "Restart Game" from the
+	// pause menu is exactly such a path — the host restarts, tells each client with 'RSTR',
+	// and both sides land here with the old sessions and sequence numbers still in place.
+	// doNewGame itself then throws away the transport's unacknowledged packets
+	// (list_FreeAll(&safePacketsSent) above), so several frames in each direction are lost
+	// for good while the sequence carries straight on — after which the receiver waits
+	// forever for a frame that will never be sent again and every mod call between the two
+	// machines stops, silently, for the rest of the session. Clearing here also runs the
+	// ClearHooks, which is what drops state keyed by uids and slots that restart with the run
+	// (custom bodies and models, the host's inventory mirror, a joiner's held keys).
+	//
+	// A client says hello again from its own tick once it is in the new game, and the host
+	// re-primes on every hello, so the two machines reaching this line seconds apart is fine.
+	// Nothing is sent or reset in singleplayer, and a stock client is still never sent anything.
+	SAMNet::clear();
 	// S.A.M Framework: move speed resets on EVERY machine, outside the host gate below.
 	// A client applies its own multiplier locally (movement is computed where the player
 	// lives), and the host only transmits on change — so a client that skipped this would
 	// carry the last game's speed into the next one until some script happened to set it.
 	SAMLua::resetMoveSpeed();
+	// Clear any lingering impact-frame state (screen flash / hitstop) so a prior run's
+	// effect can't bleed into the next game. Local, like the move-speed reset above.
+	SAMLua::resetImpact();
+	// A game speed a script set (sam_set_game_speed) ends with the run too: the next
+	// character starts at 1x, and so does a restart in place, which skips doEndgame.
+	SAMSpeed::reset();
+	// Same reasoning for a mod picture left on screen: an overlay is local, so every
+	// machine drops its own rather than waiting to be told.
+	SAMImages::resetAll();
+	// ...and for anything the script drew or opened. Nothing in the engine ever tore these
+	// down, so a HUD widget or an interactive panel survived the end of the run: it was
+	// repainted over the MAIN MENU (the repaint runs outside the intro branch), it followed
+	// the player into their next character, and a modal panel went on holding the mouse
+	// cursor there. Both are local screen state, so every machine drops its own.
+	SAMHud::clearAll();
+	SAMUi::closeAll();
+	// A script's camera rig (and the body flag it took) and a forced music track are this machine's
+	// own presentation state too. A client whose next game began without a doEndgame -- the host
+	// restarting the lobby -- kept the last game's orbit camera on a slot that may now be somebody
+	// else's, and the last host's boss track under a host that forces nothing. Every machine drops
+	// its own here, before on_game_start below can set new ones.
+	SAMCamera::clear();
+	SAMMusic::resetForNewGame();
+	// A brand new character must not inherit the previous one's saved mod state, and this
+	// is the ONLY reliable place to guarantee that.
+	//
+	// The obvious home looks like doEndgame(), but doEndgame is optional on the path
+	// between two runs: dying and restarting, and the host restarting a co-op lobby, both
+	// reach a fresh character without it ever running. doNewGame is the one function every
+	// route has to pass through, which is why every other per-run S.A.M reset already lives
+	// in this block.
+	//
+	// This sits OUTSIDE the host gate below, with the other local resets, because the state
+	// map is per-machine memory rather than host-authoritative data: a client fills its own
+	// copy (loadGame -> beginLoad/absorb) and flushes it into its own multiplayer save on a
+	// level change, so a client that skipped this would carry the last character's state
+	// into the next one and then write it into that character's first save.
+	//
+	// The gate must be wasLoadingSaveGame, the copy captured at its declaration above, and
+	// not the live loadingsavegame, which is already 0 by this point. When a save IS being
+	// loaded, loadGame() has already restored that save's state and clearing would erase it.
+	if ( !wasLoadingSaveGame ) { SAMWorldState::clearAll(); SAMLua::resetRandomStreams(); }
+	// Per-player and per-monster script scratch data (sam_set_player_data / sam_set_monster_data)
+	// is session state, never saved, so it resets on EVERY new run including a load. Until
+	// now nothing on the path between two characters cleared either store -- the previous
+	// character's cooldowns and flags carried over, and the monster map is keyed by a UID
+	// space that restarts from 1, so entries silently attached to different creatures.
+	SAMLua::playerDataClear();
+	SAMLua::monsterDataClear();
+	// S.A.M: name anyone in this game who is not running S.A.M. Three separate bug reports
+	// turned out to be exactly this, and the framework already had the evidence -- a machine
+	// without S.A.M cannot answer the mod fingerprint, and by now the answer is not coming.
+	SAMSync::reportModPresence();
+	SAMLua::clearDamageImmune();   // same reasoning: session state, keyed by a uid space that restarts
+	SAMRules::clearMonsterModifiersForNewFloor();
+	SAMRules::clearPlayersForNewRun();   // slot-keyed, so it would otherwise reach the next character
+	// The once-per-run latch of game.on_game_end, this run's revive answers and any Use still
+	// waiting for the host's answer. Local state on every machine.
+	SAMMpInput::resetRun();
+	// The host's mirror of every remote player's backpack and spell list, the proxy uids
+	// handed out for it, and any item destroy or spell removal still queued. All of it
+	// belongs to the character that just ended, and nothing else on this path drops it: the
+	// ClearHook only runs from doEndgame, which a death-and-restart and a host restarting the
+	// lobby both skip. Outside the host gate like the rest of this block, because the client
+	// half is what makes that machine re-report its NEW character at once.
+	SAMMpInventory::resetForNewRun();
+	// Every machine drops its OWN timers. Only the host ever ticks them, but a client holds the
+	// timers its scripts registered while loading (sam_set_timer refuses a client after that), and
+	// keeping those callbacks alive for the whole session did nothing but hold them. A timer set
+	// by top-level script code is dropped here on the host too: set timers from
+	// game.on_game_start, which fires just below.
+	SAMLua::resetTimers();
+	SAMJs::resetTimers();
 
 	// Reset per-run state and fire game.on_game_start (host-authoritative).
 	if ( multiplayer != CLIENT )
 	{
 		SAMLua::resetKills();
-		SAMLua::resetTimers();
-		SAMJs::resetTimers();
 
 		for ( int c = 0; c < MAXPLAYERS; ++c )
 		{
 			if ( !client_disconnected[c] && stats[c] )
 			{
-				SAMLua::Event ev;
-				ev.setName("game.on_game_start");
-				ev.i("player", (long long)c);
-				ev.i("class_id", (long long)client_classes[c]);
-				ev.s("class_name", std::string(playerClassLangEntry(client_classes[c], c)));
-				ev.i("race", (long long)stats[c]->playerRace);
-				ev.s("race_name", std::string(Language::get(3161 + stats[c]->playerRace)));
-				SAMLua::dispatchEvent(ev);
-
-				SAMJs::Event jsev;
-				jsev.setName("game.on_game_start");
-				jsev.i("player", (long long)c);
-				jsev.i("class_id", (long long)client_classes[c]);
-				jsev.s("class_name", std::string(playerClassLangEntry(client_classes[c], c)));
-				jsev.i("race", (long long)stats[c]->playerRace);
-				jsev.s("race_name", std::string(Language::get(3161 + stats[c]->playerRace)));
-				SAMJs::dispatchEvent(jsev);
+				{
+					SamEvent samEv;
+					samEv.setName("game.on_game_start");
+					samEv.i("player", (long long)c);
+					samEv.i("class_id", (long long)client_classes[c]);
+					// S.A.M: NOT the raw playerClassLangEntry. For a custom class (id >= 1000) that
+					// lands on Language::get(4210), which is the string "Effect has no use" -- so
+					// this field literally read that. SAMClasses::canonicalName gives the same
+					// answer sam_get_class does, so a script can compare the two.
+					samEv.s("class_name", SAMClasses::canonicalName(client_classes[c], c));
+					samEv.i("race", (long long)stats[c]->playerRace);
+					// S.A.M: NOT Language::get(3161 + race). That block of the language file is
+					// solid "DEPRECATED", so this field was the literal string "DEPRECATED" for
+					// every vanilla race, while sam_get_race answered "skeleton" for the same
+					// player in the same frame.
+					samEv.s("race_name", SAMRaces::canonicalName(stats[c]->playerRace));
+					samEv.fire();
+				}
 			}
 		}
 	}
@@ -9861,6 +9991,9 @@ void doEndgameOnDisconnect()
 
 void doEndgame(bool saveHighscore, bool onServerDisconnect) {
 	int c, x;
+	// S.A.M: gameLogic keeps ticking the main-menu map after a run, so a game speed left
+	// set here would run the menu background at Nx. Back to 1x on the way out.
+	SAMSpeed::reset();
 	bool endTutorial = false;
 	bool localScores = gameModeManager.allowsHiscores();
 	bool onlineScores = gameModeManager.allowsGlobalHiscores();
@@ -10287,6 +10420,7 @@ void doEndgame(bool saveHighscore, bool onServerDisconnect) {
 
 	// reset game
 	darkmap = false;
+	SAMNet::clear(); // S.A.M: forget every multiplayer peer and channel before the next game or join
 	multiplayer = SINGLE;
 	currentlevel = 0;
 	secretlevel = false;
@@ -10476,6 +10610,19 @@ void doEndgame(bool saveHighscore, bool onServerDisconnect) {
 #ifdef LOCAL_ACHIEVEMENTS
 	LocalAchievements_t::writeToFile();
 #endif
+
+	// S.A.M Framework: drop this run's per-character mod state now the run is over, so the
+	// next character does not start life holding the last one's progress. This is the right
+	// place for it and game start is NOT: loadGame() has already restored a loaded save's
+	// state by the time the new-game path runs, and clearing there would erase it.
+	// doEndgame only ever deletes a save, never writes one, so nothing is lost here.
+	SAMWorldState::clearAll(); SAMLua::resetRandomStreams();
+	// ...and the local screen state too. doNewGame clears these when the NEXT run begins,
+	// which is the guarantee that matters for correctness, but that leaves a mod's panel or
+	// HUD text drawn over the main menu in the gap between the two -- and a client dropped
+	// by the host may sit there indefinitely.
+	SAMHud::clearAll();
+	SAMUi::closeAll();
 }
 
 void doIntro() {
@@ -11894,7 +12041,18 @@ bool replayLastCharacter(const int index, int multiplayer)
 	if ( lastClass >= 0 && lastSex >= 0 && lastRace >= 0 && lastAppearance >= 0 && lastName != "" )
 	{
 		stats[index]->sex = static_cast<sex_t>(std::min(lastSex, (int)sex_t::FEMALE));
-		stats[index]->playerRace = std::min(std::max(static_cast<int>(RACE_HUMAN), lastRace), static_cast<int>(RACE_ENUM_END - 1));
+		// S.A.M: a registered custom race (id >= SAM_RACE_ID_BASE) must survive the restore,
+		// for the same reason the class below does -- the vanilla clamp turned it into the
+		// last vanilla race. Gate on get() so a stale id from an uninstalled mod still
+		// falls back to the vanilla clamp.
+		if ( lastRace >= SAM_RACE_ID_BASE && SAMRaces::get(lastRace) != nullptr )
+		{
+			stats[index]->playerRace = lastRace;
+		}
+		else
+		{
+			stats[index]->playerRace = std::min(std::max(static_cast<int>(RACE_HUMAN), lastRace), static_cast<int>(RACE_ENUM_END - 1));
+		}
 		stats[index]->stat_appearance = lastAppearance;
 		// S.A.M: a registered custom class (id >= SAM_CLASS_ID_BASE) must survive the
 		// restore. The vanilla clamp to NUMCLASSES-1 would turn it into CLASS_PALADIN,
