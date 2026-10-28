@@ -1887,6 +1887,12 @@ bool makeFollower(int monsterclicked, bool ringconflict, char namesays[64],
 					canAlly = true; // non-boss imps
 				}
 			}
+			// S.A.M: a custom race's "recruits" list. Nothing happens without a race mod: a vanilla race has
+			// playerRace 0 and recruitsByUse answers at its first comparison.
+			if ( SAMRaces::recruitsByUse(stats[monsterclicked], my, myStats) )
+			{
+				canAlly = true;
+			}
 			if ( myStats->monsterForceAllegiance == Stat::MONSTER_FORCE_PLAYER_RECRUITABLE
 				|| (myStats->getEffectActive(EFF_PENANCE) >= 1 
 					&& myStats->getEffectActive(EFF_PENANCE) < 1 + MAXPLAYERS) )
@@ -2094,6 +2100,12 @@ bool makeFollower(int monsterclicked, bool ringconflict, char namesays[64],
 						{
 							canAlly = true; // non-boss imps
 						}
+					}
+					// S.A.M: a custom race's "recruits" list. Nothing happens without a race mod: a vanilla race has
+					// playerRace 0 and recruitsByUse answers at its first comparison.
+					if ( SAMRaces::recruitsByUse(stats[monsterclicked], my, myStats) )
+					{
+						canAlly = true;
 					}
 					if ( myStats->monsterForceAllegiance == Stat::MONSTER_FORCE_PLAYER_RECRUITABLE )
 					{

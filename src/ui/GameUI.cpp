@@ -3,6 +3,7 @@
 #include "GameUI.hpp"
 #include "sam_recipes.hpp" // S.A.M custom crafting kits
 #include "sam_rules.hpp"   // S.A.M XP curve: the XP bar's scale
+#include "sam_spells.hpp"  // S.A.M custom spell icon in the "new spell learned" popup
 #include "MainMenu.hpp"
 #include "Frame.hpp"
 #include "Image.hpp"
@@ -43845,10 +43846,23 @@ void updateSkillUpFrame(const int player)
 
 		if ( skillUp.isSpell )
 		{
-			node_t* spellImageNode = ItemTooltips.getSpellNodeFromSpellID(skillUp.spellID);
-			if ( spellImageNode )
+			// S.A.M: a mod spell (id >= 2000) has no node in the vanilla spell image list, so this popup
+			// had no picture for it and skipped its layout. Use the mod's icon, else the generic orb.
+			std::string samSpellIcon;
+			int imageSpellID = skillUp.spellID;
+			if ( imageSpellID >= SAM_SPELL_ID_BASE )
 			{
-				if ( string_t* string = (string_t*)spellImageNode->element )
+				samSpellIcon = SAMSpells::getIconPath(imageSpellID);
+				if ( samSpellIcon.empty() ) { imageSpellID = SPELL_FORCEBOLT; }
+			}
+			node_t* spellImageNode = ItemTooltips.getSpellNodeFromSpellID(imageSpellID);
+			if ( spellImageNode || !samSpellIcon.empty() )
+			{
+				if ( !samSpellIcon.empty() )
+				{
+					skillImg->path = samSpellIcon;
+				}
+				else if ( string_t* string = (string_t*)spellImageNode->element )
 				{
 					skillImg->path = string->data;
 				}

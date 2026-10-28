@@ -6354,7 +6354,17 @@ void item_Spellbook(Item*& item, int player)
 					{
 						spell_t* samS = getSpellFromID(spellID);
 						const bool samIgnoreSkill = ( spellID >= SAM_SPELL_ID_BASE && samS && samS->difficulty <= 0 );
-						learned = addSpell(spellID, player, samIgnoreSkill);
+						// S.A.M: a mod spell's learn_requirements (stats and skills beyond difficulty).
+						const std::string samUnmet = ( spellID >= SAM_SPELL_ID_BASE )
+							? SAMSpells::unmetLearnRequirement(spellID, player) : std::string();
+						if ( !samUnmet.empty() )
+						{
+							messagePlayer(player, MESSAGE_INTERACTION, "%s", samUnmet.c_str());
+						}
+						else
+						{
+							learned = addSpell(spellID, player, samIgnoreSkill);
+						}
 					}
 				}
 				else if ( items[item->type].category == TOME_SPELL )
@@ -6363,7 +6373,16 @@ void item_Spellbook(Item*& item, int player)
 					if ( auto spell = getSpellFromID(spellID) )
 					{
 						const bool samIgnoreSkill = ( spell->ID >= SAM_SPELL_ID_BASE && spell->difficulty <= 0 );
-						learned = addSpell(spell->ID, player, samIgnoreSkill);
+						const std::string samUnmet = ( spell->ID >= SAM_SPELL_ID_BASE )
+							? SAMSpells::unmetLearnRequirement(spell->ID, player) : std::string();
+						if ( !samUnmet.empty() )
+						{
+							messagePlayer(player, MESSAGE_INTERACTION, "%s", samUnmet.c_str());
+						}
+						else
+						{
+							learned = addSpell(spell->ID, player, samIgnoreSkill);
+						}
 					}
 				}
 				break;
@@ -6401,6 +6420,9 @@ void item_Spellbook(Item*& item, int player)
 
 			if ( itemCategory(item) == SPELLBOOK )
 			{
+				// S.A.M: reading an "unbreakable" mod spellbook does not wear it
+				if ( !samItemHasTrait(item->type, SAMItemTrait::UNBREAKABLE) )
+				{
 				item->status = static_cast<Status>(item->status - 1);
 				if ( item->status != BROKEN )
 				{
@@ -6410,6 +6432,7 @@ void item_Spellbook(Item*& item, int player)
 				{
 					messagePlayer(player, MESSAGE_INVENTORY | MESSAGE_EQUIPMENT, Language::get(2596));
 					consumeItem(item, player);
+				}
 				}
 
 				if ( stats[player] && stats[player]->playerRace == RACE_INSECTOID && stats[player]->stat_appearance == 0 )

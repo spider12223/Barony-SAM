@@ -340,6 +340,11 @@ namespace Test {
 
 #define CCMD (int argc, const char **argv)
 
+// interface.cpp's alchemy mixer, which has no header (/sam_alchemy calls it). Declared at file
+// scope: a block-scope extern inside namespace ConsoleCommands names ConsoleCommands::alchemyMixResult,
+// which GCC and Clang then fail to link.
+ItemType alchemyMixResult(ItemType potion1, ItemType potion2, bool& outRandomResult, bool& outTryDuplicatePotion, bool& outSamePotion, bool& outExplodeSelf);
+
 namespace ConsoleCommands {
 	static ConsoleCommand ccmd_help("/help", "get help for a command (eg: /help listcmds)", []CCMD{
 		const char* cmd = argc == 1 ? "help" : argv[1];
@@ -538,9 +543,8 @@ namespace ConsoleCommands {
 	// Custom potions in alchemy: prove a custom potion mixes SAFELY (no detonation, no item
 	// loss) by calling the real alchemyMixResult the brew GUI uses, with a vanilla control so
 	// a regression in vanilla mixing is caught too. alchemyMixResult is a free function in
-	// interface.cpp with no header, so forward-declare it here.
+	// interface.cpp with no header, so it is declared at the top of this file.
 	static ConsoleCommand ccmd_sam_alchemy("/sam_alchemy", "S.A.M: check a custom potion mixes safely in alchemy: /sam_alchemy <ns:potion>", []CCMD{
-		extern ItemType alchemyMixResult(ItemType, ItemType, bool&, bool&, bool&, bool&);
 		if ( argc < 2 ) { { char b[512]; snprintf(b, sizeof(b), "usage: /sam_alchemy <ns:potion>"); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); } return; }
 		const int cp = samResolveCustomItem(argv[1]);
 		if ( cp < 0 ) { { char b[512]; snprintf(b, sizeof(b), "S.A.M: unknown item '%s'.", argv[1]); messagePlayer(clientnum, MESSAGE_MISC, "%s", b); SAM_INFO("TEST", b); } return; }
@@ -1225,7 +1229,7 @@ namespace ConsoleCommands {
 			{ "thrown_ball", SAMItemTrait::THROWN_BALL }, { "shield_slot", SAMItemTrait::SHIELD_SLOT },
 			{ "potion_bad", SAMItemTrait::POTION_BAD }, { "automaton_food", SAMItemTrait::AUTOMATON_FOOD },
 			{ "tinker_throwable", SAMItemTrait::TINKER_THROWABLE }, { "usable", SAMItemTrait::USABLE },
-			{ "beatitude_ac", SAMItemTrait::BEATITUDE_AC },
+			{ "beatitude_ac", SAMItemTrait::BEATITUDE_AC }, { "unbreakable", SAMItemTrait::UNBREAKABLE },
 		};
 		std::string out;
 		for ( const auto& k : kNames )

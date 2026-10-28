@@ -14448,6 +14448,16 @@ void Entity::attack(int pose, int charge, Entity* target)
 						hit.entity->modHP(thornsEffect);
 					}*/
 
+					// S.A.M: a mod weapon's own on_hit_effect (item JSON), once the damage has landed. A golem
+					// smash and a bugbear shield bash are unarmed attacks even though the weapon is still in hand.
+					// One integer compare for every vanilla weapon.
+					if ( myStats->weapon && !shapeshifted && hitstats && damage > 0
+						&& (int)myStats->weapon->type >= SAM_ITEM_ID_BASE
+						&& pose != PLAYER_POSE_GOLEM_SMASH && pose != MONSTER_POSE_BUGBEAR_SHIELD )
+					{
+						SAMCombat::applyItemOnHit((int)myStats->weapon->type, this, hit.entity, hitstats);
+					}
+
 					// special weapon effects
 					if ( myStats->weapon && !shapeshifted )
 					{

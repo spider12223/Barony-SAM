@@ -792,6 +792,7 @@ namespace SAMItemTrait
 	static const Uint64 TINKER_THROWABLE = 1ULL << 8;  // bomb / trap / deployable
 	static const Uint64 USABLE           = 1ULL << 9;  // offers a "use" option in the inventory
 	static const Uint64 BEATITUDE_AC     = 1ULL << 10; // blessing/cursing it changes its AC (masks)
+	static const Uint64 UNBREAKABLE      = 1ULL << 11; // never loses condition: asked at every wear site (spellEffectPreserveItem)
 }
 
 // True iff `type` is a real slot whose mod-declared traits include `trait`. Safe for any

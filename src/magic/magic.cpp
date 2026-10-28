@@ -3433,6 +3433,12 @@ Entity* spellEffectFlameSprite(Entity& caster, spellElement_t& element, real_t x
 bool Entity::spellEffectPreserveItem(Item* item)
 {
 	if ( !item ) { return false; }
+	// S.A.M: a mod item that declared the "unbreakable" trait never wears out. This is the one gate
+	// every wear site already asks (melee, bows, staves, digging, degradeArmor for armour, shields
+	// and spellbooks, cloak burning, reflection, scrolls, amulets, torches, lockpicks, helmets), so
+	// answering yes here covers them all. Before the monster and Preserve checks: a monster that
+	// wields the item is covered too, and no mana is spent. A vanilla item has no traits.
+	if ( samItemHasTrait(item->type, SAMItemTrait::UNBREAKABLE) ) { return true; }
 	if ( Stat* myStats = getStats() )
 	{
 		if ( behavior != &actPlayer )

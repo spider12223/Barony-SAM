@@ -1375,6 +1375,22 @@ bool magicOnSpellCastEvent(Entity* parent, Entity* projectile, Entity* hitentity
 	return skillIncreased;
 }
 
+// The poison, acid spray, steal weapon, drain soul and charm payloads are applied by helpers in
+// magic.cpp that report a hit with the VANILLA spell id (SPELL_POISON, ...), so a custom spell
+// built on one of them never reached the on_hit_effect block below. actMagicMissile names the
+// custom spell for the length of that helper call, and magicOnEntityHit falls back to it.
+// 0 outside those calls, and a vanilla spell id is below SAM_SPELL_ID_BASE: a no-op for vanilla.
+namespace
+{
+	int s_samMissileSpellID = 0;
+	struct SamMissileSpellScope
+	{
+		int prev;
+		explicit SamMissileSpellScope(int id) : prev(s_samMissileSpellID) { s_samMissileSpellID = id; }
+		~SamMissileSpellScope() { s_samMissileSpellID = prev; }
+	};
+}
+
 void magicOnEntityHit(Entity* parent, Entity* particle, Entity* hitentity, Stat* hitstats, Sint32 preResistanceDamage, Sint32 damage, Sint32 oldHP, int spellID, int selfCastUsingItem)
 {
 	if ( !hitentity  ) { return; }
@@ -1385,9 +1401,10 @@ void magicOnEntityHit(Entity* parent, Entity* particle, Entity* hitentity, Stat*
 	// branch of actMagicMissile alone, so a custom fire/cold/lightning/... spell resolved its
 	// effect, logged it, tagged its tooltip, and never applied it. Pure no-op for vanilla
 	// spells (ID < SAM_SPELL_ID_BASE) and when no custom spell is registered.
-	if ( hitstats && spellID >= SAM_SPELL_ID_BASE && SAMSpells::count() > 0 )
+	const int samSpellID = ( spellID >= SAM_SPELL_ID_BASE ) ? spellID : s_samMissileSpellID;
+	if ( hitstats && samSpellID >= SAM_SPELL_ID_BASE && SAMSpells::count() > 0 )
 	{
-		if ( const SAMSpellDef* samsp = SAMSpells::getSpell(spellID) )
+		if ( const SAMSpellDef* samsp = SAMSpells::getSpell(samSpellID) )
 		{
 			if ( samsp->onHitEffectSlot >= 0 )
 			{
@@ -6750,6 +6767,7 @@ void actMagicMissile(Entity* my)   //TODO: Verify this function.
 					Entity* caster = uidToEntity(spell->caster);
 					if ( caster )
 					{
+						SamMissileSpellScope samScope(spell ? spell->ID : 0);
 						spellEffectAcid(*my, *element, parent, preResistanceDamage, resistance);
 					}
 				}
@@ -6758,6 +6776,7 @@ void actMagicMissile(Entity* my)   //TODO: Verify this function.
 					Entity* caster = uidToEntity(spell->caster);
 					if ( caster )
 					{
+						SamMissileSpellScope samScope(spell ? spell->ID : 0);
 						spellEffectPoison(*my, *element, parent, preResistanceDamage, resistance);
 					}
 				}
@@ -6774,6 +6793,7 @@ void actMagicMissile(Entity* my)   //TODO: Verify this function.
 					Entity* caster = uidToEntity(spell->caster);
 					if ( caster )
 					{
+						SamMissileSpellScope samScope(spell ? spell->ID : 0);
 						spellEffectStealWeapon(*my, *element, parent, resistance);
 					}
 				}
@@ -6782,6 +6802,7 @@ void actMagicMissile(Entity* my)   //TODO: Verify this function.
 					Entity* caster = uidToEntity(spell->caster);
 					if ( caster )
 					{
+						SamMissileSpellScope samScope(spell ? spell->ID : 0);
 						spellEffectDrainSoul(*my, *element, parent, preResistanceDamage, resistance);
 					}
 				}
@@ -6790,6 +6811,7 @@ void actMagicMissile(Entity* my)   //TODO: Verify this function.
 					Entity* caster = uidToEntity(spell->caster);
 					if ( caster )
 					{
+						SamMissileSpellScope samScope(spell ? spell->ID : 0);
 						spellEffectCharmMonster(*my, *element, parent, resistance, static_cast<bool>(my->actmagicCastByMagicstaff));
 					}
 				}
