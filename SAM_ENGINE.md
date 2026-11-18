@@ -31,6 +31,27 @@ The framework itself is not in this repo. The engine calls into it, and most cal
 comment starting with `S.A.M`. With no mod loaded each one does nothing, including on the wire, so
 a stock 5.0.2 client can still join a game hosted by this build.
 
+## Party members and lobby cards (unreleased)
+
+The engine side of `sam_party_*` and `sam_lobby_*` (see the framework's `docs/party-and-lobby.md`).
+Each call site is marked `S.A.M` and does nothing unless a mod uses these features.
+
+| file | call | what it is for |
+|---|---|---|
+| `entity.cpp` | `SAMParty::allegiance` (in `checkEnemy` and `checkFriend`) | a party member is a friend of players and their followers |
+| `entity.cpp` | `SAMParty::balancePlayers`, `levelUpLikePlayer` | the run's party count in the balance loop; a class's level-up |
+| `maps.cpp`, `actmonster.cpp` | `SAMParty::balancePlayers`, `runDifficultyCount` | the same count for monster numbers and the Devil |
+| `actmonster.cpp` | `SAMParty::onDeath`, `think`, `isMember` | death and respawn before the gear drops; a member walks to an exit; a member is not a recruit |
+| `actladder.cpp` | `SAMParty::exitsMayClose`, `exitUser` | an exit waits for the party; a member can take the party through |
+| `game.cpp` | `SAMParty::respawnFallen`, `SAMParty::tick` | the fallen come back on a new floor; a carrier that vanished ends the run |
+| `interface/interface.cpp` | `SAMParty::takesOrdersFreely` | no leadership gate for a member |
+| `actplayer.cpp` | `SAMParty::partyCarriesOn`, `samPartyWiped` | with a `carry_on` member standing the save, the game-over music and the ghost rules follow the run; the real end does them once |
+| `ui/MainMenu.cpp` | `SAMParty::partyCarriesOn`, `writeStartTail`, `readStartTail`, `beginRun`, `lobbyOpened` | the game-over window; the party count rides after the start packet's 17 bytes; the lobby hooks |
+| `ui/MainMenu.cpp`, `menu.cpp` | `SAMLobby::*` | cards on empty player slots, the `SAML` packet, the client hello after the host's `SAMF` |
+| `net.cpp` | `SAMParty::readStartTail` | a client reads the party count before any map is built |
+
+The party's net ops are in `SAMNet::Op::PartyFirst` (104..119).
+
 ## Building
 
 The build expects the framework as a sibling folder named `SAM-Framework`:
@@ -48,3 +69,12 @@ data, FMOD and the Steamworks SDK are not part of this repo.
 ## Licence
 
 `LICENSE.txt` is unchanged: the Barony Open Source License (BSD 2-Clause).
+
+## Gear on allies (unreleased)
+
+The engine side of `sam_monster_*`, `sam_give_item_to_ally` and `sam_take_item_from_ally` (see the framework's `docs/ally-items.md`).
+The call site is marked `S.A.M` and does nothing unless a mod moves an item.
+
+| file | call | what it is for |
+|---|---|---|
+| `game.cpp` | `SAMAllyItems::tick` | an item move between a player and an ally waits for the next tick, then finishes and fires its event |

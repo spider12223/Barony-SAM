@@ -19,6 +19,7 @@
 #include "sam_recipes.hpp" // S.A.M mod-declared tinkering recipes
 #include "sam_items.hpp"   // S.A.M custom-item icon paths (crafting-cost material icons)
 #include "sam_logger.hpp"  // SAM_WARN for a full tinkering grid
+#include "sam_party.hpp"   // party members take orders whatever the leader's leadership
 #include "../magic/magic.hpp"
 #include "interface.hpp"
 #include "sam_event.hpp"   // player.on_callout
@@ -4409,6 +4410,10 @@ bool FollowerRadialMenu::allowedInteractEntity(Entity& selectedEntity, bool upda
 
 int FollowerRadialMenu::optionDisabledForCreature(int playerSkillLVL, int monsterType, int option, Entity* follower)
 {
+	if ( SAMParty::takesOrdersFreely(follower) )
+	{
+		playerSkillLVL = SKILL_LEVEL_LEGENDARY; // S.A.M: a party member is a companion, not a recruit; no leadership gate
+	}
 	int creatureTier = 0;
 
 	switch ( monsterType )

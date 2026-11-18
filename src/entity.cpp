@@ -23,6 +23,7 @@ See LICENSE for details.
 #include "magic/magic.hpp"
 #include "interface/interface.hpp"
 #include "net.hpp"
+#include "sam_party.hpp"
 #include "collision.hpp"
 #include "paths.hpp"
 #include "book.hpp"
@@ -4024,14 +4025,7 @@ int Entity::getHungerTickRate(Stat* myStats, bool isPlayer, bool checkItemsEffec
 		hungerTickRate = 15;
 	}
 
-	int playerCount = 0;
-	for ( int i = 0; i < MAXPLAYERS; ++i )
-	{
-		if ( !client_disconnected[i] )
-		{
-			++playerCount;
-		}
-	}
+	int playerCount = SAMParty::balancePlayers(); // S.A.M: connected players plus this run's party count
 
 	if ( playerCount == 3 )
 	{
@@ -4571,7 +4565,10 @@ void Entity::handleEffects(Stat* myStats)
 		else
 		{
 			// monsters use this.
-			Entity::monsterRollLevelUpStats(increasestat);
+			if ( !SAMParty::levelUpLikePlayer(this, myStats, increasestat) ) // S.A.M: a party member grows like its class
+			{
+				Entity::monsterRollLevelUpStats(increasestat);
+			}
 
 			for ( int i = 0; i < 3; i++ )
 			{
@@ -19487,6 +19484,15 @@ bool Entity::checkEnemy(Entity* your)
 		return false;
 	}
 
+	{
+		// S.A.M: a party member is on the players' side. -1 = no opinion (the vanilla path).
+		const int samParty = SAMParty::allegiance(this, myStats, your, yourStats, true);
+		if ( samParty >= 0 )
+		{
+			return samParty == 1;
+		}
+	}
+
 	if ( (your->behavior == &actPlayer || your->behavior == &actPlayerLimb) && (behavior == &actPlayer || behavior == &actPlayerLimb) )
 	{
 		return false;
@@ -20138,6 +20144,15 @@ bool Entity::checkFriend(Entity* your)
 	if ( everybodyfriendly || intro )   // friendly monsters mode
 	{
 		return true;
+	}
+
+	{
+		// S.A.M: a party member is on the players' side. -1 = no opinion (the vanilla path).
+		const int samParty = SAMParty::allegiance(this, myStats, your, yourStats, false);
+		if ( samParty >= 0 )
+		{
+			return samParty == 1;
+		}
 	}
 
 	if ( (your->behavior == &actPlayer || your->behavior == &actPlayerLimb) && (behavior == &actPlayer || behavior == &actPlayerLimb) )

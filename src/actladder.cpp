@@ -16,6 +16,7 @@
 #include "entity.hpp"
 #include "scores.hpp"
 #include "net.hpp"
+#include "sam_party.hpp"
 #include "collision.hpp"
 #include "player.hpp"
 #include "magic/magic.hpp"
@@ -83,11 +84,12 @@ void actLadder(Entity* my)
 	// use ladder (climb)
 	if (multiplayer != CLIENT)
 	{
+		const int samExit = SAMParty::exitUser(my); // S.A.M: every player is down and a party member reached this exit
 		for (i = 0; i < MAXPLAYERS; i++)
 		{
-			if ( selectedEntity[i] == my || client_selected[i] == my )
+			if ( selectedEntity[i] == my || client_selected[i] == my || i == samExit ) // S.A.M: or a party member carries the party on
 			{
-				if (inrange[i])
+				if (inrange[i] || i == samExit)
 				{
 					for (c = 0; c < MAXPLAYERS; c++)
 					{
@@ -116,6 +118,10 @@ void actLadder(Entity* my)
 							}
 							return;
 						}
+					}
+					if ( !SAMParty::exitsMayClose(my, i) )
+					{
+						return; // S.A.M: a party member the exit waits for is not here yet
 					}
 					if (playercount == 1)
 					{
@@ -354,11 +360,12 @@ void actPortal(Entity* my)
 	}
 
 	// step through portal
+	const int samExit = SAMParty::exitUser(my); // S.A.M: every player is down and a party member reached this exit
 	for (i = 0; i < MAXPLAYERS; i++)
 	{
-		if ( selectedEntity[i] == my || client_selected[i] == my )
+		if ( selectedEntity[i] == my || client_selected[i] == my || i == samExit ) // S.A.M: or a party member carries the party on
 		{
-			if (inrange[i])
+			if (inrange[i] || i == samExit)
 			{
 				for (c = 0; c < MAXPLAYERS; c++)
 				{
@@ -387,6 +394,10 @@ void actPortal(Entity* my)
 						}
 						return;
 					}
+				}
+				if ( !SAMParty::exitsMayClose(my, i) )
+				{
+					return; // S.A.M: a party member the exit waits for is not here yet
 				}
 				if (playercount == 1)
 				{
@@ -602,6 +613,10 @@ void actWinningPortal(Entity* my)
 						}
 						return;
 					}
+				}
+				if ( !SAMParty::exitsMayClose(my, i) )
+				{
+					return; // S.A.M: a party member the exit waits for is not here yet
 				}
 
 				victory = my->portalVictoryType;
@@ -874,6 +889,10 @@ void Entity::actExpansionEndGamePortal()
 						return;
 					}
 				}
+				if ( !SAMParty::exitsMayClose(this, i) )
+				{
+					return; // S.A.M: a party member the exit waits for is not here yet
+				}
 				victory = portalVictoryType;
 
 				if ( multiplayer != CLIENT )
@@ -1086,11 +1105,12 @@ void Entity::actMidGamePortal()
 	}
 
 	// step through portal
+	const int samExit = SAMParty::exitUser(this); // S.A.M: every player is down and a party member reached this exit
 	for ( i = 0; i < MAXPLAYERS; i++ )
 	{
-		if ( selectedEntity[i] == this || client_selected[i] == this )
+		if ( selectedEntity[i] == this || client_selected[i] == this || i == samExit ) // S.A.M: or a party member carries the party on
 		{
-			if ( inrange[i] )
+			if ( inrange[i] || i == samExit )
 			{
 				for ( c = 0; c < MAXPLAYERS; c++ )
 				{
@@ -1119,6 +1139,10 @@ void Entity::actMidGamePortal()
 						}
 						return;
 					}
+				}
+				if ( !SAMParty::exitsMayClose(this, i) )
+				{
+					return; // S.A.M: a party member the exit waits for is not here yet
 				}
 
 				Uint8 cutscene = 0;
@@ -1533,11 +1557,12 @@ void actCustomPortal(Entity* my)
 	}
 
 	// step through portal
+	const int samExit = SAMParty::exitUser(my); // S.A.M: every player is down and a party member reached this exit
 	for ( i = 0; i < MAXPLAYERS; i++ )
 	{
-		if ( selectedEntity[i] == my || client_selected[i] == my )
+		if ( selectedEntity[i] == my || client_selected[i] == my || i == samExit ) // S.A.M: or a party member carries the party on
 		{
-			if ( inrange[i] )
+			if ( inrange[i] || i == samExit )
 			{
 				for ( c = 0; c < MAXPLAYERS; c++ )
 				{
@@ -1566,6 +1591,10 @@ void actCustomPortal(Entity* my)
 						}
 						return;
 					}
+				}
+				if ( !SAMParty::exitsMayClose(my, i) )
+				{
+					return; // S.A.M: a party member the exit waits for is not here yet
 				}
 				if ( playercount == 1 )
 				{

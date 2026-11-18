@@ -22,6 +22,7 @@ static bool samRaceHeadOnMonster(const Entity*) { return false; }
 #endif
 #include <algorithm>
 #include "classdescriptions.hpp" // NUMAPPEARANCES — clamping the network appearance byte
+#include "sam_party.hpp"
 #include "messages.hpp"
 #include "entity.hpp"
 #include "files.hpp"
@@ -6845,6 +6846,7 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		local_rng.seedBytes(&uniqueGameKey, sizeof(uniqueGameKey));
 		net_rng.seedBytes(&uniqueGameKey, sizeof(uniqueGameKey));
 		uniqueLobbyKey = SDLNet_Read32(&net_packet->data[13]);
+		SAMParty::readStartTail(net_packet->data, net_packet->len); // S.A.M: the host's party count, before any map is built
 	    if (net_packet->data[12] == 0) {
 		    loadingsavegame = 0;
 			loadinglobbykey = 0;
