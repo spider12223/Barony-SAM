@@ -25315,7 +25315,7 @@ void Entity::monsterAcquireAttackTarget(const Entity& target, Sint32 state, bool
 				{
 					players[c]->worldUI.worldTooltipDialogue.createDialogueTooltip(getUID(),
 						Player::WorldUI_t::WorldTooltipDialogue_t::DIALOGUE_ATTACK, Language::get(3243),
-						Language::get(4217 + local_rng.uniform(0, 16)), getMonsterLocalizedName(targetStats->type).c_str());
+						Language::get(4217 + local_rng.uniform(0, 16)), getMonsterLocalizedName(targetStats->type, targetStats).c_str());
 				}
 				if (target.behavior == &actPlayer && targetStats->type != HUMAN && targetStats->type != AUTOMATON )
 				{
@@ -25333,11 +25333,11 @@ void Entity::monsterAcquireAttackTarget(const Entity& target, Sint32 state, bool
 							if (local_rng.getU8() % 2) {
 								players[c]->worldUI.worldTooltipDialogue.createDialogueTooltip(getUID(),
 									Player::WorldUI_t::WorldTooltipDialogue_t::DIALOGUE_ATTACK, Language::get(516 + local_rng.uniform(0, 1)),
-									Language::get(4234 + local_rng.uniform(0, 16)), getMonsterLocalizedName(targetStats->type).c_str());
+									Language::get(4234 + local_rng.uniform(0, 16)), getMonsterLocalizedName(targetStats->type, targetStats).c_str());
 							} else {
 								players[c]->worldUI.worldTooltipDialogue.createDialogueTooltip(getUID(),
 									Player::WorldUI_t::WorldTooltipDialogue_t::DIALOGUE_ATTACK, Language::get(518 + local_rng.uniform(0, 1)),
-									Language::get(4217 + local_rng.uniform(0, 16)), getMonsterLocalizedName(targetStats->type).c_str());
+									Language::get(4217 + local_rng.uniform(0, 16)), getMonsterLocalizedName(targetStats->type, targetStats).c_str());
 							}
 						}
 					}
@@ -28515,7 +28515,7 @@ void messagePlayerMonsterEvent(int player, Uint32 color, Stat& monsterStats, con
 		switch (detailType)
 		{
 		case MSG_DESCRIPTION:
-			messagePlayerColor(player, MESSAGE_INSPECTION, color, msgGeneric, getMonsterLocalizedName((Monster)monsterType).c_str());
+			messagePlayerColor(player, MESSAGE_INSPECTION, color, msgGeneric, getMonsterLocalizedName((Monster)monsterType, &monsterStats).c_str());
 			break;
 		case MSG_COMBAT:
 			messagePlayerColor(player, MESSAGE_COMBAT, color, msgGeneric, getMonsterLocalizedName((Monster)monsterType).c_str());
@@ -28576,7 +28576,7 @@ void messagePlayerMonsterEvent(int player, Uint32 color, Stat& monsterStats, con
 			}
 			else
 			{
-				messagePlayerColor(player, MESSAGE_INSPECTION, color, msgNamed, getMonsterLocalizedName((Monster)monsterType).c_str(), monsterStats.name);
+				messagePlayerColor(player, MESSAGE_INSPECTION, color, msgNamed, getMonsterLocalizedName((Monster)monsterType, &monsterStats).c_str(), monsterStats.name);
 			}
 			break;
 		case MSG_COMBAT:

@@ -8091,7 +8091,7 @@ bool StatusEffectQueue_t::doStatusEffectTooltip(StatusEffectQueueEntry_t& entry,
 					{
 						char buf[128];
 						memset(buf, 0, sizeof(buf));
-						snprintf(buf, sizeof(buf), definition.getDesc(0).c_str(), getMonsterLocalizedName(h->playerRace).c_str());
+						snprintf(buf, sizeof(buf), definition.getDesc(0).c_str(), getMonsterLocalizedName(h->playerRace, stats[player]).c_str());
 						std::string descStr = buf;
 						if ( h->wantedLevel == ShopkeeperPlayerHostility.FAILURE_TO_IDENTIFY )
 						{
