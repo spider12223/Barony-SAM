@@ -4909,6 +4909,17 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		int sfx = SDLNet_Read16(&net_packet->data[4]);
 		if ( tmp )
 		{
+			// S.A.M (3.13.0): a player's slot past the game's own sounds is a custom race's emote. Muted
+			// like the game's player noises below; otherwise one of that player's race's own sounds, picked
+			// here, because the slot was numbered by the sender's mod table. (A stock client plays the bare
+			// slot, which is past its table, so it hears nothing.)
+			if ( tmp->behavior == &actPlayer && sfx >= SAMSounds::vanillaCount() )
+			{
+				if ( mute_player_monster_sounds ) { return; }
+				const int p = tmp->skill[2];
+				sfx = ( p >= 0 && p < MAXPLAYERS && stats[p] ) ? SAMRaces::emoteSoundForRace(stats[p]->playerRace) : -1;
+				if ( sfx < 0 ) { return; }
+			}
 			if ( tmp->behavior == &actPlayer && mute_player_monster_sounds )
 			{
 				switch ( sfx )
@@ -9654,10 +9665,18 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 	// client played a sound
 	{'EMOT', [](){
 	    const int player = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
-		const int sfx = SDLNet_Read16(&net_packet->data[5]);
+		int sfx = SDLNet_Read16(&net_packet->data[5]);
 		const int vol = std::min(92, (int)(net_packet->data[7]));
 		if ( players[player] && players[player]->entity )
 		{
+			// S.A.M (3.13.0): a slot past the game's own sounds is a custom race's emote, numbered by the
+			// sender's mod table. Play one of that player's race's own sounds instead, and pass this slot on
+			// as the marker the other S.A.M machines resolve the same way (SNEL).
+			if ( sfx >= SAMSounds::vanillaCount() )
+			{
+				sfx = stats[player] ? SAMRaces::emoteSoundForRace(stats[player]->playerRace) : -1;
+				if ( sfx < 0 ) { return; }
+			}
 			playSoundEntityLocal(players[player]->entity, sfx, vol);
 			for ( int c = 1; c < MAXPLAYERS; ++c )
 			{

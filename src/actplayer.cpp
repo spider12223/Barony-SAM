@@ -4944,6 +4944,9 @@ void Player::PlayerMovement_t::handlePlayerMovement(bool useRefreshRateDelta)
 			PLAYER_VELY *= 0.5;
 		}
 	}
+	// S.A.M (3.13.0): sam_stop_momentum holds this player still. Cleared after every term above, so the
+	// move that follows (actPlayer's clipMove) carries them by none of it. One bool test when nobody is.
+	SAMScriptInput::holdMomentum(my, PLAYER_NUM);
 }
 
 real_t Player::PlayerMovement_t::minimiseMaximiseCameraZ = 0.4;

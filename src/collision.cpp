@@ -22,10 +22,12 @@
 #include "paths.hpp"
 #include "collision.hpp"
 #ifndef EDITOR
-#include "sam_races.hpp"   // isRaceHeadOnMonster (client walk-through fix)
+#include "sam_races.hpp"   // isRaceHeadOnMonster (client walk-through fix); a race's emote sounds
 static bool samRaceHeadOnMonster(const Entity* e) { return SAMRaces::isRaceHeadOnMonster(e); }
+static int samRaceEmoteSound(const Stat* s) { return s ? SAMRaces::emoteSound(*s) : -1; }
 #else
 static bool samRaceHeadOnMonster(const Entity*) { return false; }
+static int samRaceEmoteSound(const Stat*) { return -1; }
 #endif
 #include "prng.hpp"
 #include "player.hpp"
@@ -315,6 +317,17 @@ Entity* entityClicked(bool* clickedOnGUI, bool clickCheckOverride, int player, E
 				default:
 					sfx = 0;
 					break;
+			}
+			// S.A.M (3.13.0): a custom race in its own form says one of its "emote_sounds" instead of its
+			// host body's noise (the human body has none); 0 when none of them can play, which is silence.
+			// Always the five-second wait, the skeleton body's one second included. The slot goes out below as
+			// a marker only: every other machine picks from the race itself (net.cpp EMOT, SNEL), because a
+			// mod's sound slot number is not the same on every machine.
+			const int samEmote = samRaceEmoteSound(stats[player]);
+			if ( samEmote >= 0 )
+			{
+				sfx = samEmote;
+				players[player]->movement.monsterEmoteGimpTimer = TICKS_PER_SECOND * 5;
 			}
 
 			//Tell the server we made a noise.
