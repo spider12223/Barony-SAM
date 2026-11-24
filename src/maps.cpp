@@ -24,6 +24,7 @@
 #include "interface/interface.hpp"
 #include "book.hpp"
 #include "net.hpp"
+#include "sam_party.hpp"
 #include "paths.hpp"
 #include "collision.hpp"
 #include "player.hpp"
@@ -4757,14 +4758,7 @@ int generateDungeon(char* levelset, Uint32 seed, std::tuple<int, int, int, int> 
 				if ( map_rng.rand() % 2 || nodecoration )
 				{
 					// balance for total number of players
-					int balance = 0;
-					for ( i = 0; i < MAXPLAYERS; i++ )
-					{
-						if ( !client_disconnected[i] )
-						{
-							balance++;
-						}
-					}
+					int balance = SAMParty::balancePlayers(); // S.A.M: connected players plus this run's party count
 					switch ( balance )
 					{
 						case 1:
@@ -7084,14 +7078,7 @@ void assignActions(map_t* map)
 	map_rng.seedBytes(&mapseed, sizeof(mapseed));
 	map_server_rng.seedBytes(&mapseed, sizeof(mapseed));
 
-	int balance = 0;
-	for ( int i = 0; i < MAXPLAYERS; i++ )
-	{
-		if ( !client_disconnected[i] )
-		{
-			balance++;
-		}
-	}
+	int balance = SAMParty::balancePlayers(); // S.A.M: connected players plus this run's party count
 
 	bool customMonsterCurveExists = false;
 	monsterCurveCustomManager.followersToGenerateForLeaders.clear();

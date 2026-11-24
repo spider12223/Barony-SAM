@@ -4,6 +4,8 @@
 #include "sam_menu_badge.h" // embedded S.A.M badge icon PNG (extracted at runtime)
 #include <algorithm>
 #include "MainMenu.hpp"
+#include "sam_lobby.hpp"
+#include "sam_party.hpp"
 #include "Frame.hpp"
 #include "Image.hpp"
 #include "Field.hpp"
@@ -1008,6 +1010,9 @@ namespace MainMenu {
 	static void createStartButton(int index);
 	static void createInviteButton(int index);
 	static void createWaitingStone(int index);
+	static void createSamCardStone(int index);            // S.A.M: a mod's card in a slot it claimed
+	static void addSamSlotActions(Frame* card, int index); // S.A.M: "+ Add Companion" and friends
+	static void installSamLobbyUi();                       // S.A.M: the engine half of sam_lobby
 	static void createReadyStone(int index, bool local, bool ready);
 	static void createCountdownTimer();
 	static void createLobby(LobbyType);
@@ -11767,6 +11772,9 @@ bind_failed:
 	}
 
 	static void lockSlot(int index, bool locked) {
+	    if (SAMLobby::isClaimed(index)) {
+	        return; // S.A.M: a slot a mod holds ignores the player-count setting until the mod gives it back
+	    }
 	    if (multiplayer == SERVER) {
 	        playerSlotsLocked[index] = locked;
 	        if (locked) {
@@ -12112,6 +12120,11 @@ bind_failed:
 		// network scan
 		{'SCAN', [](){
 		    handleScanPacket();
+		}},
+
+		// S.A.M: a client's lobby says hello (framework/sam_lobby.hpp)
+		{'SAML', [](){
+		    SAMLobby::receiveOnHost(net_packet->data, net_packet->len);
 		}},
 
 		// update player attributes
@@ -12475,12 +12488,14 @@ bind_failed:
 					sendSvFlagsOverNet();
 					sendCustomScenarioOverNet(playerNum);
 					SAMSync::sendFingerprint(playerNum); // S.A.M: mod fingerprint for sync check
+					SAMLobby::playerJoined(playerNum); // S.A.M: a new client has not said hello yet
 				}
 				else if ( result == NetworkingLobbyJoinRequestResult::NET_LOBBY_JOIN_DIRECTIP_SUCCESS )
 				{
 					sendSvFlagsOverNet();
 					sendCustomScenarioOverNet(playerNum);
 					SAMSync::sendFingerprint(playerNum); // S.A.M: mod fingerprint for sync check
+					SAMLobby::playerJoined(playerNum); // S.A.M: a new client has not said hello yet
 				}
 
 			    // assume success after this point
@@ -12510,6 +12525,12 @@ bind_failed:
 	}
 
 	static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
+	    // S.A.M: a mod's card in a lobby slot (framework/sam_lobby.hpp)
+	    {'SAML', [](){
+	        SAMLobby::receiveOnClient(net_packet->data, net_packet->len);
+	        checkReadyStates();
+	    }},
+
 	    // game start
 	    {'STRT', [](){
             destroyMainMenu();
@@ -12517,6 +12538,7 @@ bind_failed:
 	        lobbyWindowSvFlags = SDLNet_Read32(&net_packet->data[4]);
 	        uniqueGameKey = SDLNet_Read32(&net_packet->data[8]);
 			uniqueLobbyKey = SDLNet_Read32(&net_packet->data[13]);
+			SAMParty::readStartTail(net_packet->data, net_packet->len); // S.A.M: the host's party count, before any map is built
 	        local_rng.seedBytes(&uniqueGameKey, sizeof(uniqueGameKey));
 	        net_rng.seedBytes(&uniqueGameKey, sizeof(uniqueGameKey));
 	        beginFade(FadeDestination::GameStart);
@@ -12689,6 +12711,7 @@ bind_failed:
 			// Answer regardless of whether it matched: the host is asking "are you running
 			// S.A.M at all", and a mismatch still means yes.
 			SAMSync::acknowledgeFingerprint();
+			SAMLobby::hostShownSam(); // the host runs S.A.M: now the lobby hello may go
 			if ( !SAMSync::hasMismatch() )
 			{
 				return; // fingerprints match — logged, nothing to show
@@ -18935,6 +18958,10 @@ failed:
 	}
 
 	static void createLockedStone(int index) {
+		if (SAMLobby::isClaimed(index)) {
+			createSamCardStone(index); // S.A.M: a claimed slot is locked, so every redraw lands here
+			return;
+		}
 	    if (multiplayer == SERVER) {
 	        newPlayer[index] = true;
 	    }
@@ -19305,6 +19332,9 @@ failed:
             }
 #endif
 		    });
+		if (currentLobbyType == LobbyType::LobbyLocal) {
+			addSamSlotActions(card, index); // S.A.M
+		}
 	}
 
 	static void createInviteButton(int index) {
@@ -19370,6 +19400,7 @@ failed:
 		invite->setBorderColor(0);
 		invite->setHighlightColor(0);
 		invite->setCallback([](Button&){buttonInviteFriends(NULL);});
+		addSamSlotActions(card, index); // S.A.M
 	}
 
 	static void createWaitingStone(int index) {
@@ -19426,6 +19457,246 @@ failed:
 		text->setSize(SDL_Rect{(card->getSize().w - 200) / 2, card->getSize().h / 2, 200, 50});
 		text->setVJustify(Field::justify_t::TOP);
 		text->setHJustify(Field::justify_t::CENTER);
+		addSamSlotActions(card, index); // S.A.M
+	}
+
+	/*-------------------------------------------------------------------------
+		S.A.M: mod-owned lobby slots (framework/sam_lobby.hpp).
+		A mod puts a link on every empty slot ("+ Add Companion") and a card of
+		its own in a slot it claims. The host's card has controls; a S.A.M
+		client draws the same card read-only; a stock client sees a locked slot.
+	-------------------------------------------------------------------------*/
+
+	// slot | row << 8 | sub << 16, where sub is a button's index or one of these.
+	static constexpr int samSubPrev = 0xFE;
+	static constexpr int samSubNext = 0xFF;
+	static inline void* samPack(int slot, int row, int sub) {
+		return (void*)(intptr_t)((slot & 0xFF) | ((row & 0xFF) << 8) | ((sub & 0xFF) << 16));
+	}
+	static inline int samSlotOf(Widget& w) { return (int)(reinterpret_cast<intptr_t>(w.getUserData()) & 0xFF); }
+	static inline int samRowOf(Widget& w) { return (int)((reinterpret_cast<intptr_t>(w.getUserData()) >> 8) & 0xFF); }
+	static inline int samSubOf(Widget& w) { return (int)((reinterpret_cast<intptr_t>(w.getUserData()) >> 16) & 0xFF); }
+
+	// Whatever this slot shows when nobody is in it, rebuilt. Each builder checks the lock
+	// itself, and createLockedStone draws the mod's card for a claimed slot.
+	static void samRebuildEmptySlot(int index) {
+		if (SAMLobby::isClaimed(index) || playerSlotsLocked[index]) {
+			createLockedStone(index);
+		} else if (currentLobbyType == LobbyType::LobbyLocal) {
+			createStartButton(index);
+		} else if (directConnect) {
+			createWaitingStone(index);
+		} else {
+			createInviteButton(index);
+		}
+	}
+
+	static void samSlotChanged(int slot) {
+		if (!main_menu_frame || !main_menu_frame->findFrame("lobby")) {
+			return;
+		}
+		if (slot > 0 && slot < MAXPLAYERS && client_disconnected[slot]) {
+			samRebuildEmptySlot(slot);
+			checkReadyStates();
+		}
+	}
+
+	static bool samSlotOpen(int slot) {
+		if (slot <= 0 || slot >= MAXPLAYERS || loadingsavegame || !client_disconnected[slot]) {
+			return false;
+		}
+		// a slot the player-count setting locked is closed, unless a mod already holds it
+		return !playerSlotsLocked[slot] || SAMLobby::isClaimed(slot);
+	}
+
+	// Lock or free a slot, and tell every client with vanilla 'LOCK', whose handler every
+	// build has: a stock client then draws a locked slot, and nobody can join into it.
+	static void samSetSlotLocked(int slot, bool locked) {
+		if (slot <= 0 || slot >= MAXPLAYERS) {
+			return;
+		}
+		playerSlotsLocked[slot] = locked;
+		if (multiplayer != SERVER) {
+			return;
+		}
+		newPlayer[slot] = true;
+		for (int c = 1; c < MAXPLAYERS; ++c) {
+			if (client_disconnected[c]) {
+				continue;
+			}
+			memcpy(net_packet->data, "LOCK", 4);
+			net_packet->data[4] = (Uint8)slot;
+			net_packet->data[5] = locked ? 1 : 0;
+			net_packet->len = 6;
+			net_packet->address.host = net_clients[c - 1].host;
+			net_packet->address.port = net_clients[c - 1].port;
+			sendPacketSafe(net_sock, -1, net_packet, c - 1);
+		}
+	}
+
+	static void samChat(const char* text) {
+		if (main_menu_frame && main_menu_frame->findFrame("lobby")) {
+			addLobbyChatMessage(uint32ColorBaronyBlue, text);
+		}
+	}
+
+	static void installSamLobbyUi() {
+		SAMLobby::Ui ui;
+		ui.slotChanged = samSlotChanged;
+		ui.slotOpen = samSlotOpen;
+		ui.setSlotLocked = samSetSlotLocked;
+		ui.chat = samChat;
+		SAMLobby::setUi(ui);
+	}
+
+	// The host's links on an empty slot, one per mod action ("+ Add Companion").
+	static void addSamSlotActions(Frame* card, int index) {
+		if (!card || index <= 0 || index >= MAXPLAYERS || multiplayer == CLIENT || loadingsavegame) {
+			return;
+		}
+		if (gameModeManager.getMode() == GameModeManager_t::GAME_MODE_TUTORIAL) {
+			return;
+		}
+		const auto& actions = SAMLobby::slotActions();
+		const int shown = std::min((int)actions.size(), SAMLobby::SHOWN_ACTIONS);
+		for (int i = 0; i < shown; ++i) {
+			auto button = card->addButton((std::string("sam_action") + std::to_string(i)).c_str());
+			button->setText(actions[i].label.c_str());
+			button->setFont(smallfont_outline);
+			button->setSize(SDL_Rect{(card->getSize().w - 200) / 2, card->getSize().h - 26 - 18 * (shown - 1 - i), 200, 16});
+			button->setVJustify(Button::justify_t::TOP);
+			button->setHJustify(Button::justify_t::CENTER);
+			button->setBorder(0);
+			button->setColor(0);
+			button->setBorderColor(0);
+			button->setHighlightColor(0);
+			button->setTextColor(makeColor(166, 123, 81, 255));
+			button->setTextHighlightColor(makeColor(255, 220, 150, 255));
+			button->setOwner(clientnum);
+			button->setUserData(samPack(index, 0, i));
+			button->setCallback([](Button& button) {
+				soundActivate();
+				SAMLobby::runSlotAction(samSubOf(button), samSlotOf(button));
+			});
+		}
+	}
+
+	static Button* addSamCardButton(Frame* card, const std::string& name, const char* text, SDL_Rect size, void* data) {
+		auto button = card->addButton(name.c_str());
+		button->setText(text);
+		button->setFont(smallfont_outline);
+		button->setSize(size);
+		button->setJustify(Button::justify_t::CENTER);
+		button->setBorder(0);
+		button->setColor(makeColor(52, 30, 22, 255));
+		button->setBorderColor(0);
+		button->setHighlightColor(makeColor(92, 56, 38, 255));
+		button->setTextColor(makeColor(166, 123, 81, 255));
+		button->setTextHighlightColor(makeColor(255, 220, 150, 255));
+		button->setOwner(clientnum);
+		button->setUserData(data);
+		button->setCallback([](Button& button) {
+			soundActivate();
+			const int slot = samSlotOf(button), row = samRowOf(button), sub = samSubOf(button);
+			// Read the control at press time: every change to the card redraws it, so the
+			// row the button was drawn from is the row the card has now.
+			const auto& c = SAMLobby::card(slot);
+			if (row >= (int)c.rows.size()) {
+				return;
+			}
+			const auto& r = c.rows[row];
+			if (sub == samSubPrev || sub == samSubNext) {
+				SAMLobby::cardInput(slot, r.control, sub == samSubPrev ? "prev" : "next", "");
+			} else if (sub < (int)r.buttons.size()) {
+				SAMLobby::cardInput(slot, r.buttons[sub], "click", "");
+			}
+		});
+		return button;
+	}
+
+	static Field* addSamCardText(Frame* card, const std::string& name, const char* text, SDL_Rect size) {
+		auto field = card->addField(name.c_str(), 160);
+		field->setText(text);
+		field->setFont(smallfont_outline);
+		field->setSize(size);
+		field->setJustify(Field::justify_t::CENTER);
+		field->setColor(makeColor(166, 123, 81, 255));
+		return field;
+	}
+
+	static void createSamCardStone(int index) {
+		if (multiplayer == SERVER) {
+			newPlayer[index] = true;
+		}
+		auto lobby = main_menu_frame ? main_menu_frame->findFrame("lobby") : nullptr;
+		if (!lobby) {
+			return;
+		}
+		auto card = lobby->findFrame((std::string("card") + std::to_string(index)).c_str());
+		if (card) {
+			card->removeSelf();
+		}
+		const auto& samCard = SAMLobby::card(index);
+		const bool host = multiplayer != CLIENT;
+
+		const int pos = (Frame::virtualScreenX / 8) * (index * 2 + 1);
+		card = lobby->addFrame((std::string("card") + std::to_string(index)).c_str());
+		card->setSize(SDL_Rect{pos - 280 / 2, Frame::virtualScreenY - 146 - 100, 280, 146});
+		card->setActualSize(SDL_Rect{0, 0, card->getSize().w, card->getSize().h});
+		card->setColor(0);
+		card->setBorder(0);
+
+		// The empty-slot backdrop, so checkReadyStates counts no human in this slot.
+		(void)card->addImage(
+			card->getActualSize(),
+			0xffffffff,
+			"*images/ui/Main Menus/Play/PlayerCreation/UI_Invite_Window00.png",
+			"backdrop"
+		);
+
+		if (host && samCard.editTitle) {
+			auto title = card->addField("sam_title", SAMLobby::MAX_TITLE + 1);
+			title->setFont(smallfont_outline);
+			title->setText(samCard.title.c_str());
+			title->setSize(SDL_Rect{40, 24, 200, 20});
+			title->setColor(playerColor(index, colorblind_lobby, false));
+			title->setBackgroundColor(makeColor(52, 30, 22, 255));
+			title->setBackgroundSelectAllColor(makeColor(52, 30, 22, 255));
+			title->setBackgroundActivatedColor(makeColor(52, 30, 22, 255));
+			title->setHJustify(Field::justify_t::CENTER);
+			title->setVJustify(Field::justify_t::CENTER);
+			title->setEditable(true);
+			title->setOwner(clientnum);
+			title->setUserData(samPack(index, 0, 0));
+			title->setCallback([](Field& field) {
+				SAMLobby::cardInput(samSlotOf(field), "title", "text", field.getText());
+			});
+		} else {
+			auto title = addSamCardText(card, "sam_title", samCard.title.c_str(), SDL_Rect{40, 24, 200, 20});
+			title->setColor(playerColor(index, colorblind_lobby, false));
+		}
+
+		int y = 48;
+		for (int r = 0; r < (int)samCard.rows.size(); ++r) {
+			const auto& row = samCard.rows[r];
+			const std::string id = std::string("sam_row") + std::to_string(r);
+			if (!host || row.kind == SAMLobby::Row::Kind::Text) {
+				(void)addSamCardText(card, id, row.text.c_str(), SDL_Rect{20, y, 240, 16});
+			} else if (row.kind == SAMLobby::Row::Kind::Cycle) {
+				(void)addSamCardButton(card, id + "_prev", "<", SDL_Rect{40, y, 22, 16}, samPack(index, r, samSubPrev));
+				(void)addSamCardText(card, id, row.text.c_str(), SDL_Rect{64, y, 152, 16});
+				(void)addSamCardButton(card, id + "_next", ">", SDL_Rect{218, y, 22, 16}, samPack(index, r, samSubNext));
+			} else {
+				const int count = std::max(1, (int)row.buttons.size());
+				const int gap = 4;
+				const int width = (200 - gap * (count - 1)) / count;
+				for (int b = 0; b < (int)row.buttons.size(); ++b) {
+					(void)addSamCardButton(card, id + "_b" + std::to_string(b), row.labels[b].c_str(),
+						SDL_Rect{40 + b * (width + gap), y, width, 16}, samPack(index, r, b));
+				}
+			}
+			y += 18;
+		}
 	}
 
 	static void checkReadyStates() {
@@ -19691,6 +19962,7 @@ failed:
 			}
 			uniqueLobbyKey = local_rng.getU32();
 	        net_rng.seedBytes(&uniqueGameKey, sizeof(uniqueGameKey));
+			SAMParty::beginRun(); // S.A.M: decide this run's party count before the start signal
 
 			printlog("Starting game, game seed: %lu", uniqueGameKey);
 
@@ -19712,6 +19984,7 @@ failed:
 		            net_packet->address.host = net_clients[c - 1].host;
 		            net_packet->address.port = net_clients[c - 1].port;
 		            net_packet->len = 17;
+		            SAMParty::writeStartTail(net_packet->data, net_packet->len); // S.A.M: the party count rides after vanilla's 17 bytes
 		            sendPacketSafe(net_sock, -1, net_packet, c - 1);
 	            }
 	        }
@@ -19811,6 +20084,7 @@ failed:
 	static void createLobby(LobbyType type) {
 		destroyMainMenu();
 		createDummyMainMenu();
+		installSamLobbyUi(); // S.A.M: before any stone is drawn
 
 #ifdef NINTENDO
 		if (type != LobbyType::LobbyLocal) {
@@ -21155,6 +21429,11 @@ failed:
                 }
             }
 		}
+
+		// S.A.M: last, so a mod's card lands on stones that exist. Host: lobby.on_lobby_opened.
+		// Client: say hello, so the host sends its cards.
+		SAMParty::lobbyOpened();
+		SAMLobby::lobbyOpened(loadingsavegame != 0);
 	}
 
 	static void createControllerPrompt(int index, bool multiple_players, void (*after_func)()) {
@@ -26606,6 +26885,7 @@ failed:
 				}
 				uniqueLobbyKey = local_rng.getU32();
 				net_rng.seedBytes(&uniqueGameKey, sizeof(uniqueGameKey));
+				SAMParty::beginRun(); // S.A.M: the restarted run counts the same party
 
 				if (multiplayer == SERVER) {
                     for (int c = 1; c < MAXPLAYERS; c++) {
@@ -26623,6 +26903,7 @@ failed:
 	                    net_packet->address.host = net_clients[c - 1].host;
 	                    net_packet->address.port = net_clients[c - 1].port;
 	                    net_packet->len = 17;
+	                    SAMParty::writeStartTail(net_packet->data, net_packet->len); // S.A.M: the party count rides after vanilla's 17 bytes
 	                    sendPacketSafe(net_sock, -1, net_packet, c - 1);
                     }
 				}
@@ -28517,6 +28798,9 @@ failed:
 				break;
 			}
 		}
+		if ( SAMParty::partyCarriesOn() ) {
+			survivingPlayer = true; // S.A.M: a party member still standing can take the party to the exit
+		}
 
         // determine if we made highscore list
         int placement = 1;
@@ -28535,6 +28819,7 @@ failed:
 		// S.A.M: the run is over and the score is settled. Fired before the window is built
 		// so a mod can record the outcome while the numbers are still in scope. Not
 		// cancellable: the run has already ended by the time anything reaches here.
+		if ( !SAMParty::partyCarriesOn() ) // the window that offers Dismiss while the party carries on is not the end: the final one fires it
 		{
 			SamEvent samOverEv("player.on_game_over");
 			samOverEv.i("player", (long long)player)
@@ -28864,6 +29149,7 @@ failed:
 				}
 				uniqueLobbyKey = local_rng.getU32();
 				net_rng.seedBytes(&uniqueGameKey, sizeof(uniqueGameKey));
+				SAMParty::beginRun(); // S.A.M: the restarted run counts the same party
 
 				if ( multiplayer == SERVER ) {
 					for ( int c = 1; c < MAXPLAYERS; c++ ) {
@@ -28881,6 +29167,7 @@ failed:
 						net_packet->address.host = net_clients[c - 1].host;
 						net_packet->address.port = net_clients[c - 1].port;
 						net_packet->len = 17;
+						SAMParty::writeStartTail(net_packet->data, net_packet->len); // S.A.M: the party count rides after vanilla's 17 bytes
 						sendPacketSafe(net_sock, -1, net_packet, c - 1);
 					}
 				}

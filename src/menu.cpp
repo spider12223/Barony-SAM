@@ -29,6 +29,8 @@
 #include "scores.hpp"
 #include "menu.hpp"
 #include "net.hpp"
+#include "sam_lobby.hpp"
+#include "sam_party.hpp"
 #ifdef STEAMWORKS
 #include <steam/steam_api.h>
 #include "steam.hpp"
@@ -9179,6 +9181,15 @@ void doNewGame(bool makeHighscore) {
         createChunks();
 
 		achievementObserver.updateData();
+
+		// S.A.M: the lobby is gone (its cards and peers), and on the host a new run forgets the
+		// party members waiting to come back. The run's party count is NOT reset here: the map
+		// above was built with it, and every later floor needs the same number.
+		SAMLobby::lobbyClosed();
+		if ( multiplayer != CLIENT )
+		{
+			SAMParty::clear();
+		}
 
 		if ( loadingsavegame )
 		{

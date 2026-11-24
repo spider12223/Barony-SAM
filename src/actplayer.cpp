@@ -22,6 +22,7 @@
 #include "scores.hpp"
 #include "monster.hpp"
 #include "net.hpp"
+#include "sam_party.hpp"
 #include "collision.hpp"
 #include "player.hpp"
 #include "colors.hpp"
@@ -1602,6 +1603,10 @@ bool Player::Ghost_t::gamemodeAllowsGhosts()
 		|| (multiplayer == SINGLE && splitscreen) )
 	{
 		return true;
+	}
+	if ( SAMParty::partyCarriesOn() )
+	{
+		return true; // S.A.M: solo with party members still standing: wait as a ghost, like co-op
 	}
 	return false;
 }
@@ -3345,7 +3350,8 @@ void actDeathCam(Entity* my)
 		}
 		else if ( !(players[DEATHCAM_PLAYERNUM]->ghost.isActive() 
 			|| (players[DEATHCAM_PLAYERNUM]->entity && players[DEATHCAM_PLAYERNUM]->entity->playerCreatedDeathCam == 0) )
-			&& DEATHCAM_DISABLE_GAMEOVER == 0 )
+			&& DEATHCAM_DISABLE_GAMEOVER == 0
+			&& !players[DEATHCAM_PLAYERNUM]->GUI.isGameoverActive() ) // S.A.M: the party code may have opened it already
 		{
 			MainMenu::openGameoverWindow(DEATHCAM_PLAYERNUM);
 		}
@@ -6211,6 +6217,82 @@ void playerDebugTests(Entity* my)
 		}
 	}
 #endif
+}
+
+// S.A.M: the party that carried the run on has fallen (or is gone) with every player already down.
+// What a death with nobody left standing does in vanilla, once, now that it is true: the save goes,
+// the game-over music plays, and the scores are posted. (sam_party.cpp, host and clients alike.)
+void samOnAllPlayersDead();
+
+void samPartyWiped()
+{
+	if ( gameModeManager.allowsSaves() )
+	{
+		if ( multiplayer == SINGLE )
+		{
+			deleteSaveGame(multiplayer);   // every player is down, so splitscreen too
+		}
+		else
+		{
+			deleteMultiplayerSaveGames();   // host only; it checks that no player is left standing
+		}
+	}
+#ifdef SOUND
+	playMusic(gameovermusic, false, true, false);
+#endif
+	samOnAllPlayersDead();
+}
+
+// Every player is down and nothing carries the run on: the one-time "all dead" bookkeeping
+// (online scores here, and on each client by DEND). S.A.M: a function of its own so the
+// party code can run it when the last member standing falls after the players (sam_party.cpp).
+void samOnAllPlayersDead()
+{
+	if ( AchievementObserver::PlayerAchievements::allPlayersDeadEvent )
+	{
+		return;
+	}
+	AchievementObserver::PlayerAchievements::allPlayersDeadEvent = true;
+
+	// post online scores
+	if ( gameModeManager.allowsGlobalHiscores() )
+	{
+		if ( splitscreen )
+		{
+			for ( int c = 0; c < MAXPLAYERS; ++c ) {
+				if ( !client_disconnected[c] ) {
+#ifdef USE_PLAYFAB
+					if ( c == 0 )
+					{
+						playfabUser.postScore(c);
+					}
+#endif
+				}
+			}
+		}
+		else
+		{
+#ifdef USE_PLAYFAB
+			playfabUser.postScore(clientnum);
+#endif
+		}
+
+		if ( multiplayer == SERVER )
+		{
+			for ( int i = 1; i < MAXPLAYERS; ++i )
+			{
+				if ( client_disconnected[i] )
+				{
+					continue;
+				}
+				strcpy((char*)net_packet->data, "DEND"); //Post your hiscores here, we're all dead
+				net_packet->address.host = net_clients[i - 1].host;
+				net_packet->address.port = net_clients[i - 1].port;
+				net_packet->len = 4;
+				sendPacketSafe(net_sock, -1, net_packet, i - 1);
+			}
+		}
+	}
 }
 
 void actPlayer(Entity* my)
@@ -11336,6 +11418,10 @@ void actPlayer(Entity* my)
 							{
 								myFollower = uidToEntity(*c);
 							}
+							if ( myFollower && SAMParty::isMember(myFollower) )
+							{
+								continue; // S.A.M: a party member stays with the party when its leader falls
+							}
 							if ( myFollower )
 							{
 								if ( myFollower->monsterAllySummonRank != 0 )
@@ -11413,7 +11499,8 @@ void actPlayer(Entity* my)
 							}
 							node_t* nextnode;
 
-							if ( gameModeManager.allowsSaves() )
+							// S.A.M: not while the party carries the run on; the save goes when it is wiped (samPartyWiped)
+							if ( gameModeManager.allowsSaves() && !SAMParty::partyCarriesOn() )
 							{
 								if ( multiplayer == SINGLE )
 								{
@@ -11471,7 +11558,7 @@ void actPlayer(Entity* my)
 								}
 							}
 
-							if (allDead)
+							if (allDead && !SAMParty::partyCarriesOn()) // S.A.M: the run goes on; samPartyWiped plays it at the end
 							{
 								playMusic(gameovermusic, false, true, false);
 							}
@@ -11491,7 +11578,10 @@ void actPlayer(Entity* my)
 								}
 							}
 
-							if ( (multiplayer == SINGLE && !splitscreen) || !keepInventoryGlobal )
+							// S.A.M: a solo player whose party carries the run on gets up again on the next
+							// floor, so Keep Inventory decides here as it does in co-op, not the solo rule.
+							const bool samSoloDrop = (multiplayer == SINGLE && !splitscreen) && !SAMParty::partyCarriesOn();
+							if ( samSoloDrop || !keepInventoryGlobal )
 							{
 								for ( node = stats[PLAYER_NUM]->inventory.first; node != nullptr; node = nextnode )
 								{
@@ -11508,7 +11598,7 @@ void actPlayer(Entity* my)
 											steamAchievement("BARONY_ACH_CHOSEN_ONE");
 										}
 									}
-									if ( (multiplayer == SINGLE && !splitscreen) )
+									if ( samSoloDrop )
 									{
 										int c = item->count;
 										for ( c = item->count; c > 0; c-- )
@@ -11675,7 +11765,10 @@ void actPlayer(Entity* my)
 								}
 							}
 
-							deleteMultiplayerSaveGames(); //Will only delete save games if was last player alive.
+							if ( !SAMParty::partyCarriesOn() ) // S.A.M: not while the party carries the run on; samPartyWiped deletes it at the end
+							{
+								deleteMultiplayerSaveGames(); //Will only delete save games if was last player alive.
+							}
 						}
 
 						if ( players[PLAYER_NUM]->isLocalPlayer() || multiplayer == SERVER )
@@ -11717,49 +11810,13 @@ void actPlayer(Entity* my)
 								allDead = false;
 							}
 						}
-						if ( allDead && !AchievementObserver::PlayerAchievements::allPlayersDeadEvent )
+						if ( allDead && SAMParty::partyCarriesOn() )
 						{
-							AchievementObserver::PlayerAchievements::allPlayersDeadEvent = true;
-
-							// post online scores
-							if ( gameModeManager.allowsGlobalHiscores() )
-							{
-								if ( splitscreen )
-								{
-									for ( int c = 0; c < MAXPLAYERS; ++c ) {
-										if ( !client_disconnected[c] ) {
-#ifdef USE_PLAYFAB
-											if ( c == 0 )
-											{
-												playfabUser.postScore(c);
-											}
-#endif
-										}
-									}
-								}
-								else
-								{
-#ifdef USE_PLAYFAB
-									playfabUser.postScore(clientnum);
-#endif
-								}
-
-								if ( multiplayer == SERVER )
-								{
-									for ( int i = 1; i < MAXPLAYERS; ++i )
-									{
-										if ( client_disconnected[i] )
-										{
-											continue;
-										}
-										strcpy((char*)net_packet->data, "DEND"); //Post your hiscores here, we're all dead
-										net_packet->address.host = net_clients[i - 1].host;
-										net_packet->address.port = net_clients[i - 1].port;
-										net_packet->len = 4;
-										sendPacketSafe(net_sock, -1, net_packet, i - 1);
-									}
-								}
-							}
+							allDead = false; // S.A.M: party members still standing carry the run on
+						}
+						if ( allDead )
+						{
+							samOnAllPlayersDead();
 						}
 					}
 					my->removeLightField();

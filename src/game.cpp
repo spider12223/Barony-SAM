@@ -29,6 +29,8 @@
 #include "scores.hpp"
 #include "menu.hpp"
 #include "net.hpp"
+#include "sam_party.hpp"
+#include "sam_ally_items.hpp"
 #ifdef STEAMWORKS
 #include <steam/steam_api.h>
 #include "steam.hpp"
@@ -2647,6 +2649,7 @@ void gameLogic(void)
 						}
 						list_FreeAll(&tempFollowers[c]);
 					}
+					SAMParty::respawnFallen(); // S.A.M: fallen party members rejoin beside their leaders
 
 					// Re-send the player totals and the XP curve: a client that joined mid-run has
 					// never seen them, and this runs on every floor entry, the first one included.
@@ -5447,6 +5450,8 @@ bool handleEvents(void)
 			// S.A.M: the multiplayer channels, on every machine, after the scripts have run:
 			// apply what arrived (in order), then send what this tick queued. No-op with no
 			// script loaded or outside multiplayer.
+			SAMParty::tick(); // S.A.M: a party that carried the run on and is gone, without a death to say so
+			SAMAllyItems::tick(); // S.A.M: item moves between a player and an ally wait for this tick
 			SAMNet::tick();
 		}
 		else

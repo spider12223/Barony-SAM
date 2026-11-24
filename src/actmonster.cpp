@@ -22,6 +22,7 @@
 #include "interface/interface.hpp"
 #include "magic/magic.hpp"
 #include "net.hpp"
+#include "sam_party.hpp"
 #include "paths.hpp"
 #include "collision.hpp"
 #include "player.hpp"
@@ -1751,7 +1752,8 @@ bool makeFollower(int monsterclicked, bool ringconflict, char namesays[64],
 				if ( followerStats )
 				{
 					if ( !(followerStats->type == SENTRYBOT || followerStats->type == GYROBOT
-						|| followerStats->type == SPELLBOT || followerStats->type == DUMMYBOT) )
+						|| followerStats->type == SPELLBOT || followerStats->type == DUMMYBOT)
+						&& !SAMParty::isMember(followerStats) ) // S.A.M: a party member is not a recruit
 					{
 						++numFollowers;
 					}
@@ -1967,7 +1969,8 @@ bool makeFollower(int monsterclicked, bool ringconflict, char namesays[64],
 						if ( followerStats )
 						{
 							if ( !(followerStats->type == SENTRYBOT || followerStats->type == GYROBOT
-								|| followerStats->type == SPELLBOT || followerStats->type == DUMMYBOT) )
+								|| followerStats->type == SPELLBOT || followerStats->type == DUMMYBOT)
+								&& !SAMParty::isMember(followerStats) ) // S.A.M: a party member is not a recruit
 							{
 								++numFollowers;
 							}
@@ -3835,6 +3838,7 @@ void actMonster(Entity* my)
 				.i("killer_uid", samKillerUid).i("floor", samDiedFloor);
 			SAMJs::dispatchEvent(jsev);
 		}
+		SAMParty::onDeath(my, myStats); // S.A.M: a party member may come back next floor (before the gear drops)
 
 		//TODO: Refactor die function.
 		// drop all equipment
@@ -5000,10 +5004,11 @@ void actMonster(Entity* my)
 
 	if ( my->getUID() % TICKS_PER_SECOND == ticks % TICKS_PER_SECOND )
 	{
+		SAMParty::think(my, myStats); // S.A.M: with every player down, party members make for the exit
 		if ( myStats && myStats->leader_uid != 0 )
 		{
 			Entity* leader = uidToEntity(myStats->leader_uid);
-			if ( !leader && my->flags[USERFLAG2] )
+			if ( !leader && my->flags[USERFLAG2] && !SAMParty::isMember(myStats) ) // S.A.M: a party member stays an ally
 			{
 				my->flags[USERFLAG2] = false;
 				serverUpdateEntityFlag(my, USERFLAG2);
@@ -9170,8 +9175,8 @@ timeToGoAgain:
 			++my->monsterSpecialTimer;
 			if ( my->monsterSpecialTimer == 20 ) // start the spawn animations
 			{
-				int numToSpawn = 2;
-				int numPlayers = 0;
+				int numToSpawn = 2 + SAMParty::runDifficultyCount(); // S.A.M: party members the run counts as players
+				int numPlayers = SAMParty::runDifficultyCount();
 				std::vector<int> alivePlayers;
 				for ( int c = 0; c < MAXPLAYERS; ++c )
 				{
