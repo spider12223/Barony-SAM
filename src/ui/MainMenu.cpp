@@ -11771,8 +11771,13 @@ bind_failed:
 	    }
 	}
 
+	// S.A.M: what the player-count setting says of a slot while a mod holds it; the slot takes it
+	// when the mod gives it back (samSetSlotLocked)
+	static bool samSlotWantsLock[MAXPLAYERS] = {};
+
 	static void lockSlot(int index, bool locked) {
 	    if (SAMLobby::isClaimed(index)) {
+	        samSlotWantsLock[index] = locked;
 	        return; // S.A.M: a slot a mod holds ignores the player-count setting until the mod gives it back
 	    }
 	    if (multiplayer == SERVER) {
@@ -12392,6 +12397,10 @@ bind_failed:
 #endif // USE_EOS
 				}
 			}
+
+			// S.A.M: where this datagram really came from, before handleSafePacket overwrites the address
+			// (a direct connection only); the lobby hello is checked against it (sam_lobby.cpp)
+			SAMLobby::noteSource(directConnect, net_packet->address.host, net_packet->address.port);
 
             // unwrap a packet if it's marked "safe"
 			if (handleSafePacket()) {
@@ -19514,6 +19523,12 @@ failed:
 	static void samSetSlotLocked(int slot, bool locked) {
 		if (slot <= 0 || slot >= MAXPLAYERS) {
 			return;
+		}
+		if (locked && SAMLobby::isClaimed(slot)) {
+			samSlotWantsLock[slot] = playerSlotsLocked[slot]; // a mod takes it: keep the setting's word
+		} else if (!locked) {
+			locked = samSlotWantsLock[slot]; // given back: closed again if the player count closed it meanwhile
+			samSlotWantsLock[slot] = false;
 		}
 		playerSlotsLocked[slot] = locked;
 		if (multiplayer != SERVER) {

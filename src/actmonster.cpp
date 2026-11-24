@@ -12678,6 +12678,10 @@ void Entity::monsterAllySendCommand(int command, int destX, int destY, Uint32 ui
 			skillLVL = std::max(skillLVL, stats[playerLeader]->getModifiedProficiency(PRO_MYSTICISM) + statGetCHR(stats[playerLeader], players[playerLeader]->entity));
 		}
 	}
+	if ( SAMParty::takesOrdersFreely(this) )
+	{
+		skillLVL = SKILL_LEVEL_LEGENDARY;   // S.A.M: a party member takes every order, as its follower menu already shows (interface.cpp)
+	}
 
 	if ( myStats->type != GYROBOT )
 	{

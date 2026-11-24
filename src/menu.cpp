@@ -62,6 +62,7 @@
 #include "sam_net.hpp"   // S.A.M: multiplayer channels (tick / clear)
 #include "sam_mp_input.hpp" // S.A.M: per-run event latches; a kicked player's leave event
 #include "sam_mp_inventory.hpp" // S.A.M: drop the last character's backpack/spell mirror
+#include "sam_ally_items.hpp"   // S.A.M: and the item moves to and from allies still waiting
 #include "sam_event.hpp"      // SamEvent: one build, both runtimes
 #include "sam_images.hpp" // S.A.M: clear any mod picture left on screen when a new game starts
 #include "sam_hud.hpp"  // S.A.M: drop a script-drawn HUD when a run ends
@@ -9811,6 +9812,9 @@ void doNewGame(bool makeHighscore) {
 	// lobby both skip. Outside the host gate like the rest of this block, because the client
 	// half is what makes that machine re-report its NEW character at once.
 	SAMMpInventory::resetForNewRun();
+	// S.A.M: the same reason for the item moves still waiting between a player and an ally: a
+	// restart skips the ClearHook, and their tickets name the last character's allies and items.
+	SAMAllyItems::onClear();
 	// Every machine drops its OWN timers. Only the host ever ticks them, but a client holds the
 	// timers its scripts registered while loading (sam_set_timer refuses a client after that), and
 	// keeping those callbacks alive for the whole session did nothing but hold them. A timer set

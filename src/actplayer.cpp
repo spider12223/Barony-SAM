@@ -6224,8 +6224,24 @@ void playerDebugTests(Entity* my)
 // the game-over music plays, and the scores are posted. (sam_party.cpp, host and clients alike.)
 void samOnAllPlayersDead();
 
+// The last player to fall while party members carried the run on: game.on_game_end names them
+// when the run does end (samPartyWiped), since no player dies then.
+static int samLastPlayerDown = 0;
+
 void samPartyWiped()
 {
+	if ( multiplayer != CLIENT && SAMMpInput::claimPartyWipe() )
+	{
+		SamEvent samEv;
+		samEv.setName("game.on_game_end");
+		samEv.i("player", (long long)samLastPlayerDown);
+		samEv.i("won", (long long)0);
+		samEv.i("floor_reached", (long long)currentlevel);
+		samEv.i("kills", (long long)gameStatistics[STATISTICS_TOTAL_KILLS]);
+		samEv.i("time_played", (long long)ticks);
+		samEv.fire();
+		samLastPlayerDown = 0;   // spent: the next run's own last player is set when they fall
+	}
 	if ( gameModeManager.allowsSaves() )
 	{
 		if ( multiplayer == SINGLE )
@@ -11269,7 +11285,13 @@ void actPlayer(Entity* my)
 									break;
 								}
 							}
-							if ( samAllDead && SAMMpInput::claimPartyWipe() )
+							// Not while party members carry the run on: it has not ended. samPartyWiped fires it
+							// when it does, for this player, the last one down.
+							if ( samAllDead && SAMParty::partyCarriesOn() )
+							{
+								samLastPlayerDown = PLAYER_NUM;
+							}
+							else if ( samAllDead && SAMMpInput::claimPartyWipe() )
 							{
 								{
 									SamEvent samEv;

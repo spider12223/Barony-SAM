@@ -24,6 +24,7 @@
 #include "../scores.hpp"
 #include "../prng.hpp"
 #include "../mod_tools.hpp"
+#include "sam_party.hpp"   // S.A.M: a party member cannot be charmed or dominated away from its party
 
 std::map<Uint32, std::map<Uint32, ParticleEmitterHit_t>> particleTimerEmitterHitEntities;
 std::map<Uint32, ParticleTimerEffect_t> particleTimerEffects;
@@ -135,6 +136,7 @@ bool spellEffectDominate(Entity& my, spellElement_t& element, Entity& caster, En
 		|| hit.entity->monsterIsTinkeringCreation()
 		|| hit.entity->monsterAllySummonRank != 0
 		|| (hitstats->type == INCUBUS && !strncmp(hitstats->name, "inner demon", strlen("inner demon")))
+		|| SAMParty::isMember(hitstats)   // S.A.M: a party member belongs to its party
 		)
 	{
 		Uint32 color = makeColorRGB(255, 0, 0);
@@ -1513,6 +1515,7 @@ void spellEffectCharmMonster(Entity& my, spellElement_t& element, Entity* parent
 				&& player < 0 
 				&& hitstats->type != SHOPKEEPER
 				&& currentCharmedFollowerCount == 0
+				&& !SAMParty::isMember(hitstats)   // S.A.M: a party member is not stolen (a monster's charm may steal followers); it is pacified instead
 				)
 			{
 				// fully charmed. (players not affected here.)
