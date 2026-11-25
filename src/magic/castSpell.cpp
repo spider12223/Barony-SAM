@@ -1065,6 +1065,13 @@ Entity* castSpell(Uint32 caster_uid, spell_t* spell, bool using_magicstaff, bool
 			{
 				traveltime /= 4; // lava boulder casting.
 			}
+			// S.A.M (3.14.1): a mod's spell with "projectile_type": "none" is cast like any other (the mana
+			// and the skill above, the casting counts below) and sends no bolt: every use of the bolt from here
+			// on checks the propulsion. Its mod does the spell's work in player.on_spell_cast.
+			if ( const SAMSpellDef* samDef = SAMSpells::getSpell(spell->ID) )
+			{
+				if ( samDef->projectileType == "none" ) { propulsion = 0; }
+			}
 		}
 		else if ( !strcmp(element->element_internal_name, spellElement_missile_trio.element_internal_name) )
 		{
