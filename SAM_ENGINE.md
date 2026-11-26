@@ -9,7 +9,8 @@ makes to the engine, on top of the original Barony git history.
 |---|---|
 | `upstream-base` | upstream Barony commit `962a5ce3`, the point S.A.M forked from (4 commits after `v5.0.2`) |
 | `sam-framework` | `upstream-base` plus every S.A.M engine change |
-| `sam-v3.14.1` | the tip of `sam-framework`, matching S.A.M Framework v3.14.1 (commit `8e64e7f`) |
+| `sam-v3.15.0` | the tip of `sam-framework`, matching S.A.M Framework v3.15.0 (commit `739f540`) |
+| `sam-v3.14.1` | the engine as of S.A.M Framework v3.14.1 (commit `8e64e7f`) |
 | `sam-v3.14.0` | the engine as of S.A.M Framework v3.14.0 (commit `fa913ac`) |
 | `sam-v3.13.0` | the engine as of S.A.M Framework v3.13.0 (commit `9c57276`) |
 | `sam-v3.12.2` | the engine as of S.A.M Framework v3.12.2 (commit `a66955b`) |
@@ -30,8 +31,9 @@ v3.4.0 is one commit, `S.A.M Framework v3.4.0: engine integration`, v3.5.0 to v3
 `S.A.M Framework v3.12.2: engine changes from v3.12.1 to v3.12.2`, v3.13.0 is one more,
 `S.A.M Framework v3.13.0: engine changes from v3.12.2 to v3.13.0`, v3.14.0 is RumpleIVSkin's party, lobby
 and ally-items branch (pull request #1, merged with its commits) and one more,
-`S.A.M Framework v3.14.0: engine changes from v3.13.0 to v3.14.0`, and v3.14.1 is one more,
-`S.A.M Framework v3.14.1: engine changes from v3.14.0 to v3.14.1`. Build a `sam-vX.Y.Z` tag against the
+`S.A.M Framework v3.14.0: engine changes from v3.13.0 to v3.14.0`, v3.14.1 is one more,
+`S.A.M Framework v3.14.1: engine changes from v3.14.0 to v3.14.1`, and v3.15.0 is one more,
+`S.A.M Framework v3.15.0: engine changes from v3.14.1 to v3.15.0`. Build a `sam-vX.Y.Z` tag against the
 SAM-Framework tag `vX.Y.Z` with the same number.
 
 ## Finding the hooks
@@ -69,7 +71,7 @@ The build expects the framework as a sibling folder named `SAM-Framework`:
 ```
 workspace/
   Barony/          this repo
-  SAM-Framework/   https://github.com/spider12223/SAM-Framework  (tag v3.14.1)
+  SAM-Framework/   https://github.com/spider12223/SAM-Framework  (tag v3.15.0)
 ```
 
 `CMakeLists.txt` and `src/CMakeLists.txt` add `../SAM-Framework/framework` to the include path and

@@ -3477,6 +3477,12 @@ void initClass(const int player)
 		}
 	}
 
+	// S.A.M (3.15.0): a custom race's own "starting_items", after the class's, whatever the class.
+	if ( stats[player]->stat_appearance == 0 && stats[player]->playerRace >= SAM_RACE_ID_BASE )
+	{
+		SAMClasses::applyRaceLoadout(player);
+	}
+
 	players[player]->mechanics.ducksInARow.clear();
 	if ( client_classes[player] == CLASS_HERMIT )
 	{

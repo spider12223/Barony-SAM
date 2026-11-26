@@ -1414,7 +1414,16 @@ void magicOnEntityHit(Entity* parent, Entity* particle, Entity* hitentity, Stat*
 					int dur = samsp->onHitDuration;
 					if ( dur <= 0 ) { dur = SAMEffects::defaultDurationForSlot(samsp->onHitEffectSlot); }
 					if ( dur <= 0 ) { dur = TICKS_PER_SECOND * 5; }
-					hitentity->setEffect(samsp->onHitEffectSlot, true, dur, true);
+					if ( samsp->onHitEffectSlot == EFF_POLYMORPH )
+					{
+						// S.A.M (3.15.0): the real polymorph, not the bare status (a monster with it
+						// only showed the icon). It deletes the creature, which this hit still holds.
+						SAMSpells::queuePolymorph(hitentity->getUID(), parent ? parent->getUID() : 0, dur);
+					}
+					else
+					{
+						hitentity->setEffect(samsp->onHitEffectSlot, true, dur, true);
+					}
 				}
 			}
 		}

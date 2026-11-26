@@ -276,6 +276,15 @@ void castSpellInit(Uint32 caster_uid, spell_t* spell, bool usingSpellbook, bool 
 		return;
 	}
 
+	// S.A.M (3.15.0): player.on_before_spell_cast. A mod may refuse the cast here, on the caster's
+	// own machine, before any gold, mana or animation, so a refused cast costs nothing anywhere. A cast
+	// the gold check below is about to refuse is not asked about: every other refusal came before this.
+	if ( player >= 0 && getGoldCostOfSpell(spell, player) <= stat->GOLD
+		&& !SAMMpInput::playerMayCast(player, spell->ID) )
+	{
+		return;
+	}
+
 	if ( player >= 0 )
 	{
 		int goldCost = getGoldCostOfSpell(spell, player);
